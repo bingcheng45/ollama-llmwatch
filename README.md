@@ -44,8 +44,11 @@ The server log is currently the only place the information exists. `llmwatch` ta
 ## Install
 
 ```bash
-uv tool install llmwatch      # or: pipx install llmwatch
+uv tool install ollama-llmwatch      # or: pipx install ollama-llmwatch
 ```
+
+The installed command is `llmwatch`. The distribution is named `ollama-llmwatch` because
+the PyPI name `llmwatch` belongs to an unrelated LLM cost-tracking package.
 
 Or just take the file — it's a single script with no dependencies:
 

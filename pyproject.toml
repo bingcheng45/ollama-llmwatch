@@ -3,7 +3,10 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "llmwatch"
+# The PyPI name `llmwatch` is taken by an unrelated LLM cost-tracking package,
+# so the distribution is `ollama-llmwatch`. The installed command is still
+# `llmwatch` (see [project.scripts]).
+name = "ollama-llmwatch"
 version = "0.1.0"
 description = "See what your local Ollama model is actually doing: live prefill progress, ETA, and tok/s."
 readme = "README.md"
