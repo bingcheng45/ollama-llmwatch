@@ -1,0 +1,19 @@
+slot launch_slot_: id  0 | task 1040 | processing task, is_child = 0
+slot   operator(): id  0 | task 1040 | new prompt, n_ctx_slot = 131072, n_keep = 4, task.n_tokens = 32952
+slot   operator(): id  0 | task 1040 | checking checkpoint with [32111, 32111] against 32115...
+slot   operator(): id  0 | task 1040 | restored context checkpoint (pos_min = 32111, pos_max = 32111, n_tokens = 32112, n_past = 32112, size = 275.676 MiB)
+slot   operator(): id  0 | task 1040 | cached n_tokens = 32112, memory_seq_rm [32112, end)
+slot print_timing: id  0 | task 1040 | prompt processing, n_tokens =    328, progress = 0.98, t =   6.37 s / 51.49 tokens per second
+slot   operator(): id  0 | task 1040 | cached n_tokens = 32440, memory_seq_rm [32440, end)
+slot create_check: id  0 | task 1040 | erasing context checkpoint too close to an earlier one (pos_min = 32111, pos_max = 32111, n_tokens = 32112, size = 275.676 MiB)
+slot create_check: id  0 | task 1040 | created context checkpoint 4 of 32 (pos_min = 32439, pos_max = 32439, n_tokens = 32440, size = 276.964 MiB)
+slot print_timing: id  0 | task 1040 | prompt processing, n_tokens =    836, progress = 1.00, t =  15.91 s / 52.54 tokens per second
+slot   operator(): id  0 | task 1040 | cached n_tokens = 32948, memory_seq_rm [32948, end)
+slot init_sampler: id  0 | task 1040 | init sampler, took 3.36 ms, tokens: text = 32952, total = 32952
+slot create_check: id  0 | task 1040 | created context checkpoint 5 of 32 (pos_min = 32947, pos_max = 32947, n_tokens = 32948, size = 278.958 MiB)
+slot print_timing: id  0 | task 1040 | n_decoded =    100, tg =   3.10 t/s, tg_3s =   3.10 t/s
+slot print_timing: id  0 | task 1040 | n_decoded =    116, tg =   3.21 t/s, tg_3s =   4.16 t/s
+slot print_timing: id  0 | task 1040 | n_decoded =    128, tg =   3.26 t/s, tg_3s =   3.72 t/s
+slot print_timing: id  0 | task 1040 | prompt eval time =   16927.80 ms /   840 tokens (   20.15 ms per token,    49.62 tokens per second)
+slot print_timing: id  0 | task 1040 |        eval time =   41149.08 ms /   138 tokens (  298.18 ms per token,     3.35 tokens per second)
+slot print_timing: id  0 | task 1040 |       total time =   58076.88 ms /   978 tokens

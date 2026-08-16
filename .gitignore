@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+
+# oh-my-claudecode session state (contains local paths + session ids)
+.omc/

@@ -1,0 +1,26 @@
+srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+srv          init: idle slots will be saved to prompt cache upon starting a new task
+srv          init: init: chat template, example_format: '<|im_start|>system
+You are a helpful assistant<|im_end|>
+<|im_start|>user
+Hello<|im_end|>
+<|im_start|>assistant
+Hi there<|im_end|>
+<|im_start|>user
+How are you?<|im_end|>
+<|im_start|>assistant
+'
+srv          init: init: chat template, thinking = 0
+srv  llama_server: model loaded
+srv  llama_server: listening on http://127.0.0.1:53443
+srv  update_slots: all slots are idle
+time=2026-08-17T00:47:28.897+08:00 level=INFO source=llama_server.go:1360 msg="llama-server started in 7.30 seconds"
+time=2026-08-17T00:47:28.935+08:00 level=INFO source=images.go:374 msg="template selection" model=registry.ollama.ai/library/qwen3.8:27b-mtp-128k selected=renderer_parser renderer=qwen3.8 parser=qwen3.5 go_template=null chat_template="[tools thinking completion vision]" harmony=null renderer_parser="[completion vision tools thinking]"
+time=2026-08-17T00:47:28.935+08:00 level=INFO source=sched.go:728 msg="loaded runners" count=1
+time=2026-08-17T00:47:28.935+08:00 level=INFO source=llama_server.go:1293 msg="waiting for llama-server to start responding"
+time=2026-08-17T00:47:28.936+08:00 level=INFO source=llama_server.go:1360 msg="llama-server started in 7.34 seconds"
+srv  server_strea: conv_id= (empty=1)
+slot get_availabl: id  0 | task -1 |  - skipping, slot is empty
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+srv  get_availabl: updating prompt cache
+srv          load:  - looking for better prompt, base f_keep = -1.000, f_sim = 0.000

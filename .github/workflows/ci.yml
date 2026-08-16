@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # macOS is where this was developed; ubuntu guards the journald/Linux paths
+    # from bit-rotting even though the live Linux path is still unverified.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run tests
+        run: python -m unittest discover tests -v
+
+      - name: Check the CLI starts and reports its version
+        run: python llmwatch.py --version
+
+      - name: Check it fails cleanly with no log present
+        run: |
+          set +e
+          LLMWATCH_LOG=/nonexistent/ollama.log python llmwatch.py --last
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "expected exit code 2 for a missing log, got $code"
+            exit 1
+          fi
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      - name: Verify the console script is installable
+        run: |
+          pip install dist/*.whl
+          llmwatch --version

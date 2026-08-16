@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmwatch"
+version = "0.1.0"
+description = "See what your local Ollama model is actually doing: live prefill progress, ETA, and tok/s."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+keywords = ["ollama", "llm", "local-llm", "llama.cpp", "monitoring", "tokens-per-second", "prefill"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+]
+# No dependencies, deliberately: this should be safe to curl and run.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/bingcheng45/llmwatch"
+Issues = "https://github.com/bingcheng45/llmwatch/issues"
+
+[project.scripts]
+llmwatch = "llmwatch:main"
+
+[tool.setuptools]
+py-modules = ["llmwatch"]
