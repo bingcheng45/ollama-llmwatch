@@ -16,10 +16,11 @@ llmwatch tails that log and answers the question the spinner can't:
     "is it still reading my prompt, or is it actually writing -- and how long
      until it starts?"
 
-Structure: three layers, each testable in isolation.
-    parse_line(line) -> Event      pure, no I/O
-    Tracker.feed(event) -> Output  pure state machine
-    main()                         all the I/O
+Structure: four layers, the first three pure and testable.
+    parse_line(line) -> Event        pure, no I/O
+    Tracker.feed(event) -> [Output]  pure state machine
+    render_live(...) / render_*      pure formatting
+    follow()                         all the I/O, incl. the repaint thread
 
 Requires Python 3.9+. Standard library only, on purpose.
 """
@@ -28,12 +29,24 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import namedtuple
 
-__version__ = "0.1.0"
+try:
+    import queue
+except ImportError:  # pragma: no cover - py2 only, never hit
+    queue = None
+
+__version__ = "0.2.0"
+
+# How often the live line repaints. llama-server logs progress only once per
+# 512-token batch (5-10s apart at typical rates), so without an independent
+# repaint clock the display looks frozen for many seconds at a time.
+REPAINT_HZ = 10.0
 
 # --------------------------------------------------------------------------
 # Events
@@ -60,7 +73,6 @@ RequestEnd = namedtuple("RequestEnd", "slot task ms tokens")
 
 _SLOT = r"id\s+(\d+)\s*\|\s*task\s+(-?\d+)\s*\|"
 
-RE_SLOT = re.compile(_SLOT)
 RE_SERVER_STARTED = re.compile(r'llama-server started in ([\d.]+) seconds')
 RE_MODEL = re.compile(r"template selection.*?model=(\S+)")
 RE_REQ_START = re.compile(
@@ -156,8 +168,12 @@ def fmt_duration(seconds):
     return "%dh%02dm" % (hours, minutes)
 
 
-def fmt_bar(fraction, width=20):
-    filled = int(width * max(0.0, min(1.0, fraction)))
+def fmt_bar(fraction, width=20, style=None):
+    """Progress bar. Unicode blocks when the terminal can take them, else ASCII."""
+    fraction = max(0.0, min(1.0, fraction))
+    filled = int(width * fraction)
+    if style and style.unicode:
+        return "█" * filled + "░" * (width - filled)
     return "[" + "#" * filled + "-" * (width - filled) + "]"
 
 
@@ -188,7 +204,7 @@ class Request:
 
 class Tracker:
     """Consumes events, emits Outputs. No I/O, no terminal escapes: a caller
-    decides whether 'live' means an overwritten line or a JSON record."""
+    decides whether 'live' means an animated line or a JSON record."""
 
     def __init__(self):
         self.model = "?"
@@ -210,21 +226,20 @@ class Tracker:
 
         if isinstance(ev, ModelLoaded):
             self.model = ev.model
-            return [Output("line", "   model loaded: %s" % ev.model,
+            return [Output("line", "model loaded: %s" % ev.model,
                            {"event": "model_loaded", "model": ev.model})]
 
         if isinstance(ev, ServerStarted):
-            return [Output("line", "   weights loaded into GPU in %.1fs" % ev.seconds,
+            return [Output("line", "weights loaded into GPU in %.1fs" % ev.seconds,
                            {"event": "server_started", "seconds": ev.seconds})]
 
         if isinstance(ev, RequestStart):
             req = Request(ev.slot, ev.task, self.model, ev.prompt_tokens, ev.ctx)
             self.requests[self._key(ev)] = req
-            stamp = time.strftime("%H:%M:%S", time.localtime(req.started))
-            header = "-- %s  %s  (task %d)" % (stamp, req.model, ev.task)
-            return [Output("line", header,
+            return [Output("line", "",
                            {"event": "request_start", "task": ev.task,
-                            "prompt_tokens": ev.prompt_tokens, "model": req.model})]
+                            "prompt_tokens": ev.prompt_tokens, "model": req.model,
+                            "started": req.started})]
 
         if isinstance(ev, CacheInfo):
             req = self._get(ev)
@@ -244,17 +259,12 @@ class Tracker:
                 fraction = ev.progress
                 total = int(ev.processed / ev.progress) if ev.progress else ev.processed
             eta = (ev.elapsed / fraction - ev.elapsed) if fraction > 0 else None
-            cached_note = ""
-            if req.cached:
-                cached_note = "  (%s cached)" % format(req.cached, ",")
-            text = ("PREFILL  %s %3.0f%%  %s/%s tok%s  %5.0f tok/s  eta %s"
-                    % (fmt_bar(fraction), fraction * 100, format(ev.processed, ","),
-                       format(total, ","), cached_note, ev.rate, fmt_duration(eta)))
-            return [Output("live", text,
+            return [Output("live", "",
                            {"event": "prefill_tick", "task": ev.task,
+                            "model": req.model,
                             "processed": ev.processed, "to_process": total,
                             "cached": req.cached, "fraction": fraction,
-                            "rate": ev.rate, "eta_seconds": eta})]
+                            "rate": ev.rate, "elapsed": ev.elapsed, "eta_seconds": eta})]
 
         if isinstance(ev, PrefillDone):
             req = self._get(ev)
@@ -262,11 +272,12 @@ class Tracker:
             return []
 
         if isinstance(ev, GenTick):
-            text = ("GENERATE %s tok   %.1f tok/s (now %.1f)"
-                    % (format(ev.decoded, ","), ev.rate, ev.rate_3s))
-            return [Output("live", text,
+            req = self._get(ev)
+            elapsed = ev.decoded / ev.rate if ev.rate else 0.0
+            return [Output("live", "",
                            {"event": "generate_tick", "task": ev.task,
-                            "decoded": ev.decoded, "rate": ev.rate, "rate_3s": ev.rate_3s})]
+                            "model": req.model, "decoded": ev.decoded,
+                            "rate": ev.rate, "rate_3s": ev.rate_3s, "elapsed": elapsed})]
 
         if isinstance(ev, GenDone):
             req = self._get(ev)
@@ -280,42 +291,212 @@ class Tracker:
 
     def _finish(self, ev):
         req = self.requests.pop(self._key(ev), None)
-        out = []
         total_s = ev.ms / 1000.0
-
-        if req and req.prefill:
-            ms, tokens, rate = req.prefill
-            cached_note = ""
-            if req.cached:
-                cached_note = " (+%s cached)" % format(req.cached, ",")
-            out.append(Output("line",
-                              " v PREFILL  %s tok%s  in %7s   avg %6.1f tok/s"
-                              % (format(tokens, ","), cached_note, fmt_duration(ms / 1000.0), rate),
-                              {"event": "prefill_done", "task": ev.task, "tokens": tokens,
-                               "cached": req.cached, "seconds": ms / 1000.0, "rate": rate}))
-        if req and req.generation:
-            ms, tokens, rate = req.generation
-            out.append(Output("line",
-                              " v GENERATE %s tok  in %7s   avg %6.1f tok/s"
-                              % (format(tokens, ","), fmt_duration(ms / 1000.0), rate),
-                              {"event": "generate_done", "task": ev.task, "tokens": tokens,
-                               "seconds": ms / 1000.0, "rate": rate}))
-
-        note = ""
+        prefill = req.prefill if req else None
+        generation = req.generation if req else None
         share = None
-        if req and req.prefill and total_s > 0:
-            share = req.prefill[0] / 1000.0 / total_s * 100
-            note = ("   (first token after %s = %.0f%% of the wait)"
-                    % (fmt_duration(req.prefill[0] / 1000.0), share))
-        out.append(Output("line", " = TOTAL    %7s%s" % (fmt_duration(total_s), note),
-                          {"event": "request_end", "task": ev.task,
-                           "seconds": total_s, "prefill_share_pct": share}))
-        out.append(Output("line", "", {"event": "blank"}))
+        if prefill and total_s > 0:
+            share = prefill[0] / 1000.0 / total_s * 100
+
+        out = []
+        if prefill:
+            out.append(Output("line", "", {
+                "event": "prefill_done", "task": ev.task, "tokens": prefill[1],
+                "cached": req.cached, "seconds": prefill[0] / 1000.0, "rate": prefill[2]}))
+        if generation:
+            out.append(Output("line", "", {
+                "event": "generate_done", "task": ev.task, "tokens": generation[1],
+                "seconds": generation[0] / 1000.0, "rate": generation[2]}))
+        out.append(Output("line", "", {
+            "event": "request_end", "task": ev.task, "seconds": total_s,
+            "model": req.model if req else "?",
+            "prefill_share_pct": share,
+            "started": req.started if req else None}))
         return out
 
 
 # --------------------------------------------------------------------------
-# Layer 3: I/O
+# Layer 3: rendering (pure)
+# --------------------------------------------------------------------------
+
+SPINNER_UNICODE = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPINNER_ASCII = "|/-\\"
+
+
+class Style:
+    """Terminal capabilities + colours, resolved once."""
+
+    def __init__(self, color=True, unicode_ok=True, width=80):
+        self.color = color
+        self.unicode = unicode_ok
+        self.width = width
+
+    def paint(self, text, code):
+        if not self.color:
+            return text
+        return "\033[%sm%s\033[0m" % (code, text)
+
+    def dim(self, t):
+        return self.paint(t, "2")
+
+    def bold(self, t):
+        return self.paint(t, "1")
+
+    def cyan(self, t):
+        return self.paint(t, "36")
+
+    def green(self, t):
+        return self.paint(t, "32")
+
+    def yellow(self, t):
+        return self.paint(t, "33")
+
+    @classmethod
+    def detect(cls, no_color=False):
+        is_tty = sys.stdout.isatty()
+        color = is_tty and not no_color and not os.environ.get("NO_COLOR")
+        enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+        return cls(color=color, unicode_ok="utf" in enc,
+                   width=shutil.get_terminal_size((80, 24)).columns)
+
+
+def spinner_frame(seconds, style):
+    frames = SPINNER_UNICODE if style.unicode else SPINNER_ASCII
+    return frames[int(seconds * 10) % len(frames)]
+
+
+def project(processed, rate, age, total):
+    """Estimated position between log ticks.
+
+    llama-server reports progress once per 512-token batch. Freezing the display
+    between those reports is what made the tool feel dead; extrapolating from the
+    last measured rate keeps it honest and moving. Never runs past the total, so
+    the bar cannot claim completion that hasn't happened.
+    """
+    if rate <= 0 or age <= 0:
+        return processed
+    if total is None:
+        return processed + rate * age
+    return min(total, processed + rate * age)
+
+
+def render_live(data, age, style, now=None):
+    """One live status line. `age` is seconds since this data arrived."""
+    if data is None:
+        return ""
+    event = data.get("event")
+    spin = spinner_frame((now if now is not None else time.time()), style)
+
+    if event == "prefill_tick":
+        total = data.get("to_process") or 0
+        seen = project(data["processed"], data.get("rate", 0), age, total or None)
+        fraction = (seen / float(total)) if total else data.get("fraction", 0.0)
+        elapsed = data.get("elapsed", 0) + age
+        eta = data.get("eta_seconds")
+        eta = max(0.0, eta - age) if eta is not None else None
+        bar_width = 24 if style.width >= 100 else 16
+        cached = data.get("cached") or 0
+        cached_note = (" +%s cached" % format(cached, ",")) if cached else ""
+        return "%s %s %s %s %s  %s  %s" % (
+            spin,
+            style.bold("PREFILL "),
+            style.cyan(fmt_bar(fraction, bar_width, style)),
+            style.bold("%3.0f%%" % (fraction * 100)),
+            style.dim("%s/%s tok%s" % (format(int(seen), ","), format(total, ","), cached_note)),
+            "%5.0f tok/s" % data.get("rate", 0),
+            style.dim("elapsed %s | eta %s" % (fmt_duration(elapsed), fmt_duration(eta))),
+        )
+
+    if event == "generate_tick":
+        decoded = int(project(data["decoded"], data.get("rate", 0), age, None))
+        elapsed = data.get("elapsed", 0) + age
+        return "%s %s %s  %s  %s" % (
+            spin,
+            style.bold("GENERATE"),
+            style.green("%s tok" % format(decoded, ",")),
+            "%.1f tok/s" % data.get("rate", 0),
+            style.dim("now %.1f | elapsed %s"
+                      % (data.get("rate_3s", 0), fmt_duration(elapsed))),
+        )
+
+    if event == "request_start":
+        # No progress ticks exist yet -- llama-server emits the first only after a
+        # full 512-token batch, and a cache hit may mean none ever arrive. Show a
+        # running clock so this state never looks stalled.
+        total = data.get("prompt_tokens")
+        what = ("reading prompt, %s tok" % format(total, ",")) if total else "starting"
+        return "%s %s %s" % (spin, style.bold("PREFILL "),
+                             style.dim("%s | elapsed %s" % (what, fmt_duration(age))))
+    return ""
+
+
+def render_idle(age, style):
+    spin = spinner_frame(time.time(), style)
+    return style.dim("%s waiting for a request  (idle %s)" % (spin, fmt_duration(age)))
+
+
+def render_header(data, style, show_time=True):
+    """`show_time` is False when replaying history: llama-server's timing lines
+    carry no timestamps, so during replay the only clock available is 'now',
+    which would be a fabricated request time."""
+    model = data.get("model", "?")
+    if show_time:
+        stamp = time.strftime("%H:%M:%S", time.localtime(data.get("started") or time.time()))
+        label = "%s  %s  task %s" % (stamp, model, data.get("task"))
+    else:
+        label = "%s  task %s  (most recent)" % (model, data.get("task"))
+    rule = "─" if style.unicode else "-"
+    pad = max(0, min(style.width, 78) - len(label) - 4)
+    return style.dim(rule * 2 + " ") + style.bold(label) + style.dim(" " + rule * pad)
+
+
+def render_summary(prefill, generation, end, style):
+    """The committed block printed when a request finishes."""
+    lines = []
+    tee = ("├", "└") if style.unicode else ("|", "`")
+
+    if prefill:
+        cached = prefill.get("cached") or 0
+        note = (" +%s cached" % format(cached, ",")) if cached else ""
+        lines.append("  %s %s %s %s %s" % (
+            tee[0],
+            style.bold("PREFILL "),
+            ("%9s tok%s" % (format(prefill["tokens"], ","), note)).ljust(26),
+            fmt_duration(prefill["seconds"]).rjust(8),
+            style.dim("  avg %6.1f tok/s" % prefill["rate"])))
+
+    if generation:
+        lines.append("  %s %s %s %s %s" % (
+            tee[0],
+            style.bold("GENERATE"),
+            ("%9s tok" % format(generation["tokens"], ",")).ljust(26),
+            fmt_duration(generation["seconds"]).rjust(8),
+            style.dim("  avg %6.1f tok/s" % generation["rate"])))
+
+    share = end.get("prefill_share_pct")
+    tail = ""
+    if share is not None:
+        # A split bar: how much of the wall clock was spent before the first
+        # token appeared. This is the whole point of the tool, so it gets a bar.
+        width = 20
+        filled = int(round(width * share / 100.0))
+        if style.unicode:
+            bar = "█" * filled + "▓" * (width - filled)
+        else:
+            bar = "#" * filled + "=" * (width - filled)
+        tail = "  %s %s" % (style.yellow(bar),
+                            style.dim("%.0f%% was prefill" % share))
+    lines.append("  %s %s %s %s%s" % (
+        tee[1],
+        style.bold("TOTAL   "),
+        " " * 26,
+        fmt_duration(end["seconds"]).rjust(8),
+        tail))
+    return lines
+
+
+# --------------------------------------------------------------------------
+# Layer 4: I/O
 # --------------------------------------------------------------------------
 
 MACOS_HOMEBREW = ["/opt/homebrew/var/log/ollama.log", "/usr/local/var/log/ollama.log"]
@@ -370,26 +551,17 @@ def current_model():
     return "?"
 
 
-class Console:
-    """Renders Outputs to a terminal, overwriting 'live' lines in place."""
-
-    def __init__(self, use_color=True):
-        self.use_color = use_color and sys.stdout.isatty()
-        self.dirty = False
-
-    def emit(self, out):
-        if out.kind == "live":
-            if sys.stdout.isatty():
-                sys.stdout.write("\r\033[K   " + out.text)
-                self.dirty = True
-            else:
-                return  # progress is meaningless when piped; --json covers that
-        else:
-            if self.dirty and sys.stdout.isatty():
-                sys.stdout.write("\r\033[K")
-            sys.stdout.write(out.text + "\n")
-            self.dirty = False
-        sys.stdout.flush()
+def _reader(proc, q, stop):
+    """Log lines arrive on their own schedule; the UI must not wait for them."""
+    try:
+        for line in proc.stdout:
+            if stop.is_set():
+                break
+            q.put(line)
+    except (ValueError, OSError):
+        pass
+    finally:
+        q.put(None)
 
 
 def follow(args):
@@ -404,31 +576,104 @@ def follow(args):
 
     tracker = Tracker()
     tracker.model = current_model()
-    console = Console(use_color=not args.no_color)
+    style = Style.detect(no_color=args.no_color)
+    interactive = sys.stdout.isatty() and not args.json
 
     if not args.json:
         where = target if kind == "file" else "journalctl -u %s" % target
-        sys.stderr.write("llmwatch %s - watching %s\n" % (__version__, where))
+        sys.stderr.write("llmwatch %s  watching %s\n" % (__version__, where))
 
     proc = subprocess.Popen(tail_command(kind, target), stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    q = queue.Queue()
+    stop = threading.Event()
+    thread = threading.Thread(target=_reader, args=(proc, q, stop))
+    thread.daemon = True
+    thread.start()
+
+    live_data = None
+    live_at = time.time()
+    idle_since = time.time()
+    pending = {}          # task -> {"prefill":..., "generation":...}
+    dirty = False
+
+    def clear():
+        if interactive and dirty:
+            sys.stdout.write("\r\033[K")
+
+    def commit(text):
+        clear()
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+
     try:
-        for line in proc.stdout:
-            ev = parse_line(line)
-            if ev is None:
-                if args.debug_unparsed and looks_like_timing(line):
-                    sys.stderr.write("UNPARSED: %s" % line)
-                continue
-            for out in tracker.feed(ev):
-                if args.json:
-                    if out.data.get("event") != "blank":
-                        sys.stdout.write(json.dumps(out.data) + "\n")
+        while True:
+            # 1. drain whatever the log produced since the last repaint
+            drained = False
+            while True:
+                try:
+                    line = q.get_nowait()
+                except Exception:
+                    break
+                if line is None:
+                    raise KeyboardInterrupt
+                drained = True
+                ev = parse_line(line)
+                if ev is None:
+                    if args.debug_unparsed and looks_like_timing(line):
+                        sys.stderr.write("UNPARSED: %s" % line)
+                    continue
+
+                for out in tracker.feed(ev):
+                    kind_, data = out.kind, out.data
+                    name = data.get("event")
+
+                    if args.json:
+                        sys.stdout.write(json.dumps(data) + "\n")
                         sys.stdout.flush()
+                        continue
+
+                    if kind_ == "live":
+                        live_data, live_at = data, time.time()
+                        continue
+
+                    if name == "request_start":
+                        commit("")
+                        commit(render_header(data, style))
+                        live_data, live_at = data, time.time()
+                    elif name in ("prefill_done", "generate_done"):
+                        slot = pending.setdefault(data["task"], {})
+                        slot["prefill" if name == "prefill_done" else "generation"] = data
+                    elif name == "request_end":
+                        slot = pending.pop(data["task"], {})
+                        for text in render_summary(slot.get("prefill"),
+                                                   slot.get("generation"), data, style):
+                            commit(text)
+                        live_data = None
+                        idle_since = time.time()
+                    elif name in ("model_loaded", "server_started"):
+                        commit("  " + style.dim(out.text))
+
+            if drained:
+                idle_since = time.time() if live_data is None else idle_since
+
+            # 2. repaint on our own clock, not the log's
+            if interactive:
+                if live_data is not None:
+                    text = render_live(live_data, time.time() - live_at, style)
                 else:
-                    console.emit(out)
+                    text = render_idle(time.time() - idle_since, style)
+                if text:
+                    sys.stdout.write("\r\033[K  " + text)
+                    sys.stdout.flush()
+                    dirty = True
+
+            time.sleep(1.0 / REPAINT_HZ)
     except KeyboardInterrupt:
+        clear()
         sys.stdout.write("\n")
     finally:
+        stop.set()
         proc.terminate()
     return 0
 
@@ -448,28 +693,33 @@ def summarise_last(args):
 
     tracker = Tracker()
     tracker.model = current_model()
-    finished = []
+    style = Style.detect(no_color=args.no_color)
+    groups = []
+    pending = {}
     for line in lines:
-        outs = tracker.feed(parse_line(line))
-        for out in outs:
-            if out.data.get("event") in ("prefill_done", "generate_done", "request_end"):
-                finished.append(out)
+        for out in tracker.feed(parse_line(line)):
+            name = out.data.get("event")
+            if name in ("prefill_done", "generate_done"):
+                slot = pending.setdefault(out.data["task"], {})
+                slot["prefill" if name == "prefill_done" else "generation"] = out.data
+            elif name == "request_end":
+                slot = pending.pop(out.data["task"], {})
+                groups.append((slot.get("prefill"), slot.get("generation"), out.data))
 
-    if not finished:
+    if not groups:
         sys.stderr.write("llmwatch: no completed request found in the recent log\n")
         return 1
 
-    # Walk back to the last request_end and print its group.
-    tail = []
-    for out in reversed(finished):
-        tail.append(out)
-        if out.data.get("event") == "prefill_done":
-            break
-    for out in reversed(tail):
-        if args.json:
-            sys.stdout.write(json.dumps(out.data) + "\n")
-        else:
-            sys.stdout.write(out.text + "\n")
+    prefill, generation, end = groups[-1]
+    if args.json:
+        for part in (prefill, generation, end):
+            if part:
+                sys.stdout.write(json.dumps(part) + "\n")
+        return 0
+
+    sys.stdout.write(render_header(end, style, show_time=False) + "\n")
+    for text in render_summary(prefill, generation, end, style):
+        sys.stdout.write(text + "\n")
     return 0
 
 

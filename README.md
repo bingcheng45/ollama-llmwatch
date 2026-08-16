@@ -4,12 +4,22 @@
 live, with a progress bar and an ETA.
 
 ```
--- 01:19:15  qwen3.8:27b-mtp-128k  (task 1310)
-   PREFILL  [########------]  41%  2,912/7,022 tok  (512 cached)   72 tok/s   eta 56.4s
- v PREFILL  7,022 tok (+512 cached)  in   1m36s   avg   72.6 tok/s
- v GENERATE 28 tok  in    4.0s   avg    7.0 tok/s
- = TOTAL      1m40s   (first token after 1m36s = 96% of the wait)
+── 01:41:41  qwen3.8:27b-mtp-128k  task 2313
+  ⠹ PREFILL  ████░░░░░░░░░░░░  27% 4,096/14,906 tok    101 tok/s  elapsed 40.5s | eta 1m47s
 ```
+
+...and when it finishes:
+
+```
+── 01:41:41  qwen3.8:27b-mtp-128k  task 2313
+  ├ PREFILL     14,906 tok +512 cached     2m47s   avg   89.1 tok/s
+  ├ GENERATE        15 tok                  2.7s   avg    5.6 tok/s
+  └ TOTAL                                  2m49s  ████████████████████ 98% was prefill
+```
+
+The live line repaints 10x per second even though the server logs progress only once
+per 512-token batch (5-10 seconds apart) — position is projected from the last measured
+rate, so the display never sits frozen while you wonder if anything is happening.
 
 ## The problem
 
