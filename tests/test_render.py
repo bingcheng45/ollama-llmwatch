@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llmwatch import (  # noqa: E402
     SPARK_UNICODE, Stats, Style, Tracker, compose_frame, fmt_bar, parse_line, project,
-    render_board, render_help, render_idle, render_live, render_recent, render_summary,
+    render_board, render_help, render_idle, render_live, render_live_detail,
+    render_recent, render_summary,
     sparkline, spinner_frame,
 )
 
@@ -394,3 +395,75 @@ class TestRecentHeaderAndHelp(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestProgressNeverRewinds(unittest.TestCase):
+    """Reported: '47% then 46% then 47%'.
+
+    Position is projected from the last measured rate between ticks. When the
+    real rate dips, the next tick lands behind the projection and the bar
+    rewinds. Tokens only move forward, so the display must too.
+    """
+
+    def data(self, processed, rate):
+        return {"event": "prefill_tick", "task": 1, "model": "m", "processed": processed,
+                "to_process": 3095, "cached": 14894, "fraction": processed / 3095.0,
+                "rate": rate, "elapsed": 30.0, "eta_seconds": 60.0}
+
+    def percent(self, line):
+        return int([t for t in strip_ansi(line).split() if t.endswith("%")][0].rstrip("%"))
+
+    def test_a_slower_tick_does_not_move_the_bar_backwards(self):
+        from llmwatch import ProgressFloor
+        floor = ProgressFloor()
+        seen = []
+        for processed, rate, age in [(1461, 100.0, 0.0), (1461, 100.0, 4.0),
+                                     (1470, 20.0, 0.0), (1470, 20.0, 2.0)]:
+            seen.append(self.percent(
+                render_live(self.data(processed, rate), age, PLAIN, now=0, floor=floor)))
+        self.assertEqual(seen, sorted(seen), "progress went backwards: %s" % seen)
+
+    def test_without_a_floor_it_would_have_rewound(self):
+        """Confirms the test above is actually exercising the fix."""
+        ahead = self.percent(render_live(self.data(1461, 100.0), 4.0, PLAIN, now=0))
+        behind = self.percent(render_live(self.data(1470, 20.0), 0.0, PLAIN, now=0))
+        self.assertLess(behind, ahead)
+
+    def test_a_new_request_resets_the_floor(self):
+        from llmwatch import ProgressFloor
+        floor = ProgressFloor()
+        render_live(self.data(3000, 100.0), 0.0, PLAIN, now=0, floor=floor)
+        fresh = dict(self.data(10, 100.0), task=2)
+        self.assertLess(self.percent(render_live(fresh, 0.0, PLAIN, now=0, floor=floor)), 10)
+
+    def test_projection_cannot_run_more_than_one_batch_ahead(self):
+        """Otherwise the bar races ahead, then stalls waiting for reality."""
+        from llmwatch import PREFILL_BATCH, project
+        self.assertEqual(project(1000, 1000.0, 60.0, None, cap_ahead=PREFILL_BATCH),
+                         1000 + PREFILL_BATCH)
+
+
+class TestEstimateKeepsMoving(unittest.TestCase):
+    """Reported: the 'answer ready' line does not update, and shows nothing once
+    it reaches zero. Clamping the remaining prefill at zero made the total a
+    constant, so the line froze."""
+
+    DATA = {"event": "prefill_tick", "task": 1, "processed": 1461, "to_process": 3095,
+            "cached": 0, "fraction": 0.47, "rate": 100.0, "elapsed": 30.0,
+            "eta_seconds": 60.0}
+    SNAP = {"generation": {"avg": 10.0}, "avg_output_tokens": 200.0, "prefill": {}}
+
+    def last(self, age):
+        return strip_ansi(render_live_detail(self.DATA, self.SNAP, PLAIN, age)[-1])
+
+    def test_estimate_counts_down_every_frame(self):
+        self.assertNotEqual(self.last(0.0), self.last(20.0))
+        self.assertIn("answer ready", self.last(20.0))
+
+    def test_overrun_reports_a_live_clock_rather_than_freezing(self):
+        line = self.last(90.0)
+        self.assertIn("past estimate", line)
+        self.assertIn("2m00s", line)         # 30s measured + 90s since
+
+    def test_the_clock_keeps_moving_while_overrun(self):
+        self.assertNotEqual(self.last(90.0), self.last(120.0))

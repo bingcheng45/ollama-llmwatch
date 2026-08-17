@@ -33,6 +33,7 @@ import re
 import select
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -51,7 +52,7 @@ try:
 except ImportError:  # pragma: no cover - py2 only, never hit
     queue = None
 
-__version__ = "0.5.3"
+__version__ = "0.6.0"
 
 # Frame pacing. The loop wakes on new log data OR on these deadlines, whichever
 # comes first, so fresh data appears immediately while animation (spinner,
@@ -198,7 +199,9 @@ def parse_line(line):
 
     m = RE_MODEL.search(line)
     if m:
-        return ModelLoaded(m.group(1).rsplit("/", 1)[-1].strip('"'))
+        # Untrusted: a model name can carry anything. Sanitise before it can
+        # reach a terminal (see safe_text).
+        return ModelLoaded(safe_text(m.group(1).rsplit("/", 1)[-1].strip('"'), limit=80))
 
     return None
 
@@ -645,6 +648,31 @@ SPINNER_ASCII = "|/-\\"
 
 RE_ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
+# Anything we did not generate ourselves gets stripped of control characters
+# before it can reach a terminal.
+RE_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def safe_text(value, limit=300):
+    """Make untrusted text safe to print.
+
+    Two things end up on screen that llmwatch did not author: model names (from
+    the log) and agent tool-call arguments (from a Codex session file). Both can
+    carry escape sequences. `\\x1b[2J` clears the screen, `\\x1b]0;...\\x07`
+    rewrites the terminal title, and some terminals honour considerably worse.
+
+    The realistic path is not a hand-crafted model name: an LLM writes tool-call
+    arguments, prompt injection from any page or file the agent reads can shape
+    them, Codex records them verbatim, and llmwatch prints them.
+
+    Sanitise at the boundary where untrusted data enters, so no renderer has to
+    remember. Note this must happen BEFORE styling: truncate_visible()
+    deliberately preserves ANSI, because llmwatch's own colour goes through it.
+    """
+    if value is None:
+        return None
+    return RE_CONTROL.sub("", str(value))[:limit]
+
 
 def visible_len(text):
     """Length as the terminal sees it. ANSI escapes occupy no columns."""
@@ -720,7 +748,11 @@ def spinner_frame(seconds, style):
     return frames[int(seconds * 10) % len(frames)]
 
 
-def project(processed, rate, age, total):
+PREFILL_BATCH = 512      # llama-server reports prefill progress every 512 tokens
+GEN_TICK_TOKENS = 50     # and generation roughly every 50
+
+
+def project(processed, rate, age, total, cap_ahead=None):
     """Estimated position between log ticks.
 
     llama-server reports progress once per 512-token batch. Freezing the display
@@ -730,12 +762,43 @@ def project(processed, rate, age, total):
     """
     if rate <= 0 or age <= 0:
         return processed
+    projected = processed + rate * age
+    # Never run more than one reporting interval ahead. A tick arrives every
+    # batch, so a projection beyond that is certainly ahead of reality -- and
+    # once it is, the monotonic clamp holds the bar there until reality catches
+    # up, which looks like a stall.
+    if cap_ahead is not None:
+        projected = min(projected, processed + cap_ahead)
     if total is None:
-        return processed + rate * age
-    return min(total, processed + rate * age)
+        return projected
+    return min(total, projected)
 
 
-def render_live(data, age, style, now=None):
+class ProgressFloor:
+    """Keeps displayed progress monotonic.
+
+    Between log ticks the position is projected from the last measured rate. When
+    the real rate dips, the next tick lands BEHIND the projection and the bar
+    visibly rewinds (reported as 47% -> 46% -> 47%). Tokens only ever move
+    forward, so the display should too: never show less than was already shown
+    for this request.
+
+    Held outside render_live so that function stays deterministic for its inputs;
+    pass None and no clamping happens.
+    """
+
+    def __init__(self):
+        self.task = None
+        self.value = 0
+
+    def clamp(self, task, value):
+        if task != self.task:            # new request: start again from scratch
+            self.task, self.value = task, value
+        self.value = max(self.value, value)
+        return self.value
+
+
+def render_live(data, age, style, now=None, floor=None):
     """One live status line. `age` is seconds since this data arrived."""
     if data is None:
         return ""
@@ -744,7 +807,10 @@ def render_live(data, age, style, now=None):
 
     if event == "prefill_tick":
         total = data.get("to_process") or 0
-        seen = project(data["processed"], data.get("rate", 0), age, total or None)
+        seen = project(data["processed"], data.get("rate", 0), age, total or None,
+                       cap_ahead=PREFILL_BATCH)
+        if floor is not None:
+            seen = floor.clamp(data.get("task"), seen)
         fraction = (seen / float(total)) if total else data.get("fraction", 0.0)
         elapsed = data.get("elapsed", 0) + age
         eta = data.get("eta_seconds")
@@ -773,7 +839,10 @@ def render_live(data, age, style, now=None):
         )
 
     if event == "generate_tick":
-        decoded = int(project(data["decoded"], data.get("rate", 0), age, None))
+        decoded = int(project(data["decoded"], data.get("rate", 0), age, None,
+                              cap_ahead=GEN_TICK_TOKENS))
+        if floor is not None:
+            decoded = int(floor.clamp(data.get("task"), decoded))
         elapsed = data.get("elapsed", 0) + age
         return "%s %s %s  %s  %s" % (
             spin,
@@ -812,7 +881,13 @@ def project_completion(snap, data, age):
         eta = data.get("eta_seconds")
         if eta is None:
             return None
-        return max(0.0, eta - age) + avg_out / gen_rate
+        remaining = eta - age
+        if remaining <= 0:
+            # Past the estimate. Clamping to zero made the total a CONSTANT, so
+            # the line froze and stopped being feedback at all. Say we're overdue
+            # instead and let the caller show a live clock.
+            return None
+        return remaining + avg_out / gen_rate
     if data.get("event") == "generate_tick":
         done = data.get("decoded", 0) + data.get("rate", 0) * age
         return max(0.0, avg_out - done) / gen_rate
@@ -933,6 +1008,11 @@ def render_live_detail(data, snap, style, age=0.0, codex=None, system=None):
     finish = project_completion(snap or {}, data, age)
     if finish is not None:
         lines.append(style.dim("answer ready ~%s" % fmt_duration(finish)))
+    elif data and data.get("event") in ("prefill_tick", "generate_tick"):
+        # No estimate available, or the estimate has been overrun. Either way a
+        # live clock is better than a frozen number or an empty line.
+        waited = (data.get("elapsed") or 0) + age
+        lines.append(style.dim("running past estimate - %s so far" % fmt_duration(waited)))
     return lines
 
 
@@ -1443,6 +1523,215 @@ def plan_frame(now, last_paint, next_frame, got_data, active):
     return True, now + (FRAME_ACTIVE if active else FRAME_IDLE)
 
 
+MIN_COMPARE_SAMPLES = 5      # below this, report counts rather than a ratio
+
+# Prompt-size bands. Comparing a cached 244-token request against an uncached
+# 47,000-token one produces a number that means nothing; bucketing keeps the
+# comparison honest.
+SIZE_BANDS = ((0, 1000, "tiny"), (1000, 10000, "small"),
+              (10000, 50000, "large"), (50000, None, "huge"))
+
+
+def size_band(tokens):
+    for low, high, name in SIZE_BANDS:
+        if tokens is None:
+            return "unknown"
+        if tokens >= low and (high is None or tokens < high):
+            return name
+    return "unknown"
+
+
+class History:
+    """A local record of every completed request.
+
+    Without this, everything llmwatch measures dies at exit -- which is why the
+    same "is this model build actually faster?" question ends up being answered
+    with a hand-written benchmark script every time.
+
+    Stores timings and model names only. There is deliberately no column that
+    could hold prompt content, matching the property the Ollama log itself has.
+    """
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS requests (
+        id              INTEGER PRIMARY KEY,
+        ts              REAL NOT NULL,
+        model           TEXT NOT NULL,
+        prompt_tokens   INTEGER,
+        cached_tokens   INTEGER,
+        prefill_tokens  INTEGER,
+        prefill_seconds REAL,
+        prefill_rate    REAL,
+        gen_tokens      INTEGER,
+        gen_seconds     REAL,
+        gen_rate        REAL,
+        total_seconds   REAL,
+        prefill_share   REAL,
+        cache_miss      INTEGER,
+        draft_rate      REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
+    CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model, ts);
+    """
+
+    def __init__(self, path=None):
+        self.path = path or self.default_path()
+        self.conn = None
+        self.enabled = True
+        self._connect()
+
+    @staticmethod
+    def default_path():
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        return os.path.join(base, "ollama-llmwatch", "history.db")
+
+    def _connect(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            self.conn = sqlite3.connect(self.path, timeout=1.0)
+            self.conn.executescript(self.SCHEMA)
+            self.conn.commit()
+        except (sqlite3.Error, OSError):
+            # A monitor that dies because its logbook is locked is worse than one
+            # with no logbook. Carry on without history.
+            self.conn = None
+            self.enabled = False
+
+    def record(self, model, prefill, generation, end, now=None):
+        if not self.conn:
+            return False
+        prefill = prefill or {}
+        generation = generation or {}
+        try:
+            self.conn.execute(
+                "INSERT INTO requests (ts, model, prompt_tokens, cached_tokens, "
+                "prefill_tokens, prefill_seconds, prefill_rate, gen_tokens, "
+                "gen_seconds, gen_rate, total_seconds, prefill_share, cache_miss, "
+                "draft_rate) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (now if now is not None else time.time(), model or "?",
+                 (prefill.get("tokens") or 0) + (prefill.get("cached") or 0),
+                 prefill.get("cached") or 0,
+                 prefill.get("tokens"), prefill.get("seconds"), prefill.get("rate"),
+                 generation.get("tokens"), generation.get("seconds"),
+                 generation.get("rate"), end.get("seconds"),
+                 end.get("prefill_share_pct"), 1 if end.get("cache_miss") else 0,
+                 (end.get("draft") or [None])[0]))
+            self.conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def _rows(self, since, until=None, model=None):
+        query = "SELECT * FROM requests WHERE ts >= ?"
+        args = [since]
+        if until is not None:
+            query += " AND ts < ?"
+            args.append(until)
+        if model:
+            query += " AND model = ?"
+            args.append(model)
+        try:
+            cur = self.conn.execute(query, args)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+
+    @staticmethod
+    def _weighted(rows, tokens_key, seconds_key):
+        """Token-weighted rate, for the same reason the live stats use one: a
+        mean of rates lets a 4-token request outvote a 47,000-token one."""
+        tokens = sum(r.get(tokens_key) or 0 for r in rows)
+        seconds = sum(r.get(seconds_key) or 0 for r in rows)
+        return (tokens / seconds) if seconds > 0 else None
+
+    def rollup(self, days=7, model=None, now=None):
+        """Per-model summary for a window, with the change against the window
+        immediately before it (so "slower than last week" is answerable)."""
+        if not self.conn:
+            return []
+        now = now if now is not None else time.time()
+        span = days * 86400
+        # No upper bound on the current window: a request logged at exactly `now`
+        # belongs to it, and `ts < now` quietly dropped it.
+        current = self._rows(now - span, None, model)
+        previous = self._rows(now - 2 * span, now - span, model)
+
+        out = []
+        for name in sorted({r["model"] for r in current}):
+            mine = [r for r in current if r["model"] == name]
+            before = [r for r in previous if r["model"] == name]
+            gen = self._weighted(mine, "gen_tokens", "gen_seconds")
+            gen_before = self._weighted(before, "gen_tokens", "gen_seconds")
+            change = None
+            if gen and gen_before:
+                change = (gen - gen_before) / gen_before * 100
+            cached = sum(r.get("cached_tokens") or 0 for r in mine)
+            prompt = sum(r.get("prompt_tokens") or 0 for r in mine)
+            out.append({
+                "model": name, "requests": len(mine),
+                "prefill_rate": self._weighted(mine, "prefill_tokens", "prefill_seconds"),
+                "gen_rate": gen, "gen_change_pct": change,
+                "previous_requests": len(before),
+                "cache_pct": (cached / prompt * 100) if prompt else None,
+                "cache_misses": sum(1 for r in mine if r.get("cache_miss")),
+            })
+        return out
+
+    def compare(self, model_a, model_b, days=30, now=None):
+        """Compare two models on LIKE-FOR-LIKE requests.
+
+        Bucketed by prompt size and cache state, with the sample count reported
+        for each. An unbucketed comparison is how a 1.8x result turns out to have
+        been two different workloads.
+        """
+        if not self.conn:
+            return []
+        now = now if now is not None else time.time()
+        # No upper bound, for the same reason as rollup: `ts < now` dropped the
+        # most recent request, which is the one most likely to matter.
+        rows = self._rows(now - days * 86400, None)
+        buckets = {}
+        for row in rows:
+            if row["model"] not in (model_a, model_b):
+                continue
+            key = (size_band(row.get("prefill_tokens")), bool(row.get("cache_miss")))
+            buckets.setdefault(key, {model_a: [], model_b: []})[row["model"]].append(row)
+
+        out = []
+        for (band, miss), sides in sorted(buckets.items()):
+            a_rows, b_rows = sides[model_a], sides[model_b]
+            a_rate = self._weighted(a_rows, "gen_tokens", "gen_seconds")
+            b_rate = self._weighted(b_rows, "gen_tokens", "gen_seconds")
+            enough = (len(a_rows) >= MIN_COMPARE_SAMPLES
+                      and len(b_rows) >= MIN_COMPARE_SAMPLES)
+            out.append({
+                "band": band, "cache_miss": miss,
+                "a_n": len(a_rows), "b_n": len(b_rows),
+                "a_rate": a_rate, "b_rate": b_rate,
+                # Only claim a ratio when both sides have enough samples to mean
+                # something. Otherwise report the counts and say so.
+                "ratio": (a_rate / b_rate) if (enough and a_rate and b_rate) else None,
+                "enough": enough,
+            })
+        return out
+
+    def all_rows(self, days=None, now=None):
+        if not self.conn:
+            return []
+        now = now if now is not None else time.time()
+        since = 0 if days is None else now - days * 86400
+        return self._rows(since)
+
+    def close(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except sqlite3.Error:
+                pass
+            self.conn = None
+
+
 class SystemProbe:
     """Cheap, sudo-free signals that explain a measured slowdown.
 
@@ -1576,11 +1865,12 @@ def busiest_process():
     """Name the biggest CPU consumer. Only called when a slowdown is detected --
     it costs ~46ms, too much to poll continuously."""
     try:
-        out = subprocess.run("ps -Ao pcpu,comm -r | head -2", shell=True,
+        # No shell: the pipe to `head` was doing nothing that a slice cannot.
+        out = subprocess.run(["ps", "-Ao", "pcpu,comm", "-r"],
                              capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-    rows = [r.strip() for r in out.splitlines()[1:] if r.strip()]
+    rows = [r.strip() for r in out.splitlines()[1:3] if r.strip()]
     if not rows:
         return None
     parts = rows[0].split(None, 1)
@@ -1615,6 +1905,7 @@ class CodexTail:
         self.path = path
         self.offset = 0
         self.inode = None
+        self._attached = False
         self.action = None
         self.detail = None
         self.calls = 0
@@ -1641,9 +1932,21 @@ class CodexTail:
     def poll(self):
         """Read whatever is new. Cheap enough to call every frame."""
         newest = self.fixed_path or self.newest_session()
-        if newest != self.path:
-            self.path, self.offset = newest, 0
-            self.calls = 0
+        # `not self._attached` matters as much as the path check: with a path
+        # supplied up front, `newest != self.path` is false on the very first
+        # poll, so a change-only test would still replay the file.
+        if newest and (newest != self.path or not self._attached):
+            # Start at the END, like `tail -n 0`. Starting at 0 meant attaching
+            # to a long-running session replayed the whole thing: the largest
+            # session file on the development machine was 5.97 MB, every
+            # historical tool call counted, and an hours-old action displayed as
+            # if it were current.
+            self.path, self.calls, self._attached = newest, 0, True
+            try:
+                stat = os.stat(newest)
+                self.offset, self.inode = stat.st_size, stat.st_ino
+            except OSError:
+                self.offset, self.inode = 0, None
         if not self.path:
             return
         try:
@@ -1695,13 +1998,13 @@ class CodexTail:
         kind = payload.get("type") or record.get("type")
         if kind == "function_call":
             self.calls += 1
-            self.action = payload.get("name") or "tool call"
-            self.detail = self._summarise(payload.get("arguments"))
+            self.action = safe_text(payload.get("name"), limit=60) or "tool call"
+            self.detail = safe_text(self._summarise(payload.get("arguments")))
             self.last_call_at = time.time()
         elif kind == "function_call_output":
             output = payload.get("output")
             if self.looks_like_failure(output):
-                short = " ".join(str(output).split())[:90]
+                short = safe_text(" ".join(str(output).split()), limit=90)
                 # The same failure repeating is the interesting case: the agent
                 # is retrying something that cannot work, and will keep burning
                 # full prompt reads until someone stops it.
@@ -1843,6 +2146,8 @@ def follow(args):
     keyboard = Keyboard() if tui else None
     codex_tail = CodexTail() if (tui and args.codex) else None
     probe = SystemProbe()          # cheap and rate-limited; useful in both modes
+    history = None if args.no_history else History()
+    progress_floor = ProgressFloor()   # displayed progress must never rewind
     help_visible = False
     live_data = None
     live_at = time.time()
@@ -1901,6 +2206,9 @@ def follow(args):
                 slot = pending.pop(data["task"], {})
                 stats.record(data.get("model") or tracker.model,
                              slot.get("prefill"), slot.get("generation"), data)
+                if history:
+                    history.record(data.get("model") or tracker.model,
+                                   slot.get("prefill"), slot.get("generation"), data)
                 for text in render_summary(slot.get("prefill"),
                                            slot.get("generation"), data, style):
                     commit(text)
@@ -1920,7 +2228,8 @@ def follow(args):
 
     def live_text():
         if live_data is not None:
-            return render_live(live_data, time.time() - live_at, style)
+            return render_live(live_data, time.time() - live_at, style,
+                               floor=progress_floor)
         return render_idle(time.time() - idle_since, style,
                            probe.snapshot() if probe else None)
 
@@ -2005,6 +2314,8 @@ def follow(args):
     finally:
         stop.set()
         proc.terminate()
+        if history:
+            history.close()
         if keyboard:
             keyboard.leave()
         if screen:
@@ -2071,6 +2382,73 @@ def summarise_last(args):
     return 0
 
 
+def show_history(args, out=sys.stdout, history=None, now=None):
+    hist = history or History()
+    rows = hist.rollup(days=args.days, model=args.model, now=now)
+    if not rows:
+        out.write("no history yet for that window - run llmwatch alongside your agent "
+                  "and it will fill in\n")
+        return 1
+    out.write("last %d day%s\n\n" % (args.days, "" if args.days == 1 else "s"))
+    out.write("  %-26s %6s %12s %12s %10s %s\n"
+              % ("model", "req", "prefill", "generate", "cache", "vs previous"))
+    for row in rows:
+        change = ""
+        if row["gen_change_pct"] is not None:
+            arrow = "up" if row["gen_change_pct"] >= 0 else "down"
+            change = "%s %.0f%%" % (arrow, abs(row["gen_change_pct"]))
+        elif row["previous_requests"] == 0:
+            change = "no prior data"
+        out.write("  %-26s %6d %9s %11s %9s   %s\n" % (
+            row["model"][:26], row["requests"],
+            ("%.1f tok/s" % row["prefill_rate"]) if row["prefill_rate"] else "-",
+            ("%.1f tok/s" % row["gen_rate"]) if row["gen_rate"] else "-",
+            ("%.0f%%" % row["cache_pct"]) if row["cache_pct"] is not None else "-",
+            change))
+    return 0
+
+
+def show_compare(args, out=sys.stdout, history=None, now=None):
+    model_a, model_b = args.compare
+    hist = history or History()
+    rows = hist.compare(model_a, model_b, days=args.days, now=now)
+    if not rows:
+        out.write("no requests recorded for either model in the last %d days\n" % args.days)
+        return 1
+    out.write("%s vs %s, last %d days\n" % (model_a, model_b, args.days))
+    out.write("compared within prompt-size and cache buckets, because a cached "
+              "244-token\nrequest and an uncached 47k one are not the same workload\n\n")
+    out.write("  %-8s %-10s %14s %14s   %s\n"
+              % ("size", "cache", model_a[:14], model_b[:14], "result"))
+    for row in rows:
+        if row["ratio"]:
+            verdict = "%.2fx %s" % (row["ratio"] if row["ratio"] >= 1 else 1 / row["ratio"],
+                                    "faster" if row["ratio"] >= 1 else "slower")
+        else:
+            verdict = "not enough data (need %d each)" % MIN_COMPARE_SAMPLES
+        out.write("  %-8s %-10s %11s %14s   %s\n" % (
+            row["band"], "miss" if row["cache_miss"] else "hit",
+            "%.1f (n=%d)" % (row["a_rate"], row["a_n"]) if row["a_rate"] else "n=%d" % row["a_n"],
+            "%.1f (n=%d)" % (row["b_rate"], row["b_n"]) if row["b_rate"] else "n=%d" % row["b_n"],
+            verdict))
+    return 0
+
+
+def export_history(args, out=sys.stdout, history=None, now=None):
+    hist = history or History()
+    rows = hist.all_rows(days=args.days, now=now)
+    if args.export == "json":
+        out.write(json.dumps(rows, indent=2) + "\n")
+        return 0
+    if not rows:
+        return 1
+    columns = list(rows[0].keys())
+    out.write(",".join(columns) + "\n")
+    for row in rows:
+        out.write(",".join("" if row[c] is None else str(row[c]) for c in columns) + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="llmwatch",
@@ -2080,6 +2458,17 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true",
                         help="emit one JSON object per event (for status bars/scripts)")
     parser.add_argument("--log", metavar="PATH", help="path to the Ollama log")
+    parser.add_argument("--history", action="store_true",
+                        help="per-model summary from your recorded history")
+    parser.add_argument("--compare", nargs=2, metavar=("MODEL_A", "MODEL_B"),
+                        help="compare two models on like-for-like recorded requests")
+    parser.add_argument("--export", choices=("json", "csv"),
+                        help="dump recorded history")
+    parser.add_argument("--days", type=int, default=7,
+                        help="window for --history/--compare/--export (default 7)")
+    parser.add_argument("--model", help="restrict --history to one model")
+    parser.add_argument("--no-history", action="store_true",
+                        help="do not record this session (timings only are ever stored)")
     parser.add_argument("--codex", action="store_true",
                         help="show what Codex is doing, read from its session file "
                              "(contains commands and file paths)")
@@ -2093,6 +2482,12 @@ def main(argv=None):
 
     if args.log:
         os.environ["LLMWATCH_LOG"] = args.log
+    if args.history:
+        return show_history(args)
+    if args.compare:
+        return show_compare(args)
+    if args.export:
+        return export_history(args)
     return summarise_last(args) if args.last else follow(args)
 
 

@@ -16,10 +16,10 @@ platform.
 
 **Especially wanted**
 
-- **Linux (journald) and Docker reports.** Those code paths are written but unverified — a
+- **Linux (journald) and Docker reports.** Those code paths are written but unverified - a
   simple "it worked" or the error you hit is valuable either way.
 - **Confusing output.** If a line made you stop and think, that's a design bug worth fixing.
 
 Known-out-of-scope: showing *what* your agent is doing (file names, tool calls). Ollama's log
-contains timings only — no prompt content — so llmwatch cannot see it. Happy to discuss
+contains timings only - no prompt content - so llmwatch cannot see it. Happy to discuss
 alternatives in an issue if you need that.

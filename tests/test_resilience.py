@@ -99,6 +99,7 @@ class TestCodexFileFailures(unittest.TestCase):
         """A shrinking file would otherwise leave the offset past EOF, and the
         pane would show stale state forever."""
         tail = self.tail()
+        tail.poll()                                      # attach: skips existing content
         self.write([self.call(cmd="a much longer original command here to grow the file")])
         tail.poll()
         self.assertIn("much longer", tail.detail)
@@ -111,6 +112,7 @@ class TestCodexFileFailures(unittest.TestCase):
         """Rotating a new file into place keeps the name but changes the inode;
         size alone cannot see it."""
         tail = self.tail()
+        tail.poll()                                      # attach: skips existing content
         self.write([self.call(cmd="original")])
         tail.poll()
         self.assertIn("original", tail.detail)
@@ -245,3 +247,44 @@ class TestDiagnoseEdges(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestCodexAttachDoesNotReplayHistory(unittest.TestCase):
+    """Attaching set offset=0, so a long-running session was replayed in full:
+    the largest session file on the development machine was 5.97 MB, every
+    historical tool call was counted, and an hours-old action displayed as if it
+    were current."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "rollout-existing.jsonl")
+        with open(self.path, "w") as fh:
+            for i in range(500):
+                fh.write(json.dumps({"payload": {
+                    "type": "function_call", "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "historical command %d" % i})}}) + "\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_history_is_not_replayed_on_attach(self):
+        tail = CodexTail(path=self.path)
+        tail.poll()
+        self.assertEqual(tail.calls, 0, "attaching replayed %d historical calls" % tail.calls)
+        self.assertIsNone(tail.action)
+
+    def test_new_activity_after_attach_is_still_picked_up(self):
+        tail = CodexTail(path=self.path)
+        tail.poll()
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"payload": {
+                "type": "function_call", "name": "exec_command",
+                "arguments": json.dumps({"cmd": "the current command"})}}) + "\n")
+        tail.poll()
+        self.assertEqual(tail.calls, 1)
+        self.assertIn("current command", tail.detail)
+
+    def test_attach_to_a_missing_file_is_safe(self):
+        tail = CodexTail(path=os.path.join(self.dir, "nope.jsonl"))
+        tail.poll()
+        self.assertEqual(tail.offset, 0)
