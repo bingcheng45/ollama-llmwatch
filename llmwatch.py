@@ -26,27 +26,48 @@ Requires Python 3.9+. Standard library only, on purpose.
 """
 
 import argparse
+import atexit
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 from collections import namedtuple
 
+try:                       # POSIX only; the TUI degrades to no-keyboard elsewhere
+    import termios
+    import tty
+except ImportError:        # pragma: no cover - Windows
+    termios = None
+    tty = None
+
 try:
     import queue
 except ImportError:  # pragma: no cover - py2 only, never hit
     queue = None
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-# How often the live line repaints. llama-server logs progress only once per
-# 512-token batch (5-10s apart at typical rates), so without an independent
-# repaint clock the display looks frozen for many seconds at a time.
-REPAINT_HZ = 10.0
+# Frame pacing. The loop wakes on new log data OR on these deadlines, whichever
+# comes first, so fresh data appears immediately while animation (spinner,
+# elapsed, ETA countdown, projected position) keeps moving when the log is
+# silent -- llama-server logs progress only once per 512-token batch, 5-10s
+# apart at typical rates.
+FRAME_ACTIVE = 0.1     # 10 fps while a request is in flight
+FRAME_IDLE = 0.5       # 2 fps when nothing is running: a spinner needs no more
+MIN_FRAME_GAP = 1 / 30.0   # hard ceiling so a log flood can't spin the CPU
+
+# Requests smaller than this are excluded from peak/low. A cached prompt can
+# process 4 tokens at a meaningless rate; without this floor that number becomes
+# the session "low" forever and the board quietly lies.
+MIN_TOKENS_FOR_EXTREMES = 64
+
+RECENT_LIMIT = 20      # requests kept for the sparkline and the recent pane
 
 # --------------------------------------------------------------------------
 # Events
@@ -234,12 +255,25 @@ class Tracker:
                            {"event": "server_started", "seconds": ev.seconds})]
 
         if isinstance(ev, RequestStart):
+            outs = []
+            # A slot handles one request at a time, so anything still open on this
+            # slot was cancelled -- the client disconnected (a Codex timeout, say)
+            # and llama-server never wrote its `total time` line. Without this the
+            # display just shows a header with nothing under it, which reads like
+            # the tool lost track.
+            for key in [k for k in self.requests if k[0] == ev.slot]:
+                old = self.requests.pop(key)
+                outs.append(Output("line", "", {
+                    "event": "request_abandoned", "task": old.task,
+                    "model": old.model, "prompt_tokens": old.prompt_tokens}))
+
             req = Request(ev.slot, ev.task, self.model, ev.prompt_tokens, ev.ctx)
             self.requests[self._key(ev)] = req
-            return [Output("line", "",
-                           {"event": "request_start", "task": ev.task,
-                            "prompt_tokens": ev.prompt_tokens, "model": req.model,
-                            "started": req.started})]
+            outs.append(Output("line", "",
+                               {"event": "request_start", "task": ev.task,
+                                "prompt_tokens": ev.prompt_tokens, "model": req.model,
+                                "started": req.started}))
+            return outs
 
         if isinstance(ev, CacheInfo):
             req = self._get(ev)
@@ -313,6 +347,125 @@ class Tracker:
             "prefill_share_pct": share,
             "started": req.started if req else None}))
         return out
+
+
+class PhaseStats:
+    """Rates for one phase (prefill or generation) of one model."""
+
+    def __init__(self):
+        self.tokens = 0
+        self.seconds = 0.0
+        self.count = 0
+        self.peak = None
+        self.low = None
+        self.recent = []      # per-request rates, oldest first
+
+    def record(self, tokens, seconds, rate):
+        self.count += 1
+        self.tokens += tokens
+        self.seconds += seconds
+        self.recent.append(rate)
+        if len(self.recent) > RECENT_LIMIT:
+            del self.recent[0]
+        # Tiny requests are real, but their rates are noise -- see the constant.
+        if tokens >= MIN_TOKENS_FOR_EXTREMES:
+            self.peak = rate if self.peak is None else max(self.peak, rate)
+            self.low = rate if self.low is None else min(self.low, rate)
+
+    @property
+    def average(self):
+        """Token-weighted: total tokens / total seconds.
+
+        Deliberately NOT the mean of per-request rates. Averaging rates gives a
+        4-token request the same weight as a 47,000-token one, which produces a
+        number that matches no experience anybody actually had.
+        """
+        return (self.tokens / self.seconds) if self.seconds > 0 else None
+
+    def snapshot(self):
+        return {"tokens": self.tokens, "seconds": self.seconds, "count": self.count,
+                "peak": self.peak, "low": self.low, "avg": self.average,
+                "recent": list(self.recent)}
+
+
+class ModelStats:
+    """Everything tracked for a single model."""
+
+    def __init__(self):
+        self.prefill = PhaseStats()
+        self.generation = PhaseStats()
+        self.cached_tokens = 0
+        self.requests = 0
+        self.wall_seconds = 0.0
+        self.ttfts = []
+        self.recent = []
+
+    def record(self, prefill, generation, end):
+        self.requests += 1
+        self.wall_seconds += end.get("seconds") or 0.0
+        if prefill:
+            self.prefill.record(prefill["tokens"], prefill["seconds"], prefill["rate"])
+            self.cached_tokens += prefill.get("cached") or 0
+            # The log has no queue-admission timestamp, so prefill duration is the
+            # closest honest proxy for time-to-first-token.
+            self.ttfts.append(prefill["seconds"])
+        if generation:
+            self.generation.record(generation["tokens"], generation["seconds"],
+                                   generation["rate"])
+        self.recent.append({
+            "task": end.get("task"),
+            "tokens": (prefill or {}).get("tokens", 0),
+            "seconds": end.get("seconds") or 0.0,
+            "rate": (prefill or {}).get("rate"),
+            "share": end.get("prefill_share_pct"),
+        })
+        if len(self.recent) > RECENT_LIMIT:
+            del self.recent[0]
+
+    def snapshot(self):
+        total_prompt = self.prefill.tokens + self.cached_tokens
+        cache_rate = (self.cached_tokens / float(total_prompt) * 100) if total_prompt else None
+        share = None
+        if self.wall_seconds > 0:
+            share = self.prefill.seconds / self.wall_seconds * 100
+        ttft = None
+        if self.ttfts:
+            ttft = {"min": min(self.ttfts), "max": max(self.ttfts),
+                    "avg": sum(self.ttfts) / len(self.ttfts)}
+        return {
+            "requests": self.requests,
+            "prefill": self.prefill.snapshot(),
+            "generation": self.generation.snapshot(),
+            "cache_pct": cache_rate,
+            "cached_tokens": self.cached_tokens,
+            "ttft": ttft,
+            "prefill_share_pct": share,
+            "recent": list(reversed(self.recent)),
+        }
+
+
+class Stats:
+    """Per-model session statistics.
+
+    Scoped by model on purpose: the MTP and base builds of the same model differ
+    by ~1.34x on code, so pooling them produces an average that describes neither.
+    """
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self.started = clock()
+        self.by_model = {}
+
+    def record(self, model, prefill, generation, end):
+        self.by_model.setdefault(model or "?", ModelStats()).record(prefill, generation, end)
+
+    def snapshot(self, model):
+        data = self.by_model.get(model)
+        snap = data.snapshot() if data else ModelStats().snapshot()
+        snap["model"] = model or "?"
+        snap["session_seconds"] = self._clock() - self.started
+        snap["models_seen"] = len(self.by_model)
+        return snap
 
 
 # --------------------------------------------------------------------------
@@ -397,6 +550,16 @@ def render_live(data, age, style, now=None):
         bar_width = 24 if style.width >= 100 else 16
         cached = data.get("cached") or 0
         cached_note = (" +%s cached" % format(cached, ",")) if cached else ""
+
+        # Prompt batches are done, but the request isn't: the server still has to
+        # build logits, validate/restore the KV cache and produce the first token,
+        # and llama-server logs NONE of that. Showing "PREFILL 100%" with a clock
+        # ticking up reads like a stall, so name the state honestly instead.
+        if fraction >= 0.999:
+            return "%s %s %s" % (
+                spin, style.bold("PREFILL "),
+                style.dim("prompt read (%s tok%s) - waiting for first token | elapsed %s"
+                          % (format(total, ","), cached_note, fmt_duration(elapsed))))
         return "%s %s %s %s %s  %s  %s" % (
             spin,
             style.bold("PREFILL "),
@@ -495,6 +658,138 @@ def render_summary(prefill, generation, end, style):
     return lines
 
 
+SPARK_UNICODE = "▁▂▃▄▅▆▇█"
+SPARK_ASCII = ".:-=+*#"
+
+
+def sparkline(values, style):
+    """Trend of recent per-request rates.
+
+    Scaled between the observed min and max rather than from zero: the point is
+    to see change (throttling, contention, a slower model) and a zero-based
+    scale flattens exactly that.
+    """
+    values = [v for v in (values or []) if v is not None]
+    if not values:
+        return ""
+    chars = SPARK_UNICODE if style.unicode else SPARK_ASCII
+    low, high = min(values), max(values)
+    if high - low < 1e-9:
+        return chars[len(chars) // 2] * len(values)
+    span = high - low
+    return "".join(chars[min(len(chars) - 1,
+                             int((v - low) / span * (len(chars) - 1) + 0.5))]
+                   for v in values)
+
+
+def _rate(value):
+    return ("%6.1f" % value) if value is not None else "     -"
+
+
+def render_board(snap, style, width=80, compact=False):
+    """The stats board. Returns a list of lines, no trailing newlines."""
+    lines = []
+    pre, gen = snap["prefill"], snap["generation"]
+
+    lines.append("%s peak %s   avg %s   low %s tok/s   %s" % (
+        style.bold("PREFILL "), style.green(_rate(pre["peak"])), _rate(pre["avg"]),
+        style.yellow(_rate(pre["low"])),
+        style.dim("%s tok - %s" % (format(pre["tokens"], ","), fmt_duration(pre["seconds"])))))
+    if not compact:
+        spark = sparkline(pre["recent"], style)
+        if spark:
+            lines.append("         %s %s" % (style.cyan(spark),
+                                             style.dim("last %d" % len(pre["recent"]))))
+
+    lines.append("%s peak %s   avg %s   low %s tok/s   %s" % (
+        style.bold("GENERATE"), style.green(_rate(gen["peak"])), _rate(gen["avg"]),
+        style.yellow(_rate(gen["low"])),
+        style.dim("%s tok - %s" % (format(gen["tokens"], ","), fmt_duration(gen["seconds"])))))
+    if not compact:
+        spark = sparkline(gen["recent"], style)
+        if spark:
+            lines.append("         %s %s" % (style.cyan(spark),
+                                             style.dim("last %d" % len(gen["recent"]))))
+
+    if snap.get("cache_pct") is not None:
+        lines.append("%s %s reused - %s" % (
+            style.bold("CACHE   "), "%4.0f%%" % snap["cache_pct"],
+            style.dim("%s tok never recomputed" % format(snap["cached_tokens"], ","))))
+
+    ttft = snap.get("ttft")
+    if ttft:
+        # Approximate: prefill duration. The log has no queue-admission time, so
+        # true client-send-to-first-token cannot be derived from it.
+        lines.append("%s min %s - avg %s - max %s %s" % (
+            style.bold("TTFT    "), fmt_duration(ttft["min"]), fmt_duration(ttft["avg"]),
+            fmt_duration(ttft["max"]), style.dim("(approx: prefill time)")))
+
+    share = snap.get("prefill_share_pct")
+    if share is not None:
+        bar_w = 20 if width >= 70 else 10
+        filled = int(round(bar_w * share / 100.0))
+        bar = ("█" * filled + "░" * (bar_w - filled)) if style.unicode else \
+              ("#" * filled + "-" * (bar_w - filled))
+        lines.append("%s %s %s" % (style.bold("WAIT    "), style.yellow(bar),
+                                   style.dim("%.0f%% of session spent in prefill" % share)))
+    return lines
+
+
+def render_recent(rows, style, width=80, limit=6):
+    """Recent requests, newest first. Carries a header row: without one the
+    columns are four unlabelled numbers and the reader has to guess."""
+    out = [style.dim("  %-6s %12s %9s %14s   %s"
+                     % ("task", "prompt", "total", "prefill speed", "share of wait"))]
+    for row in rows[:limit]:
+        share = ("%3.0f%% reading" % row["share"]) if row.get("share") is not None else ""
+        rate = ("%6.1f tok/s" % row["rate"]) if row.get("rate") is not None else ""
+        out.append("  %-6s %12s %9s %14s   %s" % (
+            row.get("task", "?"), format(row.get("tokens", 0), ",") + " tok",
+            fmt_duration(row.get("seconds")), rate, style.dim(share)))
+    return out
+
+
+HELP_TEXT = [
+    ("", "llmwatch shows what your local model is doing right now."),
+    ("", ""),
+    ("PREFILL", "The model is READING your prompt. Silent in your agent, and usually"),
+    ("", "the long part: a 47,000-token agent prompt can take minutes."),
+    ("GENERATE", "The model is WRITING its answer. This is the text you actually see."),
+    ("", ""),
+    ("the bar", "How much of the prompt still needs computing, with an ETA. It moves"),
+    ("", "smoothly because position is projected from the last measured rate --"),
+    ("", "the server only reports progress once every 512 tokens."),
+    ("+N cached", "Tokens reused from a previous request, so they cost nothing. Only"),
+    ("", "tokens that actually need computing are counted in the bar."),
+    ("waiting for", "Prompt batches are done, but the server is still building logits and"),
+    ("first token", "checking its cache. It logs nothing here, so the clock keeps running."),
+    ("", ""),
+    ("peak/avg/low", "Per request, for the current model only. avg is token-weighted"),
+    ("", "(total tokens / total seconds), not an average of rates. Requests under"),
+    ("", "64 tokens are excluded from peak/low so cache hits can't skew them."),
+    ("CACHE", "Share of all prompt tokens this session that were reused, not recomputed."),
+    ("TTFT", "Time to first token, approximated by prefill duration -- the log has no"),
+    ("", "record of when your client sent the request."),
+    ("WAIT", "Share of total wall clock spent reading rather than writing. On a coding"),
+    ("", "agent this is often above 90%, which is the point of the tool."),
+    ("sparkline", "The last 20 request rates. A downward trend means throttling,"),
+    ("", "memory pressure, or something else competing for the GPU."),
+    ("", ""),
+    ("keys", "h close help   -   ctrl-c quit"),
+]
+
+
+def render_help(style, cols, rows):
+    out = [style.bold(" llmwatch %s - how to read this" % __version__), ""]
+    for label, text in HELP_TEXT:
+        # Pad BEFORE colouring: ANSI escapes have no width on screen but do count
+        # in %-12s, which silently destroys column alignment.
+        padded = "%-12s" % label
+        out.append("  " + (style.cyan(padded) if label else padded) +
+                   " " + (text if label else style.dim(text)))
+    return out[:max(1, rows - 1)]
+
+
 # --------------------------------------------------------------------------
 # Layer 4: I/O
 # --------------------------------------------------------------------------
@@ -551,17 +846,200 @@ def current_model():
     return "?"
 
 
+class Screen:
+    """Full-screen output on the alternate buffer, with guaranteed restore.
+
+    A wedged terminal is worse than any missing feature, so the restore sequence
+    is wired three ways: the caller's finally block, an atexit hook, and a
+    SIGTERM handler (atexit does not run when the process is signalled).
+    """
+
+    ENTER = "\033[?1049h\033[?25l"
+    LEAVE = "\033[?25h\033[?1049l"
+
+    def __init__(self, stream=None):
+        self.stream = stream or sys.stdout
+        self.active = False
+        self.resized = threading.Event()
+        self._prev_term = None
+
+    def enter(self):
+        if self.active:
+            return
+        self.stream.write(self.ENTER)
+        self.stream.flush()
+        self.active = True
+        atexit.register(self.leave)
+        # Restore at SIGNAL time, not at exit time. Waiting for the finally block
+        # means the restore sequence is written microseconds before the process
+        # dies, and a pty can discard buffered data when the slave closes -- so
+        # ctrl-c could leave the terminal on the alternate screen.
+        self._prev_term = signal.getsignal(signal.SIGTERM)
+        self._prev_int = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGTERM, self._on_term)
+        signal.signal(signal.SIGINT, self._on_int)
+        if hasattr(signal, "SIGWINCH"):
+            signal.signal(signal.SIGWINCH, lambda *a: self.resized.set())
+
+    def _on_term(self, *_args):
+        self.leave()
+        raise SystemExit(0)          # unwinds finally blocks, unlike a bare kill
+
+    def _on_int(self, *_args):
+        self.leave()
+        raise KeyboardInterrupt
+
+    def leave(self):
+        if not self.active:
+            return
+        self.active = False
+        try:
+            self.stream.write(self.LEAVE)
+            self.stream.flush()
+        except (ValueError, OSError):
+            pass
+
+    def size(self):
+        self.resized.clear()
+        return shutil.get_terminal_size((80, 24))
+
+    def draw(self, lines, rows):
+        """One write per frame. Several writes at 10 fps flicker visibly."""
+        clipped = lines[:max(1, rows - 1)]
+        body = "\033[K\n".join(clipped)
+        self.stream.write("\033[H" + body + "\033[K\033[J")
+        self.stream.flush()
+
+
+def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=False):
+    """Build the whole TUI frame. Pure: takes a snapshot, returns lines.
+
+    Panes drop in priority order when the terminal is short -- sparklines first,
+    then the recent list -- but the live line is never dropped, because that is
+    the thing the tool exists to show.
+    """
+    rule = "─" if style.unicode else "-"
+
+    def divider(label):
+        text = "%s %s " % (rule * 2, label)
+        return style.dim(text + rule * max(0, min(cols, 100) - len(text) - 1))
+
+    budget = max(1, rows - 1)
+
+    if help_visible:
+        # Help replaces the board but keeps the live line: you should never lose
+        # sight of the running request just because you asked what a column means.
+        help_lines = render_help(style, cols, rows - 3)
+        return help_lines + ["", divider("live"), "  " + (live_text or style.dim("idle"))]
+
+    # Reserved first and never trimmed: everything else is context, but this is
+    # the answer to "is it still reading my prompt, or is it writing?".
+    live_block = ["", divider("live"), "  " + (live_text or style.dim("idle"))]
+    if len(live_block) >= budget:
+        return live_block[-budget:]
+
+    title = " llmwatch %s   %s" % (__version__, style.bold(snap.get("model", "?")))
+    meta = "%d req - %s" % (snap.get("requests", 0),
+                            fmt_duration(snap.get("session_seconds", 0)))
+    if snap.get("models_seen", 0) > 1:
+        meta += " - %d models seen" % snap["models_seen"]
+
+    compact = rows < 22
+    recent = snap.get("recent") or []
+    recent_block = []
+    if recent:
+        recent_block = ["", divider("recent")] + render_recent(recent, style, cols, limit=6)
+
+    # Highest priority first; a section is included only if it fits whole,
+    # so the layout degrades in steps instead of tearing mid-pane.
+    head = []
+    for block in ([title + "   " + style.dim(meta)],
+                  render_board(snap, style, cols, compact=compact),
+                  recent_block,
+                  ["", style.dim("  h help   -   ctrl-c quit")] if hint else []):
+        if block and len(head) + len(block) + len(live_block) <= budget:
+            head.extend(block)
+    return head + live_block
+
+
+def plan_frame(now, last_paint, next_frame, got_data, active):
+    """Decide whether to repaint now, and when the next frame is due.
+
+    Returns (should_paint, next_frame). Pure, so the pacing guarantees can be
+    tested without threads or a terminal:
+
+    - new data repaints immediately rather than waiting for the next tick
+    - with no data at all, frames still arrive at the floor rate (the v0.2.0
+      anti-freeze guarantee)
+    - never faster than MIN_FRAME_GAP, so a log flood cannot spin the CPU
+    """
+    due = got_data or now >= next_frame
+    if not due:
+        return False, next_frame
+    if (now - last_paint) < MIN_FRAME_GAP:
+        return False, last_paint + MIN_FRAME_GAP      # defer briefly, don't drop
+    return True, now + (FRAME_ACTIVE if active else FRAME_IDLE)
+
+
+class Keyboard:
+    """Single-key input without Enter.
+
+    Restored the same three ways as the screen: a keyboard left in cbreak mode is
+    almost as annoying as a terminal left on the alternate buffer.
+    """
+
+    def __init__(self):
+        self.fd = None
+        self.saved = None
+
+    def enter(self):
+        if termios is None or not sys.stdin.isatty():
+            return False
+        try:
+            self.fd = sys.stdin.fileno()
+            self.saved = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        except (termios.error, ValueError, OSError):
+            self.saved = None
+            return False
+        atexit.register(self.leave)
+        return True
+
+    def leave(self):
+        if self.saved is None:
+            return
+        try:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        except (termios.error, ValueError, OSError):
+            pass
+        self.saved = None
+
+
 def _reader(proc, q, stop):
     """Log lines arrive on their own schedule; the UI must not wait for them."""
     try:
         for line in proc.stdout:
             if stop.is_set():
                 break
-            q.put(line)
+            q.put(("log", line))
     except (ValueError, OSError):
         pass
     finally:
-        q.put(None)
+        q.put(("log", None))
+
+
+def _key_reader(q, stop):
+    """Keys go through the same queue as log lines, so a keypress wakes the main
+    loop immediately instead of waiting for the next frame."""
+    while not stop.is_set():
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], 0.25)
+            if ready:
+                ch = sys.stdin.read(1)
+                if ch:
+                    q.put(("key", ch))
+        except (ValueError, OSError):
+            return
 
 
 def follow(args):
@@ -578,6 +1056,10 @@ def follow(args):
     tracker.model = current_model()
     style = Style.detect(no_color=args.no_color)
     interactive = sys.stdout.isatty() and not args.json
+    # Below ~10 rows the panes cannot be laid out usefully, so fall back to the
+    # single-line renderer rather than draw something corrupt.
+    tui = (interactive and not args.plain
+           and shutil.get_terminal_size((80, 24)).lines >= 10)
 
     if not args.json:
         where = target if kind == "file" else "journalctl -u %s" % target
@@ -591,6 +1073,10 @@ def follow(args):
     thread.daemon = True
     thread.start()
 
+    stats = Stats()
+    screen = Screen() if tui else None
+    keyboard = Keyboard() if tui else None
+    help_visible = False
     live_data = None
     live_at = time.time()
     idle_since = time.time()
@@ -602,79 +1088,153 @@ def follow(args):
             sys.stdout.write("\r\033[K")
 
     def commit(text):
+        if tui:
+            return                    # history lives in the recent pane instead
         clear()
         sys.stdout.write(text + "\n")
         sys.stdout.flush()
 
+    def handle(line):
+        """Returns True if this line changed anything worth repainting."""
+        nonlocal live_data, live_at, idle_since
+        ev = parse_line(line)
+        if ev is None:
+            if args.debug_unparsed and looks_like_timing(line):
+                sys.stderr.write("UNPARSED: %s" % line)
+            return False
+        changed = False
+        for out in tracker.feed(ev):
+            data = out.data
+            name = data.get("event")
+            changed = True
+
+            if args.json:
+                sys.stdout.write(json.dumps(data) + "\n")
+                sys.stdout.flush()
+                continue
+
+            if out.kind == "live":
+                live_data, live_at = data, time.time()
+                continue
+
+            if name == "request_start":
+                commit("")
+                commit(render_header(data, style))
+                live_data, live_at = data, time.time()
+            elif name in ("prefill_done", "generate_done"):
+                slot = pending.setdefault(data["task"], {})
+                slot["prefill" if name == "prefill_done" else "generation"] = data
+            elif name == "request_end":
+                slot = pending.pop(data["task"], {})
+                stats.record(data.get("model") or tracker.model,
+                             slot.get("prefill"), slot.get("generation"), data)
+                for text in render_summary(slot.get("prefill"),
+                                           slot.get("generation"), data, style):
+                    commit(text)
+                live_data = None
+                idle_since = time.time()
+            elif name == "request_abandoned":
+                pending.pop(data["task"], None)
+                commit("  " + style.dim("x task %s cancelled - client disconnected before "
+                                        "completion" % data["task"]))
+                if live_data is not None and live_data.get("task") == data["task"]:
+                    live_data = None
+                    idle_since = time.time()
+            elif name in ("model_loaded", "server_started"):
+                commit("  " + style.dim(out.text))
+        return changed
+
+    def live_text():
+        if live_data is not None:
+            return render_live(live_data, time.time() - live_at, style)
+        return render_idle(time.time() - idle_since, style)
+
+    def paint():
+        if not interactive:
+            return
+        if tui:
+            cols, rows = screen.size()
+            snap = stats.snapshot(tracker.model)
+            screen.draw(compose_frame(snap, live_text(), style, cols, rows,
+                                      help_visible=help_visible), rows)
+        else:
+            text = live_text()
+            if text:
+                sys.stdout.write("\r\033[K  " + text)
+                sys.stdout.flush()
+    # `dirty` is only meaningful for the plain single-line renderer.
+
+    if tui:
+        screen.enter()
+        if keyboard.enter():
+            key_thread = threading.Thread(target=_key_reader, args=(q, stop))
+            key_thread.daemon = True
+            key_thread.start()
+
+    last_paint = 0.0
+    next_frame = time.monotonic()
     try:
         while True:
-            # 1. drain whatever the log produced since the last repaint
-            drained = False
+            # Wake on new data OR the frame deadline, whichever comes first.
+            timeout = max(0.0, next_frame - time.monotonic())
+            batch = []
+            try:
+                batch.append(q.get(timeout=timeout))
+            except Exception:
+                pass
+            # Drain the rest of a burst so 50 lines cause one repaint, not 50.
             while True:
                 try:
-                    line = q.get_nowait()
+                    batch.append(q.get_nowait())
                 except Exception:
                     break
-                if line is None:
-                    raise KeyboardInterrupt
-                drained = True
-                ev = parse_line(line)
-                if ev is None:
-                    if args.debug_unparsed and looks_like_timing(line):
-                        sys.stderr.write("UNPARSED: %s" % line)
+
+            got_data = False
+            for kind_, payload in batch:
+                if kind_ == "key":
+                    if payload in ("h", "H", "?"):
+                        help_visible = not help_visible
+                        got_data = True          # repaint at once, don't wait
+                    elif payload in ("q", "Q"):
+                        raise KeyboardInterrupt
                     continue
+                if payload is None:
+                    raise KeyboardInterrupt
+                if handle(payload):
+                    got_data = True
 
-                for out in tracker.feed(ev):
-                    kind_, data = out.kind, out.data
-                    name = data.get("event")
-
-                    if args.json:
-                        sys.stdout.write(json.dumps(data) + "\n")
-                        sys.stdout.flush()
-                        continue
-
-                    if kind_ == "live":
-                        live_data, live_at = data, time.time()
-                        continue
-
-                    if name == "request_start":
-                        commit("")
-                        commit(render_header(data, style))
-                        live_data, live_at = data, time.time()
-                    elif name in ("prefill_done", "generate_done"):
-                        slot = pending.setdefault(data["task"], {})
-                        slot["prefill" if name == "prefill_done" else "generation"] = data
-                    elif name == "request_end":
-                        slot = pending.pop(data["task"], {})
-                        for text in render_summary(slot.get("prefill"),
-                                                   slot.get("generation"), data, style):
-                            commit(text)
-                        live_data = None
-                        idle_since = time.time()
-                    elif name in ("model_loaded", "server_started"):
-                        commit("  " + style.dim(out.text))
-
-            if drained:
-                idle_since = time.time() if live_data is None else idle_since
-
-            # 2. repaint on our own clock, not the log's
-            if interactive:
-                if live_data is not None:
-                    text = render_live(live_data, time.time() - live_at, style)
-                else:
-                    text = render_idle(time.time() - idle_since, style)
-                if text:
-                    sys.stdout.write("\r\033[K  " + text)
-                    sys.stdout.flush()
+            now = time.monotonic()
+            trigger = got_data or bool(screen and screen.resized.is_set())
+            do_paint, next_frame = plan_frame(now, last_paint, next_frame, trigger,
+                                              live_data is not None)
+            if do_paint:
+                if not tui:
                     dirty = True
-
-            time.sleep(1.0 / REPAINT_HZ)
-    except KeyboardInterrupt:
-        clear()
-        sys.stdout.write("\n")
+                paint()
+                last_paint = now
+    except (KeyboardInterrupt, SystemExit):
+        pass
     finally:
         stop.set()
         proc.terminate()
+        if keyboard:
+            keyboard.leave()
+        if screen:
+            screen.leave()
+        elif interactive:
+            clear()
+            sys.stdout.write("\n")
+
+    # The alternate buffer takes the whole session with it when it closes, so
+    # hand the numbers back on the normal screen before exiting.
+    if tui and stats.by_model:
+        sys.stdout.write("\nllmwatch session summary\n")
+        for model in sorted(stats.by_model):
+            snap = stats.snapshot(model)
+            sys.stdout.write("\n  %s  (%d requests)\n" % (model, snap["requests"]))
+            plain = Style(color=style.color, unicode_ok=style.unicode, width=style.width)
+            for text in render_board(snap, plain, style.width, compact=True):
+                sys.stdout.write("  " + text + "\n")
     return 0
 
 
@@ -732,6 +1292,8 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true",
                         help="emit one JSON object per event (for status bars/scripts)")
     parser.add_argument("--log", metavar="PATH", help="path to the Ollama log")
+    parser.add_argument("--plain", action="store_true",
+                        help="scrolling single-line output instead of the full-screen board")
     parser.add_argument("--no-color", action="store_true", help="disable colour output")
     parser.add_argument("--debug-unparsed", action="store_true",
                         help="print timing-ish lines that failed to parse (bug reports)")
