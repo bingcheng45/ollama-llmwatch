@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.0 — unreleased
+
+**Notices when the model is running slow, and says what's competing.**
+
+Slowdowns are detected from llmwatch's own rate measurements against a rolling median baseline
+(median, not mean, so one contended request doesn't move the bar it's measured against). Only
+once something is genuinely slow does it consult cheap system signals to explain it:
+
+```
+! slow: 40 vs 100 tok/s usual - 2 models loaded (34 GB), swapping 3.0/4.0 GB
+```
+
+A `SYSTEM` line on the board shows contention when present, `clear` otherwise.
+
+**No CPU or GPU percentage, on purpose.** On Apple Silicon inference is memory-bandwidth bound:
+the GPU is pinned near 100% and the CPU near idle whether throughput is good or bad, so neither
+number moves when performance does. GPU utilisation also requires sudo via `powermetrics`. What
+does predict a slowdown — measured here — is a second loaded model (~28%), background apps
+(~20%) or another process on the GPU (~44%), all of which surface as loaded models, swap,
+memory pressure or load average. A test fails if CPU%/GPU% is ever added to that line.
+
+Probes are rate-limited: cheap signals every 5s, `ollama ps` every 15s (it costs ~27ms, too
+much for a 10fps loop), and the ~46ms process lookup only when a slowdown is already detected.
+
+Tests: 143 → 167.
+
 ## 0.4.0 — unreleased
 
 **Answers "should I keep waiting, or kill it?"** A one-line diagnosis under the progress bar,

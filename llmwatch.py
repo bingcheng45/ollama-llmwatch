@@ -51,7 +51,7 @@ try:
 except ImportError:  # pragma: no cover - py2 only, never hit
     queue = None
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 # Frame pacing. The loop wakes on new log data OR on these deadlines, whichever
 # comes first, so fresh data appears immediately while animation (spinner,
@@ -475,10 +475,22 @@ class PhaseStats:
         """
         return (self.tokens / self.seconds) if self.seconds > 0 else None
 
+    @property
+    def median(self):
+        """Typical recent rate. Median, not mean: one contended outlier shouldn't
+        move the baseline that slowdown detection compares against."""
+        values = sorted(self.recent)
+        if not values:
+            return None
+        mid = len(values) // 2
+        if len(values) % 2:
+            return values[mid]
+        return (values[mid - 1] + values[mid]) / 2.0
+
     def snapshot(self):
         return {"tokens": self.tokens, "seconds": self.seconds, "count": self.count,
                 "peak": self.peak, "low": self.low, "avg": self.average,
-                "recent": list(self.recent)}
+                "median": self.median, "recent": list(self.recent)}
 
 
 class ModelStats:
@@ -775,7 +787,34 @@ LOW_DRAFT_ACCEPT = 0.35         # below this, speculative decoding is losing
 LOOP_REPEATS = 3                # identical prompt sizes in a row = likely retry loop
 
 
-def diagnose(data, snap, style, codex=None):
+SLOWDOWN_RATIO = 0.7        # below 70% of the usual rate is worth explaining
+SLOWDOWN_MIN_SAMPLES = 3    # need a baseline before calling anything "slow"
+
+
+def detect_slowdown(data, snap):
+    """Is this request measurably slower than usual, and by how much?
+
+    Compares against llmwatch's own measurements rather than guessing from system
+    metrics -- the tool already knows the only number that matters. Returns
+    (current, typical) or None.
+    """
+    if not data or not snap:
+        return None
+    if data.get("event") == "prefill_tick":
+        phase = snap.get("prefill") or {}
+    elif data.get("event") == "generate_tick":
+        phase = snap.get("generation") or {}
+    else:
+        return None
+    typical, current = phase.get("median"), data.get("rate")
+    if not typical or not current or phase.get("count", 0) < SLOWDOWN_MIN_SAMPLES:
+        return None
+    if current >= typical * SLOWDOWN_RATIO:
+        return None
+    return current, typical
+
+
+def diagnose(data, snap, style, codex=None, system=None):
     """Short, plain-English reads on what's happening, worth acting on.
 
     Deliberately terse: this line exists to help someone decide "keep waiting or
@@ -796,6 +835,16 @@ def diagnose(data, snap, style, codex=None):
     if data.get("cache_miss"):
         out.append(style.yellow("! cache gone - rereading all %s tok%s"
                                 % (format(total, ","), cost(total))))
+
+    # A measured slowdown, named. "GPU is busy" is not actionable; "2 models
+    # loaded (34 GB)" tells you exactly what to close.
+    slow = detect_slowdown(data, snap)
+    if slow:
+        current, typical = slow
+        causes = (system or {}).get("contention") or []
+        why = (" - " + ", ".join(causes[:2])) if causes else ""
+        out.append(style.yellow("! slow: %.0f vs %.0f tok/s usual%s"
+                                % (current, typical, why)))
 
     # A repeating tool failure is the CAUSE that loop detection sees the symptom
     # of, so it ranks above it: it tells you what to actually go and fix.
@@ -832,9 +881,9 @@ def diagnose(data, snap, style, codex=None):
     return out[:2]
 
 
-def render_live_detail(data, snap, style, age=0.0, codex=None):
+def render_live_detail(data, snap, style, age=0.0, codex=None, system=None):
     """Second live line: why this is slow, and when the answer will be ready."""
-    bits = diagnose(data, snap, style, codex)
+    bits = diagnose(data, snap, style, codex, system)
     finish = project_completion(snap or {}, data, age)
     if finish is not None:
         bits.append(style.dim("answer ready ~%s" % fmt_duration(finish)))
@@ -934,7 +983,34 @@ def _rate(value):
     return ("%6.1f" % value) if value is not None else "     -"
 
 
-def render_board(snap, style, width=80, compact=False):
+def render_system(system, style):
+    """One interpretive line, not a wall of gauges.
+
+    No CPU% or GPU%: during inference the GPU is pinned near 100% and the CPU
+    near idle whether throughput is good or bad, so those numbers never change
+    and never help. What changes is contention for memory bandwidth.
+    """
+    if not system:
+        return []
+    causes = system.get("contention") or []
+    if causes:
+        return ["%s %s" % (style.bold("SYSTEM  "),
+                           style.yellow("! " + ", ".join(causes)))]
+    bits = []
+    if system.get("models_loaded") is not None:
+        bits.append("%d model%s" % (system["models_loaded"],
+                                    "" if system["models_loaded"] == 1 else "s"))
+    if system.get("swap_used_gb") is not None:
+        bits.append("swap %.1f GB" % system["swap_used_gb"])
+    if system.get("load1") is not None:
+        bits.append("load %.1f" % system["load1"])
+    if not bits:
+        return []
+    return ["%s %s" % (style.bold("SYSTEM  "),
+                       style.dim("clear - " + ", ".join(bits)))]
+
+
+def render_board(snap, style, width=80, compact=False, system=None):
     """The stats board. Returns a list of lines, no trailing newlines."""
     lines = []
     pre, gen = snap["prefill"], snap["generation"]
@@ -990,6 +1066,7 @@ def render_board(snap, style, width=80, compact=False):
               ("#" * filled + "-" * (bar_w - filled))
         lines.append("%s %s %s" % (style.bold("WAIT    "), style.yellow(bar),
                                    style.dim("%.0f%% of session spent in prefill" % share)))
+    lines.extend(render_system(system, style))
     return lines
 
 
@@ -1217,7 +1294,7 @@ class Screen:
 
 
 def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=False,
-                  live_detail="", codex=None):
+                  live_detail="", codex=None, system=None):
     """Build the whole TUI frame. Pure: takes a snapshot, returns lines.
 
     Panes drop in priority order when the terminal is short -- sparklines first,
@@ -1271,7 +1348,7 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
 
     head = []
     for block in ([title + "   " + style.dim(meta)],
-                  render_board(snap, style, cols, compact=compact),
+                  render_board(snap, style, cols, compact=compact, system=system),
                   codex_block,
                   recent_block,
                   ["", style.dim("  h help   -   ctrl-c quit")] if hint else []):
@@ -1297,6 +1374,125 @@ def plan_frame(now, last_paint, next_frame, got_data, active):
     if (now - last_paint) < MIN_FRAME_GAP:
         return False, last_paint + MIN_FRAME_GAP      # defer briefly, don't drop
     return True, now + (FRAME_ACTIVE if active else FRAME_IDLE)
+
+
+class SystemProbe:
+    """Cheap, sudo-free signals that explain a measured slowdown.
+
+    Deliberately NOT CPU% or GPU%. On Apple Silicon inference is memory-bandwidth
+    bound: the GPU sits near 100% and the CPU near idle whether you are getting
+    13 tok/s or 8, so neither number predicts anything. GPU utilisation would
+    need powermetrics, which requires sudo.
+
+    What does predict it -- measured on an M1 Max: background apps cost ~20%, a
+    second loaded model ~28%, another process hammering the GPU ~44%. All of
+    those show up as memory pressure, swap, load, or a second resident model.
+    """
+
+    CHEAP_INTERVAL = 5.0     # swap / memory / load
+    MODELS_INTERVAL = 15.0   # `ollama ps` costs ~27ms, so poll it rarely
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._cheap_at = 0.0
+        self._models_at = 0.0
+        self.swap_used_gb = None
+        self.swap_total_gb = None
+        self.memory_free_pct = None
+        self.load1 = None
+        self.models_loaded = None
+        self.models_gb = None
+
+    def poll(self):
+        now = self._clock()
+        if now - self._cheap_at >= self.CHEAP_INTERVAL:
+            self._cheap_at = now
+            self._read_load()
+            self._read_swap()
+            self._read_memory()
+        if now - self._models_at >= self.MODELS_INTERVAL:
+            self._models_at = now
+            self._read_models()
+
+    def _read_load(self):
+        try:
+            self.load1 = os.getloadavg()[0]
+        except (OSError, AttributeError):
+            self.load1 = None
+
+    def _read_swap(self):
+        out = self._run(["sysctl", "-n", "vm.swapusage"])
+        if not out:
+            return
+        used = re.search(r"used\s*=\s*([\d.]+)M", out)
+        total = re.search(r"total\s*=\s*([\d.]+)M", out)
+        self.swap_used_gb = float(used.group(1)) / 1024 if used else None
+        self.swap_total_gb = float(total.group(1)) / 1024 if total else None
+
+    def _read_memory(self):
+        out = self._run(["memory_pressure"])
+        match = re.search(r"free percentage:\s*(\d+)", out or "")
+        self.memory_free_pct = int(match.group(1)) if match else None
+
+    def _read_models(self):
+        out = self._run(["ollama", "ps"])
+        if not out:
+            return
+        rows = [r for r in out.splitlines()[1:] if r.strip()]
+        self.models_loaded = len(rows)
+        total = 0.0
+        for row in rows:
+            match = re.search(r"([\d.]+)\s*GB", row)
+            if match:
+                total += float(match.group(1))
+        self.models_gb = total or None
+
+    @staticmethod
+    def _run(cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def contention(self):
+        """Short phrases naming what is competing, most impactful first."""
+        out = []
+        if (self.models_loaded or 0) > 1:
+            size = (" (%.0f GB)" % self.models_gb) if self.models_gb else ""
+            out.append("%d models loaded%s" % (self.models_loaded, size))
+        if self.swap_used_gb and self.swap_total_gb and \
+                self.swap_used_gb > 0.5 * self.swap_total_gb:
+            out.append("swapping %.1f/%.1f GB" % (self.swap_used_gb, self.swap_total_gb))
+        if self.memory_free_pct is not None and self.memory_free_pct < 25:
+            out.append("%d%% memory free" % self.memory_free_pct)
+        if self.load1 and self.load1 > 8:
+            out.append("load %.0f" % self.load1)
+        return out
+
+    def snapshot(self):
+        return {"swap_used_gb": self.swap_used_gb, "swap_total_gb": self.swap_total_gb,
+                "memory_free_pct": self.memory_free_pct, "load1": self.load1,
+                "models_loaded": self.models_loaded, "models_gb": self.models_gb,
+                "contention": self.contention()}
+
+
+def busiest_process():
+    """Name the biggest CPU consumer. Only called when a slowdown is detected --
+    it costs ~46ms, too much to poll continuously."""
+    try:
+        out = subprocess.run("ps -Ao pcpu,comm -r | head -2", shell=True,
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    rows = [r.strip() for r in out.splitlines()[1:] if r.strip()]
+    if not rows:
+        return None
+    parts = rows[0].split(None, 1)
+    if len(parts) != 2:
+        return None
+    pct, name = parts
+    return "%s %s%%" % (os.path.basename(name.strip()), pct)
 
 
 class CodexTail:
@@ -1551,6 +1747,7 @@ def follow(args):
     screen = Screen() if tui else None
     keyboard = Keyboard() if tui else None
     codex_tail = CodexTail() if (tui and args.codex) else None
+    probe = SystemProbe() if tui else None
     help_visible = False
     live_data = None
     live_at = time.time()
@@ -1641,12 +1838,15 @@ def follow(args):
             if codex_tail:
                 codex_tail.poll()
             codex_state = codex_tail.state() if codex_tail else None
+            if probe:
+                probe.poll()
+            system_state = probe.snapshot() if probe else None
             screen.draw(compose_frame(
                 snap, live_text(), style, cols, rows,
                 help_visible=help_visible,
                 live_detail=render_live_detail(live_data, snap, style, age,
-                                              codex_state),
-                codex=codex_state), rows)
+                                              codex_state, system_state),
+                codex=codex_state, system=system_state), rows)
         else:
             text = live_text()
             if text:

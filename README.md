@@ -4,19 +4,23 @@
 live, with a progress bar, an ETA, and a stats board.
 
 ```
- llmwatch 0.3.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
+ llmwatch 0.5.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
 PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
          ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
 GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
          ▂▃▄▅▆▇█▇▆▅▄▃▂▁▂▃ last 16
-CACHE      68% reused - 149,204 tok never recomputed
+CACHE      68% reused - 149,204 tok never recomputed - 2 full rereads
+DRAFT      53% accepted - speculative decoding is paying off
 TTFT     min 0.3s - avg 1m52s - max 8m11s (approx: prefill time)
 WAIT     ██████████████████░░ 91% of session spent in prefill
+SYSTEM   ! swapping 2.5/4.0 GB
 ── recent ──────────────────────────────────────────────────────────────
-  2313      14,906 tok     2m47s      89.1 tok/s    98% prefill
-  2288       6,633 tok     1m26s      77.1 tok/s    97% prefill
+  task     prompt      total   prefill speed   share of wait
+  2313   14,906 tok    2m47s      89.1 tok/s    98% reading
+  2288    6,633 tok    1m26s      77.1 tok/s    97% reading
 ── live ────────────────────────────────────────────────────────────────
   ⠹ PREFILL ████████░░░░░░░░ 41% 6,144/14,906 tok  101 tok/s  elapsed 1m01s | eta 1m27s
+    cache working: only 6,144 of 21,050 tok to read   answer ready ~1m45s
 ```
 
 ---
@@ -51,6 +55,7 @@ It sits beside your agent in another terminal and answers the questions the spin
 | "Is my machine getting slower?" | peak / average / low speeds, plus a trend line |
 | "Which model build is faster?" | stats kept per model, never mixed together |
 | **"Should I keep waiting or kill it?"** | **a one-line diagnosis — see below** |
+| "Why did it suddenly get slow?" | detects it, and names what's competing |
 
 ### The line that helps you decide
 
@@ -61,6 +66,8 @@ Under the progress bar, llmwatch says what's actually going on, in a few words:
 ! same prompt 4x - agent may be stuck in a loop
 ! 3 cancels in a row - client keeps timing out
 long chat: reading 45,000 tok this turn (~7m30s) - consider compacting
+! slow: 40 vs 100 tok/s usual - 2 models loaded (34 GB), swapping 3.0/4.0 GB
+! same tool error 3x - agent stuck on a broken call
 cache working: only 244 of 41,253 tok to read
 drafts 22% accepted - MTP is slowing this one down
 ```
@@ -84,6 +91,30 @@ is what makes llmwatch different.
 
 Use otop if you want a system dashboard. Use llmwatch if you want to know why nothing has
 happened for four minutes.
+
+
+### Why there's no CPU or GPU percentage
+
+Deliberate. On Apple Silicon, generation is **memory-bandwidth bound**: during inference the GPU
+sits pinned near 100% and the CPU near idle, whether you're getting 13 tok/s or 8. Those numbers
+don't move when performance does, so they'd be decoration. (GPU utilisation also needs
+`powermetrics`, which requires sudo.)
+
+What actually costs you throughput, measured on an M1 Max:
+
+| cause | measured effect |
+|---|---|
+| A second model loaded (50 GB of 64) | ~28% slower |
+| Background apps competing for bandwidth | ~20% slower |
+| Another process hammering the GPU | ~44% slower |
+
+So llmwatch detects slowdowns from **its own rate measurements** — it already knows the only
+number that matters — and then uses cheap, sudo-free signals (loaded models, swap, memory
+pressure, load average) purely to explain them:
+
+```
+SYSTEM   ! 2 models loaded (34 GB), swapping 3.0/4.0 GB
+```
 
 ## Setup
 
