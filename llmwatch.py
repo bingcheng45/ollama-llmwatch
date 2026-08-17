@@ -51,7 +51,7 @@ try:
 except ImportError:  # pragma: no cover - py2 only, never hit
     queue = None
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # Frame pacing. The loop wakes on new log data OR on these deadlines, whichever
 # comes first, so fresh data appears immediately while animation (spinner,
@@ -775,7 +775,7 @@ LOW_DRAFT_ACCEPT = 0.35         # below this, speculative decoding is losing
 LOOP_REPEATS = 3                # identical prompt sizes in a row = likely retry loop
 
 
-def diagnose(data, snap, style):
+def diagnose(data, snap, style, codex=None):
     """Short, plain-English reads on what's happening, worth acting on.
 
     Deliberately terse: this line exists to help someone decide "keep waiting or
@@ -796,6 +796,12 @@ def diagnose(data, snap, style):
     if data.get("cache_miss"):
         out.append(style.yellow("! cache gone - rereading all %s tok%s"
                                 % (format(total, ","), cost(total))))
+
+    # A repeating tool failure is the CAUSE that loop detection sees the symptom
+    # of, so it ranks above it: it tells you what to actually go and fix.
+    if codex and (codex.get("error_repeats") or 0) >= 2:
+        out.append(style.yellow("! same tool error %dx - agent stuck on a broken call"
+                                % codex["error_repeats"]))
 
     if snap.get("looping"):
         out.append(style.yellow("! same prompt %dx - agent may be stuck in a loop"
@@ -826,9 +832,9 @@ def diagnose(data, snap, style):
     return out[:2]
 
 
-def render_live_detail(data, snap, style, age=0.0):
+def render_live_detail(data, snap, style, age=0.0, codex=None):
     """Second live line: why this is slow, and when the answer will be ready."""
-    bits = diagnose(data, snap, style)
+    bits = diagnose(data, snap, style, codex)
     finish = project_completion(snap or {}, data, age)
     if finish is not None:
         bits.append(style.dim("answer ready ~%s" % fmt_duration(finish)))
@@ -1005,6 +1011,12 @@ def render_codex(state, style, width=80):
             if len(detail) > limit:
                 detail = detail[:limit - 1] + "…" if style.unicode else detail[:limit - 3] + "..."
             out.append("  %-12s %s" % ("", style.dim(detail)))
+    if state.get("error"):
+        repeats = state.get("error_repeats") or 1
+        label = "tool failed" if repeats < 2 else "failing %dx" % repeats
+        limit = max(30, min(72, width - 20))
+        out.append("  %s %s" % (style.bold("%-12s" % label),
+                                style.yellow(state["error"][:limit])))
     if state.get("calls"):
         out.append("  %-12s %s" % ("this turn", style.dim("%d tool calls" % state["calls"])))
     if state.get("waiting_since") is not None:
@@ -1297,17 +1309,30 @@ class CodexTail:
 
     SESSIONS = "~/.codex/sessions"
 
-    def __init__(self):
-        self.path = None
+    # Codex records no success/failure flag on tool results -- only free text --
+    # so failure detection is heuristic and deliberately conservative. A grep hit
+    # containing the word "error" must NOT be reported as a failed tool.
+    FAILURE_PREFIXES = ("failed to", "error:", "traceback (most recent call last)")
+    FAILURE_PHRASES = ("command not found", "no such file or directory",
+                       "permission denied", "is not recognized as an internal")
+    RE_EXIT_CODE = re.compile(r"process exited with code (\d+)", re.I)
+
+    def __init__(self, path=None, sessions_dir=None):
+        # An explicit path pins one session; otherwise follow whichever is newest.
+        self.fixed_path = path
+        self.sessions_dir = sessions_dir or self.SESSIONS
+        self.path = path
         self.offset = 0
+        self.inode = None
         self.action = None
         self.detail = None
         self.calls = 0
         self.last_call_at = None
+        self.error = None
+        self.error_repeats = 0
 
-    @classmethod
-    def newest_session(cls):
-        root = os.path.expanduser(cls.SESSIONS)
+    def newest_session(self):
+        root = os.path.expanduser(self.sessions_dir)
         newest, newest_mtime = None, 0
         for dirpath, _dirnames, filenames in os.walk(root):
             for name in filenames:
@@ -1324,20 +1349,51 @@ class CodexTail:
 
     def poll(self):
         """Read whatever is new. Cheap enough to call every frame."""
-        newest = self.newest_session()
+        newest = self.fixed_path or self.newest_session()
         if newest != self.path:
             self.path, self.offset = newest, 0
             self.calls = 0
         if not self.path:
             return
         try:
+            # Two ways the file can restart under us: replaced (new inode, e.g.
+            # rotated into place) or truncated (smaller than where we are). Both
+            # would otherwise leave the offset past EOF and freeze the pane on
+            # stale state. A same-size in-place rewrite is undetectable by either
+            # signal -- Codex only appends, so that case does not arise in practice.
+            stat = os.stat(self.path)
+            if stat.st_ino != self.inode or stat.st_size < self.offset:
+                self.offset = 0
+            self.inode = stat.st_ino
             with open(self.path, "r", errors="replace") as fh:
                 fh.seek(self.offset)
-                for line in fh:
-                    self._consume(line)
-                self.offset = fh.tell()
+                chunk = fh.read()
         except OSError:
             return
+
+        # The file is being appended to live, so the last line may be half
+        # written. Consume only complete lines and leave the remainder for the
+        # next poll -- otherwise a partial record is parsed as garbage, skipped,
+        # and its real content never seen.
+        parts = chunk.split("\n")
+        remainder = parts.pop()
+        for line in parts:
+            self._consume(line)
+        self.offset += len(chunk.encode("utf-8")) - len(remainder.encode("utf-8"))
+
+    @classmethod
+    def looks_like_failure(cls, output):
+        """Conservative: only obvious failures. A false 'tool failed' is worse
+        than a missed one, because it sends you debugging the wrong thing."""
+        if not output:
+            return False
+        low = " ".join(str(output).split()).lower()
+        if low.startswith(cls.FAILURE_PREFIXES):
+            return True
+        if any(phrase in low for phrase in cls.FAILURE_PHRASES):
+            return True
+        match = cls.RE_EXIT_CODE.search(low)
+        return bool(match and match.group(1) != "0")
 
     def _consume(self, line):
         try:
@@ -1351,6 +1407,18 @@ class CodexTail:
             self.action = payload.get("name") or "tool call"
             self.detail = self._summarise(payload.get("arguments"))
             self.last_call_at = time.time()
+        elif kind == "function_call_output":
+            output = payload.get("output")
+            if self.looks_like_failure(output):
+                short = " ".join(str(output).split())[:90]
+                # The same failure repeating is the interesting case: the agent
+                # is retrying something that cannot work, and will keep burning
+                # full prompt reads until someone stops it.
+                self.error_repeats = self.error_repeats + 1 if short == self.error else 1
+                self.error = short
+            else:
+                self.error = None
+                self.error_repeats = 0
         elif kind == "task_started":
             self.calls = 0
             self.action = "thinking"
@@ -1383,7 +1451,8 @@ class CodexTail:
             return None
         waiting = (time.time() - self.last_call_at) if self.last_call_at else None
         return {"action": self.action, "detail": self.detail,
-                "calls": self.calls, "waiting_since": waiting}
+                "calls": self.calls, "waiting_since": waiting,
+                "error": self.error, "error_repeats": self.error_repeats}
 
 
 class Keyboard:
@@ -1571,11 +1640,13 @@ def follow(args):
             age = time.time() - live_at
             if codex_tail:
                 codex_tail.poll()
+            codex_state = codex_tail.state() if codex_tail else None
             screen.draw(compose_frame(
                 snap, live_text(), style, cols, rows,
                 help_visible=help_visible,
-                live_detail=render_live_detail(live_data, snap, style, age),
-                codex=codex_tail.state() if codex_tail else None), rows)
+                live_detail=render_live_detail(live_data, snap, style, age,
+                                              codex_state),
+                codex=codex_state), rows)
         else:
             text = live_text()
             if text:
