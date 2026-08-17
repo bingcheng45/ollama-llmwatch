@@ -4,7 +4,7 @@
 with a progress bar, an ETA, and a plain-English answer to *"should I keep waiting?"*
 
 ```
- ollama-llmwatch 0.6.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
+ ollama-llmwatch 0.7.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
 PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
          ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
 GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
@@ -94,6 +94,47 @@ ollama-llmwatch --json       # one JSON object per event, for status bars
 ollama-llmwatch --codex      # also show what Codex is doing (opt-in, see FAQ)
 ollama-llmwatch --log PATH   # if your log isn't auto-detected
 ```
+
+### Comparing models (press `c`)
+
+Press `c` and pick two models with the arrow keys:
+
+```
+── compare: pick two models ──────────────────────────────────────────
+   #  model                        req    gen tok/s   last seen
+ > 1  qwen3.8:27b-mtp-128k          48       14.3     2h ago
+   2  qwen3.8:27b-128k              44       10.0     1d ago
+   3  qwen3.8:27b-q4_K_M             0          -     no data yet
+
+  up/down move   1-9 jump   enter pick   esc back
+```
+
+```
+── qwen3.8:27b-mtp-128k  vs  qwen3.8:27b-128k ────────────────────────
+   48 requests, last 2h ago      44 requests, last 1d ago
+
+   GENERATE   A ████████████████████   14.3 tok/s  A 1.43x faster
+              B ██████████████░░░░░░   10.0 tok/s
+   PREFILL    A ████████████████████  101.7 tok/s
+              B ███████████████████░   98.4 tok/s
+   TTFT       A 1m58s      B 2m02s      A 4.0s sooner
+   CACHE      A 33%        B 31%
+   DRAFT      A 53%        B not a speculative build
+
+   by prompt size          A            B          result
+     large   hit   14.3 (n=48)  10.0 (n=44)      A 1.43x faster
+
+   on your median request (12,000 tok prompt, 207 tok answer)
+     A  2m12s    ███████████████████
+     B  2m22s    ████████████████████
+     A saves 10.2s per request
+```
+
+That last block is the point. Generation is 1.43x faster, but on a real request that is only
+10 seconds, because reading the prompt dominates. Rates flatter; seconds do not.
+
+Models you have never measured still appear in the list, and picking one tells you exactly how
+to get data for it rather than silently doing nothing.
 
 ### Looking back
 

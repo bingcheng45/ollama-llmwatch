@@ -52,7 +52,7 @@ try:
 except ImportError:  # pragma: no cover - py2 only, never hit
     queue = None
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # Frame pacing. The loop wakes on new log data OR on these deadlines, whichever
 # comes first, so fresh data appears immediately while animation (spinner,
@@ -954,7 +954,14 @@ def diagnose(data, snap, style, codex=None, system=None):
     slow = detect_slowdown(data, snap)
     if slow:
         current, typical = slow
-        causes = (system or {}).get("contention") or []
+        causes = list((system or {}).get("contention") or [])
+        if not causes:
+            # Nothing obvious in memory or model state: name whatever is eating
+            # the machine instead. Costs ~46ms, so only once we already know
+            # something is slow.
+            busiest = busiest_process()
+            if busiest:
+                causes = [busiest]
         why = (" - " + ", ".join(causes[:2])) if causes else ""
         out.append(style.yellow("! slow: %.0f vs %.0f tok/s usual%s"
                                 % (current, typical, why)))
@@ -1294,8 +1301,299 @@ HELP_TEXT = [
     ("codex pane", "With --codex: what your agent last did, and how long it has been"),
     ("", "waiting. Reads your Codex session file, so it is opt-in."),
     ("", ""),
-    ("keys", "h close help   -   ctrl-c quit"),
+    ("compare", "Press c to compare two models on your own recorded requests:"),
+    ("", "speed, time-to-first-token, cache, and what it saves per request."),
+    ("", ""),
+    ("keys", "h help   -   c compare   -   q or ctrl-c quit"),
 ]
+
+
+SAME_WITHIN = 0.05          # closer than this is "about the same", not "1.03x"
+
+
+class UIState:
+    """Which view is showing, and what the picker has selected.
+
+    Kept separate from rendering so every transition can be tested without a
+    terminal.
+    """
+
+    def __init__(self):
+        self.view = "live"          # live | help | picker | compare
+        self.cursor = 0
+        self.model_a = None
+        self.model_b = None
+
+    def reset_selection(self):
+        self.cursor = 0
+        self.model_a = None
+        self.model_b = None
+
+
+def handle_key(state, key, models):
+    """Apply a keypress. Returns True if anything changed (so we repaint now)."""
+    names = [m["model"] for m in models]
+
+    if key in ("q", "Q"):
+        raise KeyboardInterrupt
+    if key in ("h", "H", "?"):
+        state.view = "live" if state.view == "help" else "help"
+        return True
+
+    if key in ("c", "C"):
+        if state.view == "picker":
+            state.view = "live"
+        else:
+            state.view = "picker"
+            state.reset_selection()
+        return True
+
+    if state.view == "picker":
+        if key in ("UP", "k"):
+            state.cursor = max(0, state.cursor - 1)
+            return True
+        if key in ("DOWN", "j"):
+            state.cursor = min(max(0, len(names) - 1), state.cursor + 1)
+            return True
+        if key and key.isdigit() and key != "0":
+            index = int(key) - 1
+            if index < len(names):
+                state.cursor = index
+                return True
+            return False
+        if key in ("\r", "\n"):
+            if not names:
+                return False
+            chosen = names[state.cursor]
+            if state.model_a is None:
+                state.model_a = chosen
+            else:
+                state.model_b = chosen
+                state.view = "compare"
+            return True
+        if key == "ESC":
+            state.view = "live"
+            return True
+        return False
+
+    if state.view == "compare" and key == "ESC":
+        state.view = "picker"
+        state.model_b = None
+        return True
+    if state.view == "help" and key == "ESC":
+        state.view = "live"
+        return True
+    return False
+
+
+def render_picker(models, state, style, cols=80):
+    """The model list. Models with no recorded requests stay selectable: telling
+    someone how to get data is more useful than a greyed-out row that explains
+    nothing."""
+    lines = [style.dim("   #  %-28s %6s %11s   %s"
+                       % ("model", "req", "gen tok/s", "last seen"))]
+    for index, entry in enumerate(models[:9]):
+        marker = style.cyan(">") if index == state.cursor else " "
+        chosen = " (A)" if entry["model"] == state.model_a else ""
+        if entry["requests"]:
+            seen = "%s ago" % fmt_duration(entry["last_seen"] or 0)
+            rate = "%.1f" % entry["gen_rate"] if entry["gen_rate"] else "-"
+            tail = "%6d %11s   %s" % (entry["requests"], rate, seen)
+        else:
+            tail = "%6d %11s   %s" % (0, "-", style.dim("no data yet"))
+        name = (entry["model"] + chosen)[:28]
+        row = " %s %d  %-28s %s" % (marker, index + 1, name, tail)
+        lines.append(style.bold(row) if index == state.cursor else row)
+
+    lines.append("")
+    if state.model_a:
+        lines.append("  A: %s%s" % (style.cyan(state.model_a),
+                                    style.dim("      now pick a second model")))
+    else:
+        lines.append(style.dim("  pick the first model"))
+    lines.append(style.dim("  up/down move   1-9 jump   enter pick   esc back"))
+    return lines
+
+
+def _verdict(a_value, b_value, label_a="A", label_b="B", unit="x faster"):
+    if not a_value or not b_value:
+        return "no comparison"
+    ratio = a_value / b_value
+    if abs(ratio - 1.0) <= SAME_WITHIN:
+        return "about the same"
+    if ratio > 1:
+        return "%s %.2f%s" % (label_a, ratio, unit)
+    return "%s %.2f%s" % (label_b, 1 / ratio, unit)
+
+
+def _pair_bars(label, a_value, b_value, style, suffix="tok/s", width=20):
+    """Two bars normalised to the larger value: the comparison should read
+    visually before it reads numerically."""
+    top = max(a_value or 0, b_value or 0) or 1
+    out = []
+    for tag, value in (("A", a_value), ("B", b_value)):
+        filled = int(round(width * (value or 0) / top))
+        bar = ("█" * filled + "░" * (width - filled)) if style.unicode else \
+              ("#" * filled + "-" * (width - filled))
+        out.append("   %-10s %s %s %s" % (label if tag == "A" else "", tag,
+                                          style.cyan(bar),
+                                          ("%6.1f %s" % (value, suffix)) if value
+                                          else "     - "))
+    return out
+
+
+def render_compare(profile_a, profile_b, buckets, style, cols=80, days=30):
+    """The comparison. Also used by `--compare` so the CLI and the TUI cannot
+    drift apart."""
+    if not profile_a or not profile_b:
+        return [style.dim("  pick two models to compare")]
+
+    missing = [p for p in (profile_a, profile_b) if not p.get("requests")]
+    if missing:
+        lines = []
+        for profile in missing:
+            lines.append("  %s has no recorded requests yet." % style.bold(profile["model"]))
+        lines.append("")
+        lines.append("  Run anything against it and it will appear here:")
+        lines.append(style.cyan('      ollama run %s "hello"' % missing[0]["model"]))
+        lines.append(style.dim("  or point your agent at it for a turn. A comparison needs "
+                               "about %d" % MIN_COMPARE_SAMPLES))
+        lines.append(style.dim("  requests per side before it will report a ratio."))
+        have = [p for p in (profile_a, profile_b) if p.get("requests")]
+        if have:
+            lines.append("")
+            for profile in have:
+                lines.append(style.dim("  %s already has %d requests recorded."
+                                       % (profile["model"], profile["requests"])))
+        return lines
+
+    lines = ["   %s      %s" % (
+        style.dim("%d requests, last %s ago" % (profile_a["requests"],
+                                                fmt_duration(profile_a["last_seen"] or 0))),
+        style.dim("%d requests, last %s ago" % (profile_b["requests"],
+                                                fmt_duration(profile_b["last_seen"] or 0)))), ""]
+
+    gen = _pair_bars("GENERATE", profile_a.get("gen_rate"), profile_b.get("gen_rate"), style)
+    gen[0] += "  " + style.bold(_verdict(profile_a.get("gen_rate"), profile_b.get("gen_rate")))
+    lines.extend(gen)
+    lines.extend(_pair_bars("PREFILL", profile_a.get("prefill_rate"),
+                            profile_b.get("prefill_rate"), style))
+
+    if profile_a.get("ttft") and profile_b.get("ttft"):
+        sooner = abs(profile_a["ttft"] - profile_b["ttft"])
+        who = "A" if profile_a["ttft"] < profile_b["ttft"] else "B"
+        # "B 0.0s sooner" is noise dressed as a finding.
+        note = ("%s %s sooner" % (who, fmt_duration(sooner))) if sooner >= 1 \
+            else "about the same"
+        lines.append("   %-10s A %-10s B %-10s %s" % (
+            "TTFT", fmt_duration(profile_a["ttft"]), fmt_duration(profile_b["ttft"]),
+            style.dim(note)))
+    if profile_a.get("cache_pct") is not None or profile_b.get("cache_pct") is not None:
+        lines.append("   %-10s A %-10s B %-10s" % (
+            "CACHE", "%.0f%%" % (profile_a.get("cache_pct") or 0),
+            "%.0f%%" % (profile_b.get("cache_pct") or 0)))
+    if profile_a.get("draft_pct") is not None or profile_b.get("draft_pct") is not None:
+        fmt = lambda p: ("%.0f%%" % p["draft_pct"]) if p.get("draft_pct") is not None \
+            else "not a speculative build"
+        lines.append("   %-10s A %-10s B %s" % ("DRAFT", fmt(profile_a), fmt(profile_b)))
+
+    if buckets:
+        lines.append("")
+        lines.append(style.dim("   by prompt size          A            B          result"))
+        for row in buckets:
+            if row["ratio"]:
+                result = _verdict(row["a_rate"], row["b_rate"])
+            elif row["enough"]:
+                result = "about the same"
+            else:
+                result = style.dim("need %d each" % MIN_COMPARE_SAMPLES)
+            lines.append("     %-7s %-5s %11s %12s      %s" % (
+                row["band"], "miss" if row["cache_miss"] else "hit",
+                "%.1f (n=%d)" % (row["a_rate"], row["a_n"]) if row["a_rate"]
+                else "n=%d" % row["a_n"],
+                "%.1f (n=%d)" % (row["b_rate"], row["b_n"]) if row["b_rate"]
+                else "n=%d" % row["b_n"],
+                result))
+
+    lines.extend(render_median_request(profile_a, profile_b, style))
+    return lines
+
+
+def median_request_time(profile, prompt_tokens, gen_tokens):
+    """Seconds to finish a request of this shape: read the prompt, write the
+    answer."""
+    prefill_rate, gen_rate = profile.get("prefill_rate"), profile.get("gen_rate")
+    if not prefill_rate or not gen_rate:
+        return None
+    return prompt_tokens / prefill_rate + gen_tokens / gen_rate
+
+
+def render_median_request(profile_a, profile_b, style):
+    """Rates are abstract. Seconds saved on the work you actually do are not."""
+    prompts = [p.get("median_prompt_tokens") for p in (profile_a, profile_b)
+               if p.get("median_prompt_tokens")]
+    answers = [p.get("median_gen_tokens") for p in (profile_a, profile_b)
+               if p.get("median_gen_tokens")]
+    if not prompts or not answers:
+        return []
+    prompt_tokens = sum(prompts) / len(prompts)
+    gen_tokens = sum(answers) / len(answers)
+    a_time = median_request_time(profile_a, prompt_tokens, gen_tokens)
+    b_time = median_request_time(profile_b, prompt_tokens, gen_tokens)
+    if not a_time or not b_time:
+        return []
+
+    out = ["", style.dim("   on your median request (%s tok prompt, %s tok answer)"
+                         % (format(int(prompt_tokens), ","), format(int(gen_tokens), ",")))]
+    top = max(a_time, b_time)
+    for tag, value in (("A", a_time), ("B", b_time)):
+        filled = int(round(20 * value / top))
+        bar = ("█" * filled) if style.unicode else ("#" * filled)
+        out.append("     %s  %-8s %s" % (tag, fmt_duration(value), style.cyan(bar)))
+    saved = abs(a_time - b_time)
+    who = "A" if a_time < b_time else "B"
+    if saved >= 1:
+        out.append("     " + style.bold("%s saves %s per request" % (who, fmt_duration(saved))))
+    else:
+        out.append("     " + style.dim("no meaningful difference per request"))
+    return out
+
+
+def installed_models():
+    """Models on disk. The picker shows these too, so a model you have never
+    measured is visible with an explanation rather than simply absent."""
+    try:
+        out = subprocess.run(["ollama", "list"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    names = []
+    for row in out.splitlines()[1:]:
+        row = row.strip()
+        if row:
+            names.append(safe_text(row.split()[0], limit=80))
+    return names
+
+
+def pickable_models(history):
+    """Recorded models first (they can actually be compared), then installed
+    ones with no data."""
+    recorded = history.models() if history else []
+    seen = {entry["model"] for entry in recorded}
+    unmeasured = [{"model": name, "requests": 0, "gen_rate": None, "last_seen": None}
+                  for name in installed_models() if name not in seen]
+    return recorded + sorted(unmeasured, key=lambda entry: entry["model"])
+
+
+def build_compare(history, model_a, model_b, style, cols=100, days=30, now=None):
+    """One entry point for both the TUI view and `--compare`, so they cannot
+    drift apart."""
+    if not history or not model_a or not model_b:
+        return [style.dim("  pick two models to compare")]
+    return render_compare(history.profile(model_a, days=days, now=now),
+                          history.profile(model_b, days=days, now=now),
+                          history.compare(model_a, model_b, days=days, now=now),
+                          style, cols, days)
 
 
 def render_help(style, cols, rows):
@@ -1441,7 +1739,8 @@ class Screen:
 
 
 def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=False,
-                  live_detail=None, codex=None, system=None):
+                  live_detail=None, codex=None, system=None,
+                  ui=None, picker=None, compare=None):
     """Build the whole TUI frame. Pure: takes a snapshot, returns lines.
 
     Panes drop in priority order when the terminal is short -- sparklines first,
@@ -1455,6 +1754,22 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
         return style.dim(text + rule * max(0, min(cols, 100) - len(text) - 1))
 
     budget = max(1, rows - 1)
+
+    def with_live(body, label):
+        """Every modal keeps the live line visible: you should not lose sight of
+        a running request because you opened a menu."""
+        tail = ["", divider(label), "  " + (live_text or style.dim("idle"))]
+        for detail in (live_detail or []):
+            tail.append("    " + detail)
+        return body[:max(1, budget - len(tail))] + tail
+
+    if ui is not None and ui.view == "picker":
+        return with_live([divider("compare: pick two models"), ""]
+                         + render_picker(picker or [], ui, style, cols), "live")
+
+    if ui is not None and ui.view == "compare":
+        head = divider("%s  vs  %s" % (ui.model_a or "?", ui.model_b or "?"))
+        return with_live([head, ""] + (compare or []), "live")
 
     if help_visible:
         # Help replaces the board but keeps the live line: you should never lose
@@ -1498,7 +1813,7 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
                   render_board(snap, style, cols, compact=compact, system=system),
                   codex_block,
                   recent_block,
-                  ["", style.dim("  h help   -   ctrl-c quit")] if hint else []):
+                  ["", style.dim("  h help   -   c compare   -   ctrl-c quit")] if hint else []):
         if block and len(head) + len(block) + len(live_block) <= budget:
             head.extend(block)
     return head + live_block
@@ -1715,6 +2030,56 @@ class History:
                 "enough": enough,
             })
         return out
+
+    def models(self, now=None):
+        """Every model we have ever recorded, most-used first."""
+        if not self.conn:
+            return []
+        try:
+            cur = self.conn.execute(
+                "SELECT model, COUNT(*), MAX(ts), SUM(gen_tokens), SUM(gen_seconds) "
+                "FROM requests GROUP BY model")
+        except sqlite3.Error:
+            return []
+        now = now if now is not None else time.time()
+        out = []
+        for name, count, last, tokens, seconds in cur.fetchall():
+            out.append({"model": name, "requests": count,
+                        "last_seen": (now - last) if last else None,
+                        "gen_rate": (tokens / seconds) if seconds else None})
+        return sorted(out, key=lambda r: -r["requests"])
+
+    @staticmethod
+    def _median(values):
+        values = sorted(v for v in values if v is not None)
+        if not values:
+            return None
+        mid = len(values) // 2
+        return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2.0
+
+    def profile(self, model, days=30, now=None):
+        """Everything the compare view shows for one model."""
+        if not self.conn:
+            return None
+        now = now if now is not None else time.time()
+        rows = self._rows(now - days * 86400, None, model)
+        if not rows:
+            return {"model": model, "requests": 0}
+        cached = sum(r.get("cached_tokens") or 0 for r in rows)
+        prompt = sum(r.get("prompt_tokens") or 0 for r in rows)
+        drafts = [r["draft_rate"] for r in rows if r.get("draft_rate") is not None]
+        return {
+            "model": model,
+            "requests": len(rows),
+            "last_seen": now - max(r["ts"] for r in rows),
+            "gen_rate": self._weighted(rows, "gen_tokens", "gen_seconds"),
+            "prefill_rate": self._weighted(rows, "prefill_tokens", "prefill_seconds"),
+            "ttft": self._median([r.get("prefill_seconds") for r in rows]),
+            "cache_pct": (cached / prompt * 100) if prompt else None,
+            "draft_pct": (sum(drafts) / len(drafts) * 100) if drafts else None,
+            "median_prompt_tokens": self._median([r.get("prefill_tokens") for r in rows]),
+            "median_gen_tokens": self._median([r.get("gen_tokens") for r in rows]),
+        }
 
     def all_rows(self, days=None, now=None):
         if not self.conn:
@@ -2096,18 +2461,90 @@ def _reader(proc, q, stop):
         q.put(("log", None))
 
 
+ARROW_KEYS = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
+# How long to wait for the rest of an escape sequence before deciding a bare Esc
+# was pressed. 50ms proved too tight in practice: the reader thread competes with
+# the render loop for the GIL, so the follow-up bytes of an arrow key could miss
+# the window and arrive as three separate keys - pressing Down closed the menu.
+# 150ms is still imperceptible when actually pressing Esc.
+ESC_TIMEOUT = 0.15
+
+
+def decode_keys(buffer, flush=False):
+    """Turn raw input bytes into named keys. Returns (keys, leftover).
+
+    An arrow is three bytes (\x1b[A). Two things make this fiddly:
+
+    - A lone Esc is a prefix of every arrow, so a partial sequence must be held
+      back until either the rest arrives or the read times out (`flush`).
+    - Reads must come from the raw fd. sys.stdin.read(1) pulls everything
+      available into Python's buffer and returns one character, after which
+      select() on the descriptor reports "no data" -- so a real arrow looks
+      exactly like a lone Esc, and pressing Down closes the menu.
+    """
+    keys, index = [], 0
+    while index < len(buffer):
+        char = buffer[index]
+        if char != "\x1b":
+            keys.append(char)
+            index += 1
+            continue
+        rest = buffer[index + 1:]
+        if rest.startswith("["):
+            if len(rest) >= 2:
+                keys.append(ARROW_KEYS.get(rest[1], "ESC"))
+                index += 3
+                continue
+            if not flush:
+                break                    # final byte still in flight
+            keys.append("ESC")
+            index = len(buffer)
+            continue
+        if not rest and not flush:
+            break                        # might yet become an arrow
+        keys.append("ESC")
+        index += 1
+    return keys, buffer[index:]
+
+
 def _key_reader(q, stop):
     """Keys go through the same queue as log lines, so a keypress wakes the main
     loop immediately instead of waiting for the next frame."""
+    try:
+        fd = sys.stdin.fileno()
+    except (ValueError, OSError):
+        return
+    pending = ""
     while not stop.is_set():
         try:
-            ready, _, _ = select.select([sys.stdin], [], [], 0.25)
+            ready, _, _ = select.select([fd], [], [], ESC_TIMEOUT if pending else 0.25)
             if ready:
-                ch = sys.stdin.read(1)
-                if ch:
-                    q.put(("key", ch))
+                chunk = os.read(fd, 64).decode("utf-8", "replace")
+                if not chunk:
+                    return
+                pending += chunk
+                keys, pending = decode_keys(pending)
+            elif pending:
+                keys, pending = decode_keys(pending, flush=True)
+            else:
+                continue
+            for key in keys:
+                q.put(("key", key))
         except (ValueError, OSError):
             return
+
+
+
+
+
+
+ARROW_KEYS = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
+# How long to wait for the rest of an escape sequence before deciding a bare Esc
+# was pressed. 50ms proved too tight in practice: the reader thread competes with
+# the render loop for the GIL, so the follow-up bytes of an arrow key could miss
+# the window and arrive as three separate keys - pressing Down closed the menu.
+# 150ms is still imperceptible when actually pressing Esc.
+ESC_TIMEOUT = 0.15
 
 
 def follow(args):
@@ -2148,7 +2585,9 @@ def follow(args):
     probe = SystemProbe()          # cheap and rate-limited; useful in both modes
     history = None if args.no_history else History()
     progress_floor = ProgressFloor()   # displayed progress must never rewind
-    help_visible = False
+    ui = UIState()
+    picker_models = []
+    compare_lines = []
     live_data = None
     live_at = time.time()
     idle_since = time.time()
@@ -2249,7 +2688,8 @@ def follow(args):
             style.width = cols          # keep renderers in step with resizes
             screen.draw(compose_frame(
                 snap, live_text(), style, cols, rows,
-                help_visible=help_visible,
+                help_visible=(ui.view == "help"),
+                ui=ui, picker=picker_models, compare=compare_lines,
                 live_detail=render_live_detail(live_data, snap, style, age,
                                               codex_state, system_state),
                 codex=codex_state, system=system_state), rows, cols)
@@ -2289,11 +2729,13 @@ def follow(args):
             got_data = False
             for kind_, payload in batch:
                 if kind_ == "key":
-                    if payload in ("h", "H", "?"):
-                        help_visible = not help_visible
+                    was = ui.view
+                    if handle_key(ui, payload, picker_models):
                         got_data = True          # repaint at once, don't wait
-                    elif payload in ("q", "Q"):
-                        raise KeyboardInterrupt
+                    if ui.view == "picker" and was != "picker":
+                        picker_models = pickable_models(history)
+                    if ui.view == "compare" and was != "compare":
+                        compare_lines = build_compare(history, ui.model_a, ui.model_b, style)
                     continue
                 if payload is None:
                     raise KeyboardInterrupt
@@ -2409,28 +2851,16 @@ def show_history(args, out=sys.stdout, history=None, now=None):
 
 
 def show_compare(args, out=sys.stdout, history=None, now=None):
+    """Renders through build_compare, the same path the in-TUI view uses."""
     model_a, model_b = args.compare
     hist = history or History()
-    rows = hist.compare(model_a, model_b, days=args.days, now=now)
-    if not rows:
-        out.write("no requests recorded for either model in the last %d days\n" % args.days)
-        return 1
-    out.write("%s vs %s, last %d days\n" % (model_a, model_b, args.days))
+    style = Style.detect(no_color=getattr(args, "no_color", False))
+    out.write("A  %s\nB  %s\n" % (model_a, model_b))
     out.write("compared within prompt-size and cache buckets, because a cached "
               "244-token\nrequest and an uncached 47k one are not the same workload\n\n")
-    out.write("  %-8s %-10s %14s %14s   %s\n"
-              % ("size", "cache", model_a[:14], model_b[:14], "result"))
-    for row in rows:
-        if row["ratio"]:
-            verdict = "%.2fx %s" % (row["ratio"] if row["ratio"] >= 1 else 1 / row["ratio"],
-                                    "faster" if row["ratio"] >= 1 else "slower")
-        else:
-            verdict = "not enough data (need %d each)" % MIN_COMPARE_SAMPLES
-        out.write("  %-8s %-10s %11s %14s   %s\n" % (
-            row["band"], "miss" if row["cache_miss"] else "hit",
-            "%.1f (n=%d)" % (row["a_rate"], row["a_n"]) if row["a_rate"] else "n=%d" % row["a_n"],
-            "%.1f (n=%d)" % (row["b_rate"], row["b_n"]) if row["b_rate"] else "n=%d" % row["b_n"],
-            verdict))
+    lines = build_compare(hist, model_a, model_b, style, days=args.days, now=now)
+    for line in lines:
+        out.write(line + "\n")
     return 0
 
 

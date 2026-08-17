@@ -225,10 +225,14 @@ class TestOutput(HistoryTestCase):
         self.assertIn("not the same workload", text)
 
     def test_compare_says_when_there_is_not_enough_data(self):
+        """Wording belongs to the renderer; what matters is that thin data
+        reports counts and never a ratio."""
         self.add("mtp", n=2)
         self.add("base", n=2)
-        _code, text = self.render(show_compare, Args(compare=["mtp", "base"]))
-        self.assertIn("not enough data", text)
+        _code, text = self.render(show_compare, Args(compare=["mtp", "base"], no_color=True))
+        self.assertIn("need %d each" % MIN_COMPARE_SAMPLES, text)
+        self.assertIn("n=2", text)
+        self.assertNotIn("x faster", text)
 
     def test_export_json_and_csv(self):
         self.add("mtp", n=2)

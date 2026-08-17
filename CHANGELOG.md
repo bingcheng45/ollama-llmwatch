@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.7.0
+
+**Press `c` to compare two models.** Pick them from a list with the arrow keys instead of
+retyping model names into `--compare`.
+
+- The picker shows models from your history *and* models installed but never measured. Today
+  that is the common case: 4 models installed here, 1 with recorded requests. Picking an
+  unmeasured one names the exact `ollama run` command to fix that, which beats a greyed-out row
+  that explains nothing.
+- The comparison shows generation and prefill side by side with bars normalised to the larger
+  value, TTFT, cache rate, draft acceptance, a per-prompt-size breakdown with sample counts, and
+  the time each model takes on your median request.
+- That last line matters most: generation may be 1.43x faster while saving only 10 seconds on a
+  real request, because reading the prompt dominates. Rates flatter; seconds do not.
+- Differences under 5% read as "about the same" rather than a spurious 1.03x, and a bucket with
+  fewer than 5 samples a side reports counts instead of a ratio.
+- `--compare` on the command line renders through the same code, so the two cannot drift apart.
+
+**Fixes found while building it**
+
+- Arrow keys did not work: `sys.stdin.read(1)` buffers everything available, after which
+  `select()` on the descriptor reports no data, so an arrow was indistinguishable from a bare
+  Esc and pressing Down closed the menu. Input now reads the raw fd and decodes a buffer.
+- Three top-level definitions were duplicated by earlier scripted edits, and for `_key_reader`
+  the copies differed, so the stale byte-at-a-time reader silently shadowed the new one and
+  arrow keys stayed broken while the fix sat unreachable with passing unit tests. A test now
+  fails on any shadowed definition.
+- A second guard fails on any function defined but never referenced. It immediately found
+  `busiest_process`, written to name the process competing for the machine and never wired in;
+  it now reports the culprit when a slowdown has no other explanation.
+
+Tests: 238 -> 278.
+
 ## 0.6.0
 
 ### Security

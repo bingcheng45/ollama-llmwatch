@@ -40,3 +40,34 @@ class TestPublishedText(unittest.TestCase):
     def test_faq_uses_headings_not_a_wall_of_bold(self):
         faq = read("README.md").split("## FAQ")[1].split("## How it works")[0]
         self.assertGreater(faq.count("\n### "), 8)
+
+
+class TestNoShadowedDefinitions(unittest.TestCase):
+    """A duplicate top-level definition silently shadows the earlier one.
+
+    This actually happened: a scripted edit inserted a second `_key_reader`
+    instead of replacing the first, so the old byte-at-a-time reader kept
+    running and arrow keys stayed broken while the new code sat unreachable
+    with passing unit tests.
+    """
+
+    def test_every_top_level_name_is_defined_once(self):
+        import ast
+        import collections
+        tree = ast.parse(read("llmwatch.py"))
+        names = [node.name for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.ClassDef))]
+        duplicates = [name for name, count in collections.Counter(names).items() if count > 1]
+        self.assertEqual(duplicates, [], "shadowed definitions: %s" % duplicates)
+
+    def test_no_unreachable_dead_helpers(self):
+        """Anything defined but never referenced is either dead or a bug."""
+        import ast
+        source = read("llmwatch.py")
+        tree = ast.parse(source)
+        defined = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)
+                   and not n.name.startswith("__")}
+        used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        used |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+        orphans = sorted(defined - used - {"main"})
+        self.assertEqual(orphans, [], "defined but never used: %s" % orphans)
