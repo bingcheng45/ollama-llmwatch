@@ -3,8 +3,11 @@
 **Your local model isn't frozen - it's still reading your prompt.** This shows you that, live,
 with a progress bar, an ETA, and a plain-English answer to *"should I keep waiting?"*
 
+And when it finishes: how long that whole thing actually took, at what reasoning effort, and
+whether that was normal. See [How long does a turn take?](#how-long-does-a-turn-take)
+
 ```
- ollama-llmwatch 0.7.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
+ ollama-llmwatch 0.8.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
 PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
          ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
 GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
@@ -91,7 +94,7 @@ ollama-llmwatch              # full-screen board
 ollama-llmwatch --plain      # scrolling output, keeps your shell scrollback
 ollama-llmwatch --last       # summarise the most recent request and exit
 ollama-llmwatch --json       # one JSON object per event, for status bars
-ollama-llmwatch --codex      # also show what Codex is doing (opt-in, see FAQ)
+ollama-llmwatch --codex      # what Codex is doing, and how long this turn has taken (opt-in)
 ollama-llmwatch --log PATH   # if your log isn't auto-detected
 ```
 
@@ -128,13 +131,77 @@ Press `c` and pick two models with the arrow keys:
      A  2m12s    ███████████████████
      B  2m22s    ████████████████████
      A saves 10.2s per request
+
+   median agent turn: your prompt to the final answer, tool time included
+   TURN       A 6m19s (n=11)       B 12m56s (n=9)       all efforts pooled
+     low      A 57.3s (n=6)        B 1m44s (n=4)        A 1.81x quicker
+     high     A 33m29s (n=5)       B 41m02s (n=5)       A 1.23x quicker
 ```
 
-That last block is the point. Generation is 1.43x faster, but on a real request that is only
+That third block is the point. Generation is 1.43x faster, but on a real request that is only
 10 seconds, because reading the prompt dominates. Rates flatter; seconds do not.
+
+The last block is the number you actually waited through. See
+[How long does a turn take?](#how-long-does-a-turn-take) for where it comes from and why the
+pooled row refuses to pick a winner.
 
 Models you have never measured still appear in the list, and picking one tells you exactly how
 to get data for it rather than silently doing nothing.
+
+### How long does a turn take?
+
+A request is one call to the model. A **turn** is one thing you asked for: submit a prompt, wait
+through however many requests and tool calls it takes, read the final answer. That is the number
+people actually mean by "how long does this take", and none of the rest of this tool could see
+it, because the Ollama log has no idea your twelve requests were one question.
+
+Run with `--codex` and llmwatch reads the turn boundaries out of the Codex session file. While a
+turn runs you get a clock; when it ends you get the total, and whether that was normal:
+
+```
+── codex ─────────────────────────────────────────────────────────────
+  last action  shell
+               pytest tests/
+  this turn    12m32s so far - 6 tool calls - effort high
+  waiting on   model for 41.0s
+```
+
+```
+  last turn    12m20s - effort high - 14 tool calls
+               2.1x your usual 6m00s
+```
+
+Reasoning effort is recorded with it, because it is usually the largest single factor and the
+one you control:
+
+```
+$ ollama-llmwatch --turns --days 30
+
+  model                        effort  turns    typical    longest tool calls
+  qwen3.8:27b-mtp-128k           high      5     33m29s      3h21m         16   (2 interrupted, not timed)
+  qwen3.8:27b-mtp-128k            low      6      57.3s     34m29s          0
+  gpt-5.6-sol                    high      2     10m04s     17m09s          0
+
+wall clock from your prompt to the final answer, tool time included
+```
+
+Same model, same machine: 57 seconds on low effort, 33 minutes on high. That is the kind of
+thing worth knowing before you send the prompt rather than after.
+
+Notes on how to read it:
+
+- **Tool time is included**, because it is time you waited. A turn that spent nine minutes
+  running your test suite is a nine-minute turn.
+- **Medians, not means.** One turn where you walked away and left the agent blocked would
+  otherwise set the expectation for every turn after it.
+- **Interrupted turns are counted but never timed.** How long you waited before pressing escape
+  measures your patience, not the model.
+- **The pooled TURN row never names a winner.** A model you mostly ran on low effort against one
+  you mostly ran on high is not a comparison. The verdict lives on the per-effort rows, and only
+  where both sides have at least 3 turns.
+- Durations, model names and effort levels are stored. The message text sitting next to them in
+  the session file is not, and never reaches the database. See
+  [What does the history file store?](#what-does-the-history-file-store)
 
 ### Looking back
 
@@ -143,8 +210,10 @@ benchmark script are just a command:
 
 ```bash
 ollama-llmwatch --history --days 7        # per-model summary, and the change vs last week
+ollama-llmwatch --turns --days 30         # how long a whole turn takes, by model and effort
 ollama-llmwatch --compare MODEL_A MODEL_B # which build is faster, on your real workload
 ollama-llmwatch --export csv              # hand the raw numbers to a spreadsheet
+ollama-llmwatch --export csv --turns      # the same, for turn records
 ollama-llmwatch --no-history              # record nothing this session
 ```
 
@@ -182,7 +251,9 @@ No. Ollama's log contains only timings and bookkeeping - no prompt text, no file
 responses. Nothing leaves your machine.
 
 One exception, and it's opt-in: `--codex` reads your Codex session file, which *does* contain
-commands and file paths. That's exactly why it's off by default.
+commands and file paths. That's exactly why it's off by default. Of what it reads, only turn
+durations, model names and effort levels are ever written to disk; the message text is used for
+nothing and stored nowhere.
 
 ### Will it slow down my model?
 
@@ -267,10 +338,15 @@ models and swap are used to explain them.
 
 ### What does the history file store?
 
-Timings and model names. There is deliberately no column that could hold prompt content,
-matching the property the Ollama log itself has. It lives at
+Timings, model names, and reasoning effort. There is deliberately no column that could hold
+prompt content, matching the property the Ollama log itself has. It lives at
 `~/.local/share/ollama-llmwatch/history.db` (or `$XDG_DATA_HOME`), it is plain SQLite, and
 you can delete it at any time. `--no-history` skips recording entirely.
+
+Two tables: `requests`, one row per model request, and `turns`, one row per agent turn when
+you run with `--codex`. The Codex session file that turn timings come from *does* contain your
+agent's output; the duration, the model and the effort level are lifted out of it and nothing
+else is, which is why `turns` has no column that could hold text either.
 
 ### Why are there two commands?
 
@@ -325,6 +401,12 @@ claim work that hasn't happened.
   Ollama versions. Tests run against real captured logs to catch drift.
 - **TTFT is approximate** - measured as prefill duration, since the log has no record of when
   your client sent the request.
+- **Turn times need `--codex`**, and only Codex. The Ollama log cannot tell that twelve requests
+  were one question, so turn boundaries have to come from the agent. Other agents record the
+  same thing in their own formats; support for them is not written yet.
+- **A turn time is wall clock, not model time.** It includes tool execution, approval prompts,
+  and any time the agent spent waiting on you. That is deliberate, but it means a turn time is
+  not a measurement of the model alone.
 - **The full-screen board clears on quit** (that's how alternate-screen apps work); a text
   summary is printed afterwards, and `--plain` keeps normal scrollback.
 - **Diagnosis thresholds are calibrated on an M1 Max with 27B models.** A 7B on a 4090 has very

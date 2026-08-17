@@ -42,6 +42,30 @@ class TestPublishedText(unittest.TestCase):
         self.assertGreater(faq.count("\n### "), 8)
 
 
+class TestVersionIsConsistent(unittest.TestCase):
+    """One version, in three places that ship to different audiences.
+
+    This drifted: the README's sample board still advertised 0.7.0 while the
+    code and the package had moved on, so the first thing anyone saw on PyPI was
+    a screenshot of the previous release.
+    """
+
+    def version(self):
+        import re
+        match = re.search(r'__version__ = "([^"]+)"', read("llmwatch.py"))
+        return match.group(1)
+
+    def test_pyproject_matches_the_module(self):
+        self.assertIn('version = "%s"' % self.version(), read("pyproject.toml"))
+
+    def test_the_readme_screenshot_is_not_from_a_previous_release(self):
+        self.assertIn("ollama-llmwatch %s " % self.version(), read("README.md"))
+
+    def test_the_changelog_leads_with_this_version(self):
+        first = read("CHANGELOG.md").split("## ")[1].splitlines()[0].strip()
+        self.assertEqual(first, self.version())
+
+
 class TestNoShadowedDefinitions(unittest.TestCase):
     """A duplicate top-level definition silently shadows the earlier one.
 

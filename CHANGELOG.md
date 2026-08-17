@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.8.0
+
+**How long did that whole thing take?** Everything llmwatch measured until now was one model
+request. A person waiting on a coding agent is waiting on a turn: one prompt, however many
+requests and tool calls it takes, and the final answer at the end. With `--codex`, that span is
+now timed, recorded, and comparable.
+
+- A clock while the turn runs (`this turn 12m32s so far - 6 tool calls - effort high`), and the
+  total when it ends, next to whether that was normal for this model: `last turn 12m20s`,
+  `2.1x your usual 6m00s`.
+- **Reasoning effort is recorded with it.** On the development machine the same model on the
+  same hardware medians 57 seconds on low effort and 33 minutes on high. That is not a footnote,
+  it is the largest thing you control, and it was invisible before.
+- `--turns` prints the table: turns, typical, longest and tool calls per model and effort level.
+  This is the question people ask *before* sending a prompt, not after.
+- The compare view (`c`, or `--compare`) gains a turn block, split by effort level for the same
+  reason the rate rows are split by prompt size. The pooled row deliberately never names a
+  winner: a model you mostly ran on low effort against one you mostly ran on high is not a
+  comparison, and a confident ratio sitting above per-effort rows that contradict it is exactly
+  the failure the prompt-size buckets were added to prevent.
+- Medians, not means, so one turn where you walked away does not become the expectation. Turns
+  you interrupted are counted but never timed: that duration measures your patience.
+- Durations come from Codex's own start and end stamps rather than llmwatch's clock, so a turn
+  that was already running when you started llmwatch is still timed correctly. It attaches at
+  the end of the session file and normally never sees a turn begin.
+- Timings only, as everywhere else: `task_complete` carries the agent's final message, and it is
+  dropped where the file is read. The new `turns` table has no column that could hold it.
+- `--codex` now also works under `--plain` and `--json`, which previously ignored it.
+
 ## 0.7.0
 
 **Press `c` to compare two models.** Pick them from a list with the arrow keys instead of

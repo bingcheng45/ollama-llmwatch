@@ -52,7 +52,7 @@ try:
 except ImportError:  # pragma: no cover - py2 only, never hit
     queue = None
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # Frame pacing. The loop wakes on new log data OR on these deadlines, whichever
 # comes first, so fresh data appears immediately while animation (spinner,
@@ -69,6 +69,11 @@ MIN_FRAME_GAP = 1 / 30.0   # hard ceiling so a log flood can't spin the CPU
 MIN_TOKENS_FOR_EXTREMES = 64
 
 RECENT_LIMIT = 20      # requests kept for the sparkline and the recent pane
+
+# "That took 12m20s" is a fact; "which is 2x your usual" is the useful part. Both
+# need enough history behind them not to be noise.
+TURN_TYPICAL_DAYS = 30
+MIN_TURNS_FOR_TYPICAL = 3
 
 # --------------------------------------------------------------------------
 # Events
@@ -201,7 +206,7 @@ def parse_line(line):
     if m:
         # Untrusted: a model name can carry anything. Sanitise before it can
         # reach a terminal (see safe_text).
-        return ModelLoaded(safe_text(m.group(1).rsplit("/", 1)[-1].strip('"'), limit=80))
+        return ModelLoaded(short_model_name(m.group(1)))
 
     return None
 
@@ -672,6 +677,19 @@ def safe_text(value, limit=300):
     if value is None:
         return None
     return RE_CONTROL.sub("", str(value))[:limit]
+
+
+def short_model_name(value):
+    """The last path segment of a model name, sanitised.
+
+    Two sources name the same model differently: the Ollama log writes a file
+    path (`/models/qwen3.8-27b.gguf`), Codex writes a provider-qualified id
+    (`ollama-local/qwen3.8:27b`). History keys on this form so a turn recorded
+    from Codex lines up with the requests recorded from the log.
+    """
+    if value is None:
+        return None
+    return safe_text(str(value).rsplit("/", 1)[-1].strip('"'), limit=80)
 
 
 def visible_len(text):
@@ -1238,11 +1256,61 @@ def render_codex(state, style, width=80):
         limit = max(30, min(72, width - 20))
         out.append("  %s %s" % (style.bold("%-12s" % label),
                                 style.yellow(state["error"][:limit])))
-    if state.get("calls"):
-        out.append("  %-12s %s" % ("this turn", style.dim("%d tool calls" % state["calls"])))
+    # The turn clock: how long since you pressed enter. Every other number here
+    # is about one model request; this is the one you are actually waiting on.
+    elapsed = state.get("turn_seconds")
+    running = elapsed is not None
+    # Once a turn has ended its tool count belongs to "last turn", not to a
+    # "this turn" line that is no longer about anything in flight.
+    if running or not state.get("last_turn"):
+        facts = []
+        if running:
+            facts.append("%s so far" % fmt_duration(elapsed))
+        if state.get("calls"):
+            facts.append("%d tool calls" % state["calls"])
+        if running and state.get("effort"):
+            facts.append("effort %s" % state["effort"])
+        if facts:
+            out.append("  %-12s %s" % ("this turn", style.dim(" - ".join(facts))))
     if state.get("waiting_since") is not None:
         out.append("  %-12s %s" % ("waiting on", style.dim(
             "model for %s" % fmt_duration(state["waiting_since"]))))
+    out.extend(render_last_turn(state.get("last_turn"), style))
+    return out
+
+
+def render_last_turn(turn, style):
+    """What the turn that just finished cost, and whether that was normal.
+
+    The number people want after an agent goes quiet for twenty minutes is not a
+    token rate: it is "how long did that take, and is that what this usually
+    takes?".
+    """
+    if not turn or turn.get("seconds") is None:
+        return []
+    parts = [fmt_duration(turn["seconds"])]
+    if turn.get("effort"):
+        parts.append("effort %s" % turn["effort"])
+    if turn.get("tool_calls"):
+        parts.append("%d tool calls" % turn["tool_calls"])
+    if not turn.get("completed"):
+        parts.append(turn.get("reason") or "interrupted")
+    line = "  %-12s %s" % ("last turn", style.bold(parts[0]))
+    if len(parts) > 1:
+        line += style.dim(" - " + " - ".join(parts[1:]))
+
+    typical = turn.get("typical_seconds")
+    out = [line]
+    if typical:
+        # Only worth saying when it is far enough from typical to act on.
+        ratio = turn["seconds"] / typical if typical else 1.0
+        if ratio >= 1.0 + SAME_WITHIN:
+            note = "%.1fx your usual %s" % (ratio, fmt_duration(typical))
+        elif ratio <= 1.0 - SAME_WITHIN:
+            note = "faster than your usual %s" % fmt_duration(typical)
+        else:
+            note = "about your usual %s" % fmt_duration(typical)
+        out.append("  %-12s %s" % ("", style.dim(note)))
     return out
 
 
@@ -1300,9 +1368,15 @@ HELP_TEXT = [
     ("", ""),
     ("codex pane", "With --codex: what your agent last did, and how long it has been"),
     ("", "waiting. Reads your Codex session file, so it is opt-in."),
+    ("this turn", "Wall clock since you pressed enter, with the reasoning effort the"),
+    ("last turn", "turn is running at. When a turn ends its total is kept, so the next"),
+    ("", "one can be called normal or slow against your own history. Tool time"),
+    ("", "is included: it is time you waited. Durations only are stored, never"),
+    ("", "the message text sitting next to them in the session file."),
     ("", ""),
     ("compare", "Press c to compare two models on your own recorded requests:"),
-    ("", "speed, time-to-first-token, cache, and what it saves per request."),
+    ("", "speed, time-to-first-token, cache, what it saves per request, and"),
+    ("", "median turn time split by effort level. See also --turns."),
     ("", ""),
     ("keys", "h help   -   c compare   -   q or ctrl-c quit"),
 ]
@@ -1442,7 +1516,56 @@ def _pair_bars(label, a_value, b_value, style, suffix="tok/s", width=20):
     return out
 
 
-def render_compare(profile_a, profile_b, buckets, style, cols=80, days=30):
+def render_turns(turns_a, turns_b, style):
+    """Turn time in the comparison: the only row here measured in the unit you
+    actually wait in.
+
+    The verdict lives on the per-effort rows, never on the total. A model you ran
+    mostly on low effort and one you ran mostly on high are not comparable, and
+    pooling them produces exactly the kind of confident-but-meaningless ratio the
+    prompt-size buckets exist to prevent -- 'A 2.05x quicker' sitting directly
+    above a row showing A losing at every effort level both sides share.
+    """
+    turns_a, turns_b = turns_a or {}, turns_b or {}
+    if not (turns_a.get("turns") or turns_b.get("turns")):
+        return []
+
+    def cell(profile):
+        if not profile.get("turns"):
+            return "no turns yet"
+        return "%s (n=%d)" % (fmt_duration(profile["median_seconds"]), profile["turns"])
+
+    lines = ["", style.dim("   median agent turn: your prompt to the final answer, "
+                           "tool time included")]
+    lines.append("   %-10s A %-18s B %-18s %s" % (
+        "TURN", cell(turns_a), cell(turns_b),
+        style.dim("all efforts pooled")))
+
+    efforts_a = turns_a.get("efforts") or {}
+    efforts_b = turns_b.get("efforts") or {}
+    for name in sorted(set(efforts_a) | set(efforts_b)):
+        side_a, side_b = efforts_a.get(name) or {}, efforts_b.get(name) or {}
+        thin = min(side_a.get("turns", 0), side_b.get("turns", 0)) < MIN_COMPARE_TURNS
+        if not (side_a.get("turns") and side_b.get("turns")):
+            result = style.dim("one side only")
+        elif thin:
+            result = style.dim("need %d each" % MIN_COMPARE_TURNS)
+        else:
+            result = style.bold(_verdict(side_b.get("median_seconds"),
+                                         side_a.get("median_seconds"), unit="x quicker"))
+        lines.append("   %-10s A %-18s B %-18s %s" % (
+            "  " + name, cell(side_a), cell(side_b), result))
+
+    interrupted = (turns_a.get("interrupted") or 0) + (turns_b.get("interrupted") or 0)
+    if interrupted:
+        lines.append(style.dim("     %d interrupted turn%s excluded: they measure your "
+                               "patience, not the model"
+                               % (interrupted, "" if interrupted == 1 else "s")))
+    return lines
+
+
+def render_compare(profile_a, profile_b, buckets, style, cols=80, days=30,
+                   turns_a=None, turns_b=None):
     """The comparison. Also used by `--compare` so the CLI and the TUI cannot
     drift apart."""
     if not profile_a or not profile_b:
@@ -1516,6 +1639,7 @@ def render_compare(profile_a, profile_b, buckets, style, cols=80, days=30):
                 result))
 
     lines.extend(render_median_request(profile_a, profile_b, style))
+    lines.extend(render_turns(turns_a, turns_b, style))
     return lines
 
 
@@ -1593,7 +1717,9 @@ def build_compare(history, model_a, model_b, style, cols=100, days=30, now=None)
     return render_compare(history.profile(model_a, days=days, now=now),
                           history.profile(model_b, days=days, now=now),
                           history.compare(model_a, model_b, days=days, now=now),
-                          style, cols, days)
+                          style, cols, days,
+                          turns_a=history.turn_profile(model_a, days=days, now=now),
+                          turns_b=history.turn_profile(model_b, days=days, now=now))
 
 
 def render_help(style, cols, rows):
@@ -1840,6 +1966,11 @@ def plan_frame(now, last_paint, next_frame, got_data, active):
 
 MIN_COMPARE_SAMPLES = 5      # below this, report counts rather than a ratio
 
+# Turns are far rarer than requests -- a busy afternoon is a few dozen, not a few
+# thousand -- so the floor for claiming a turn-time ratio is lower. It is not
+# zero: two turns a side is an anecdote.
+MIN_COMPARE_TURNS = 3
+
 # Prompt-size bands. Comparing a cached 244-token request against an uncached
 # 47,000-token one produces a number that means nothing; bucketing keeps the
 # comparison honest.
@@ -1863,8 +1994,13 @@ class History:
     same "is this model build actually faster?" question ends up being answered
     with a hand-written benchmark script every time.
 
-    Stores timings and model names only. There is deliberately no column that
-    could hold prompt content, matching the property the Ollama log itself has.
+    Two tables: one request as llama-server sees it, and one agent turn as you
+    experience it (prompt submitted to final text, tool calls and all).
+
+    Stores timings, model names and reasoning effort only. There is deliberately
+    no column that could hold prompt content, matching the property the Ollama
+    log itself has -- and which the Codex session file does NOT, which is why
+    only durations are lifted out of it.
     """
 
     SCHEMA = """
@@ -1887,6 +2023,18 @@ class History:
     );
     CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
     CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model, ts);
+
+    CREATE TABLE IF NOT EXISTS turns (
+        id            INTEGER PRIMARY KEY,
+        ts            REAL NOT NULL,
+        model         TEXT NOT NULL,
+        effort        TEXT,
+        seconds       REAL NOT NULL,
+        ttft_seconds  REAL,
+        tool_calls    INTEGER,
+        completed     INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_turns_model ON turns(model, ts);
     """
 
     def __init__(self, path=None):
@@ -1935,6 +2083,95 @@ class History:
             return True
         except sqlite3.Error:
             return False
+
+    def record_turn(self, turn, now=None):
+        """One finished agent turn: prompt submitted to final text.
+
+        Kept in its own table rather than as a column on `requests`, because a
+        turn contains many requests -- and, on an agent, a good deal of time that
+        is not a model request at all.
+        """
+        if not self.conn or not turn or turn.get("seconds") is None:
+            return False
+        try:
+            self.conn.execute(
+                "INSERT INTO turns (ts, model, effort, seconds, ttft_seconds, "
+                "tool_calls, completed) VALUES (?,?,?,?,?,?,?)",
+                (turn.get("ended_at") or (now if now is not None else time.time()),
+                 turn.get("model") or "?", turn.get("effort"),
+                 float(turn["seconds"]), turn.get("ttft_seconds"),
+                 turn.get("tool_calls"), 1 if turn.get("completed") else 0))
+            self.conn.commit()
+            return True
+        except (sqlite3.Error, TypeError, ValueError):
+            return False
+
+    def turn_rows(self, days=None, model=None, now=None):
+        if not self.conn:
+            return []
+        now = now if now is not None else time.time()
+        query, args = "SELECT * FROM turns WHERE ts >= ?", [
+            0 if days is None else now - days * 86400]
+        if model:
+            query += " AND model = ?"
+            args.append(model)
+        try:
+            cur = self.conn.execute(query + " ORDER BY ts", args)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+
+    def turn_profile(self, model, days=30, now=None):
+        """How long a turn takes on this model, split by reasoning effort.
+
+        Medians, not means: one turn where you walked away and left the agent
+        blocked on an approval prompt would otherwise set the expectation for
+        every turn after it. Interrupted turns are counted but never timed --
+        their duration measures your patience, not the model.
+        """
+        if not self.conn:
+            return None
+        rows = self.turn_rows(days=days, model=model, now=now)
+        done = [r for r in rows if r.get("completed")]
+        by_effort = {}
+        for row in done:
+            by_effort.setdefault(row.get("effort") or "unknown", []).append(row)
+        return {
+            "model": model,
+            "turns": len(done),
+            "interrupted": len(rows) - len(done),
+            "median_seconds": self._median([r.get("seconds") for r in done]),
+            "median_ttft": self._median([r.get("ttft_seconds") for r in done]),
+            "median_tool_calls": self._median([r.get("tool_calls") for r in done]),
+            "total_seconds": sum(r.get("seconds") or 0 for r in done),
+            "efforts": {
+                name: {"turns": len(group),
+                       "median_seconds": self._median([r.get("seconds") for r in group]),
+                       "median_ttft": self._median([r.get("ttft_seconds") for r in group])}
+                for name, group in sorted(by_effort.items())
+            },
+        }
+
+    def turn_rollup(self, days=7, model=None, now=None):
+        """One row per model and effort level, for `--turns`."""
+        if not self.conn:
+            return []
+        rows = self.turn_rows(days=days, model=model, now=now)
+        groups = {}
+        for row in rows:
+            groups.setdefault((row["model"], row.get("effort") or "unknown"), []).append(row)
+        out = []
+        for (name, effort), group in sorted(groups.items()):
+            done = [r for r in group if r.get("completed")]
+            out.append({
+                "model": name, "effort": effort,
+                "turns": len(done), "interrupted": len(group) - len(done),
+                "median_seconds": self._median([r.get("seconds") for r in done]),
+                "longest_seconds": max([r.get("seconds") or 0 for r in done] or [0]) or None,
+                "median_tool_calls": self._median([r.get("tool_calls") for r in done]),
+            })
+        return out
 
     def _rows(self, since, until=None, model=None):
         query = "SELECT * FROM requests WHERE ts >= ?"
@@ -2263,6 +2500,10 @@ class CodexTail:
                        "permission denied", "is not recognized as an internal")
     RE_EXIT_CODE = re.compile(r"process exited with code (\d+)", re.I)
 
+    # A turn longer than this is a misread field or a clock that moved, not a
+    # real wait. Reporting "37h" as a turn time is worse than reporting nothing.
+    MAX_TURN_SECONDS = 12 * 3600
+
     def __init__(self, path=None, sessions_dir=None):
         # An explicit path pins one session; otherwise follow whichever is newest.
         self.fixed_path = path
@@ -2277,6 +2518,19 @@ class CodexTail:
         self.last_call_at = None
         self.error = None
         self.error_repeats = 0
+        # ---- turn tracking ------------------------------------------------
+        # A turn is one user prompt: submitted, then thinking, tool calls and
+        # output, until the agent stops. That whole span is the number a user
+        # actually feels, and no part of it is visible in the Ollama log, which
+        # only ever sees the individual model requests inside it.
+        self.model = None            # thread-level model, last seen
+        self.effort = None           # thread-level reasoning effort, last seen
+        self.turn_id = None
+        self.turn_started = None     # our own clock, only used as a fallback
+        self.turn_model = None
+        self.turn_effort = None
+        self.last_turn = None        # the most recently finished turn
+        self.finished = []           # finished turns not yet handed over
 
     def newest_session(self):
         root = os.path.expanduser(self.sessions_dir)
@@ -2383,10 +2637,108 @@ class CodexTail:
             self.action = "thinking"
             self.detail = None
             self.last_call_at = time.time()
+            self._start_turn(payload)
+        elif kind == "turn_context":
+            # Per-turn settings, and the authoritative effort for this turn: a
+            # thread default can be changed between turns.
+            settings = (payload.get("collaboration_mode") or {}).get("settings") or {}
+            self.turn_model = short_model_name(payload.get("model")) or self.turn_model
+            effort = self._effort(settings.get("reasoning_effort"))
+            if effort:
+                self.turn_effort = effort
+        elif kind == "thread_settings_applied":
+            settings = payload.get("thread_settings") or {}
+            self.model = short_model_name(settings.get("model")) or self.model
+            self.effort = self._effort(settings.get("reasoning_effort")) or self.effort
         elif kind == "task_complete":
             self.action = "done"
             self.detail = None
             self.last_call_at = None
+            self._finish_turn(payload, completed=True)
+        elif kind == "turn_aborted":
+            self.action = "interrupted"
+            self.detail = None
+            self.last_call_at = None
+            self._finish_turn(payload, completed=False)
+
+    # ---- turns ------------------------------------------------------------
+
+    EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+    @classmethod
+    def _effort(cls, value):
+        """Only record an effort level we recognise. An unknown string would
+        become its own bucket in the history and split the samples for no gain."""
+        if value is None:
+            return None
+        name = safe_text(str(value), limit=16).strip().lower()
+        return name if name in cls.EFFORTS else None
+
+    @staticmethod
+    def _number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    def _start_turn(self, payload):
+        self.turn_id = safe_text(payload.get("turn_id"), limit=64)
+        started = self._number(payload.get("started_at"))
+        self.turn_started = started if started else time.time()
+        self.turn_model = self.model
+        # Inherit the thread default until this turn's own context arrives.
+        self.turn_effort = self.effort
+
+    def _turn_seconds(self, payload):
+        """Codex's own clock first: it knows when the prompt was submitted, and
+        llmwatch attaches at the end of the file, so it may never have seen the
+        start of a turn that is already running."""
+        seconds = self._number(payload.get("duration_ms"))
+        seconds = seconds / 1000.0 if seconds is not None else None
+        if seconds is None:
+            started = self._number(payload.get("started_at"))
+            ended = self._number(payload.get("completed_at"))
+            if started and ended:
+                seconds = ended - started
+        if seconds is None and self.turn_started:
+            seconds = time.time() - self.turn_started
+        if seconds is None or seconds < 0 or seconds > self.MAX_TURN_SECONDS:
+            return None
+        return seconds
+
+    def _finish_turn(self, payload, completed):
+        """One finished turn, as a row.
+
+        Content is dropped here and never travels further: `task_complete`
+        carries `last_agent_message`, the agent's final text, which is exactly
+        the kind of thing the rest of this tool refuses to keep.
+        """
+        seconds = self._turn_seconds(payload)
+        ttft = self._number(payload.get("time_to_first_token_ms"))
+        ended = self._number(payload.get("completed_at"))
+        turn = {
+            "turn_id": safe_text(payload.get("turn_id"), limit=64) or self.turn_id,
+            "model": self.turn_model or self.model,
+            "effort": self.turn_effort or self.effort,
+            "seconds": seconds,
+            "ttft_seconds": (ttft / 1000.0) if ttft is not None and ttft >= 0 else None,
+            "tool_calls": self.calls,
+            "completed": bool(completed),
+            "reason": None if completed else (safe_text(payload.get("reason"), limit=40)
+                                              or "interrupted"),
+            "ended_at": ended if ended else time.time(),
+        }
+        self.turn_id = None
+        self.turn_started = None
+        if seconds is None:
+            return          # nothing trustworthy to show or store
+        self.last_turn = turn
+        self.finished.append(turn)
+
+    def drain(self):
+        """Hand over finished turns exactly once, so a caller can record them
+        without having to track what it has already seen."""
+        out, self.finished = self.finished, []
+        return out
 
     @staticmethod
     def _summarise(arguments):
@@ -2409,9 +2761,14 @@ class CodexTail:
         if not self.path:
             return None
         waiting = (time.time() - self.last_call_at) if self.last_call_at else None
+        elapsed = (time.time() - self.turn_started) if self.turn_started else None
         return {"action": self.action, "detail": self.detail,
                 "calls": self.calls, "waiting_since": waiting,
-                "error": self.error, "error_repeats": self.error_repeats}
+                "error": self.error, "error_repeats": self.error_repeats,
+                "turn_seconds": elapsed,
+                "effort": self.turn_effort or self.effort,
+                "model": self.turn_model or self.model,
+                "last_turn": self.last_turn}
 
 
 class Keyboard:
@@ -2581,7 +2938,9 @@ def follow(args):
     stats = Stats()
     screen = Screen() if tui else None
     keyboard = Keyboard() if tui else None
-    codex_tail = CodexTail() if (tui and args.codex) else None
+    # Not gated on `tui`: turn timings are worth recording in --plain and --json
+    # runs too, and they are the one thing here that outlives the session.
+    codex_tail = CodexTail() if args.codex else None
     probe = SystemProbe()          # cheap and rate-limited; useful in both modes
     history = None if args.no_history else History()
     progress_floor = ProgressFloor()   # displayed progress must never rewind
@@ -2665,6 +3024,35 @@ def follow(args):
                 commit("  " + style.dim(out.text))
         return changed
 
+    def poll_codex():
+        """Read the agent's session file and bank any turn that just finished.
+
+        Separate from paint() because a --json or --plain run never paints, and
+        the turn record is the part worth keeping either way.
+        """
+        if not codex_tail:
+            return
+        codex_tail.poll()
+        for turn in codex_tail.drain():
+            model = turn.get("model") or tracker.model
+            turn["model"] = model
+            if history:
+                # Compare against what this model USUALLY takes before adding
+                # this turn to the pile, or a slow turn quietly raises the bar
+                # it is being measured against.
+                profile = history.turn_profile(model, days=TURN_TYPICAL_DAYS)
+                if profile and profile.get("turns") >= MIN_TURNS_FOR_TYPICAL:
+                    turn["typical_seconds"] = profile["median_seconds"]
+                history.record_turn(turn)
+            if args.json:
+                sys.stdout.write(json.dumps(dict(turn, event="turn_end")) + "\n")
+                sys.stdout.flush()
+            elif not tui:
+                effort = (" at %s effort" % turn["effort"]) if turn.get("effort") else ""
+                verb = "turn finished" if turn.get("completed") else "turn interrupted"
+                commit("  " + style.cyan("%s in %s%s"
+                                         % (verb, fmt_duration(turn["seconds"]), effort)))
+
     def live_text():
         if live_data is not None:
             return render_live(live_data, time.time() - live_at, style,
@@ -2681,8 +3069,6 @@ def follow(args):
             cols, rows = screen.size()
             snap = stats.snapshot(tracker.model)
             age = time.time() - live_at
-            if codex_tail:
-                codex_tail.poll()
             codex_state = codex_tail.state() if codex_tail else None
             system_state = probe.snapshot() if probe else None
             style.width = cols          # keep renderers in step with resizes
@@ -2747,6 +3133,10 @@ def follow(args):
             do_paint, next_frame = plan_frame(now, last_paint, next_frame, trigger,
                                               live_data is not None)
             if do_paint:
+                # On the frame tick rather than every wakeup: a burst of log
+                # lines must not turn into a burst of stat() calls on the
+                # session file.
+                poll_codex()
                 if not tui:
                     dirty = True
                 paint()
@@ -2864,9 +3254,44 @@ def show_compare(args, out=sys.stdout, history=None, now=None):
     return 0
 
 
+def show_turns(args, out=sys.stdout, history=None, now=None):
+    """How long a turn takes, per model and effort level.
+
+    The question this answers is the one you ask before sending a prompt, not
+    after: "if I send this to that model at high effort, am I waiting one minute
+    or twenty?"
+    """
+    hist = history or History()
+    rows = hist.turn_rollup(days=args.days, model=args.model, now=now)
+    if not rows:
+        out.write("no turns recorded yet - run llmwatch --codex alongside your agent "
+                  "and it will fill in\n")
+        return 1
+    out.write("last %d day%s\n\n" % (args.days, "" if args.days == 1 else "s"))
+    out.write("  %-26s %8s %6s %10s %10s %s\n"
+              % ("model", "effort", "turns", "typical", "longest", "tool calls"))
+    for row in rows:
+        note = ""
+        if row["interrupted"]:
+            note = "   (%d interrupted, not timed)" % row["interrupted"]
+        out.write("  %-26s %8s %6d %10s %10s %10s%s\n" % (
+            row["model"][:26], row["effort"], row["turns"],
+            fmt_duration(row["median_seconds"]) if row["median_seconds"] else "-",
+            fmt_duration(row["longest_seconds"]) if row["longest_seconds"] else "-",
+            # A turn that ran no tools is a real answer, so 0 must print as 0.
+            ("%.0f" % row["median_tool_calls"])
+            if row["median_tool_calls"] is not None else "-",
+            note))
+    out.write("\nwall clock from your prompt to the final answer, tool time included\n")
+    return 0
+
+
 def export_history(args, out=sys.stdout, history=None, now=None):
     hist = history or History()
-    rows = hist.all_rows(days=args.days, now=now)
+    if getattr(args, "turns", False):
+        rows = hist.turn_rows(days=args.days, now=now)
+    else:
+        rows = hist.all_rows(days=args.days, now=now)
     if args.export == "json":
         out.write(json.dumps(rows, indent=2) + "\n")
         return 0
@@ -2892,11 +3317,14 @@ def main(argv=None):
                         help="per-model summary from your recorded history")
     parser.add_argument("--compare", nargs=2, metavar=("MODEL_A", "MODEL_B"),
                         help="compare two models on like-for-like recorded requests")
+    parser.add_argument("--turns", action="store_true",
+                        help="how long a whole agent turn takes, by model and "
+                             "reasoning effort (needs --codex to have been recording)")
     parser.add_argument("--export", choices=("json", "csv"),
-                        help="dump recorded history")
+                        help="dump recorded history (add --turns for turn records)")
     parser.add_argument("--days", type=int, default=7,
-                        help="window for --history/--compare/--export (default 7)")
-    parser.add_argument("--model", help="restrict --history to one model")
+                        help="window for --history/--turns/--compare/--export (default 7)")
+    parser.add_argument("--model", help="restrict --history/--turns to one model")
     parser.add_argument("--no-history", action="store_true",
                         help="do not record this session (timings only are ever stored)")
     parser.add_argument("--codex", action="store_true",
@@ -2912,12 +3340,14 @@ def main(argv=None):
 
     if args.log:
         os.environ["LLMWATCH_LOG"] = args.log
+    if args.export:
+        return export_history(args)        # --turns selects which table
     if args.history:
         return show_history(args)
+    if args.turns:
+        return show_turns(args)
     if args.compare:
         return show_compare(args)
-    if args.export:
-        return export_history(args)
     return summarise_last(args) if args.last else follow(args)
 
 
