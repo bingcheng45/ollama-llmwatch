@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 # [project.scripts]); it is the one name that could collide if someone has both
 # packages installed, which is why it is the alias and not the canonical name.
 name = "ollama-llmwatch"
-version = "0.5.1"
+version = "0.5.2"
 description = "See what your local Ollama model is actually doing: live prefill progress, ETA, and tok/s."
 readme = "README.md"
 license = { text = "MIT" }

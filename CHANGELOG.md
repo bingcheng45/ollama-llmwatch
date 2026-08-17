@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.2
+
+First public release on PyPI: `uv tool install ollama-llmwatch`.
+
+- **README rewritten for people who have never seen this before.** Install command is now in the
+  first screen instead of halfway down; added a "reading the screen" table and an FAQ covering
+  the questions that actually come up — does it need internet, does it read my prompts, why is my
+  model slow, what's a good tok/s, why no CPU/GPU percentage, does it work with other clients.
+- **Diagrams redrawn in ASCII.** The mermaid versions rendered on GitHub but appeared as raw code
+  blocks on PyPI, where most people will first see this.
+- Bumped `actions/checkout` and `actions/setup-python`, which were running on deprecated Node 20.
+
 ## 0.5.1 — unreleased
 
 Renamed to **ollama-llmwatch** everywhere — PyPI, GitHub and the command — so the project has

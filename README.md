@@ -1,16 +1,15 @@
 # ollama-llmwatch
 
-**Your local model isn't stuck — it's still reading your prompt.** It shows you that,
-live, with a progress bar, an ETA, and a stats board.
+**Your local model isn't frozen — it's still reading your prompt.** This shows you that, live,
+with a progress bar, an ETA, and a plain-English answer to *"should I keep waiting?"*
 
 ```
- llmwatch 0.5.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
+ ollama-llmwatch 0.5.2   qwen3.8:27b-mtp-128k   12 req - 18m04s
 PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
          ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
 GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
          ▂▃▄▅▆▇█▇▆▅▄▃▂▁▂▃ last 16
-CACHE      68% reused - 149,204 tok never recomputed - 2 full rereads
-DRAFT      53% accepted - speculative decoding is paying off
+CACHE      68% reused - 149,204 tok never recomputed
 TTFT     min 0.3s - avg 1m52s - max 8m11s (approx: prefill time)
 WAIT     ██████████████████░░ 91% of session spent in prefill
 SYSTEM   ! swapping 2.5/4.0 GB
@@ -23,263 +22,205 @@ SYSTEM   ! swapping 2.5/4.0 GB
     cache working: only 6,144 of 21,050 tok to read   answer ready ~1m45s
 ```
 
----
-
-## The problem, in plain English
-
-When you run a model on your own machine, a request happens in two very different steps.
-
-**Step 1 — the model reads your prompt.** Every message, every file, every tool description
-your coding agent sends. Nothing is printed while this happens.
-
-**Step 2 — the model writes its answer.** Now you see text appear.
-
-Step 1 is usually the long one, and it is completely silent. A coding agent like Codex or
-Claude Code sends 30,000–55,000 tokens of instructions on *every* turn. On an M1 Max running a
-27B model, that's around **eight minutes of reading** before a single character appears — while
-the answer itself takes about twenty seconds.
-
-So you sit looking at a spinner with no idea whether the model is working, stuck, or about to
-finish. That's the whole problem.
-
-## How llmwatch helps
-
-It sits beside your agent in another terminal and answers the questions the spinner can't:
-
-| you wonder | llmwatch tells you |
-|---|---|
-| "Is it stuck, or working?" | a bar that moves, updated 10x a second |
-| "How much longer?" | a real ETA, counting down |
-| "Is it reading or writing?" | separate PREFILL and GENERATE phases |
-| "Why was that one so fast?" | how much of the prompt came from cache |
-| "Is my machine getting slower?" | peak / average / low speeds, plus a trend line |
-| "Which model build is faster?" | stats kept per model, never mixed together |
-| **"Should I keep waiting or kill it?"** | **a one-line diagnosis — see below** |
-| "Why did it suddenly get slow?" | detects it, and names what's competing |
-
-### The line that helps you decide
-
-Under the progress bar, llmwatch says what's actually going on, in a few words:
-
-```
-! cache gone - rereading all 39,528 tok (~6m35s)        answer ready ~7m10s
-! same prompt 4x - agent may be stuck in a loop
-! 3 cancels in a row - client keeps timing out
-long chat: reading 45,000 tok this turn (~7m30s) - consider compacting
-! slow: 40 vs 100 tok/s usual - 2 models loaded (34 GB), swapping 3.0/4.0 GB
-! same tool error 3x - agent stuck on a broken call
-cache working: only 244 of 41,253 tok to read
-drafts 22% accepted - MTP is slowing this one down
-```
-
-The first one is the big one: if the cache is gone, you're paying full price to re-read
-everything, and that's usually the moment to interrupt rather than wait. `answer ready ~7m10s`
-estimates when the *whole answer* will be finished — not just when text starts appearing —
-using your own measured rates.
-
-## Why not just use an existing tool
-
-Ollama's API doesn't send anything until the model has finished reading your prompt. So every
-monitor built on that API — including good ones like
-[otop](https://github.com/TiniLLM/ollama-token-monitor) and
-[howfast](https://github.com/spinualexandru/howfast) — can only show you step 2.
-
-llama.cpp added a progress field for exactly this
-([#14685](https://github.com/ggml-org/llama.cpp/issues/14685)), but Ollama doesn't pass it
-through. **The server log is currently the only place this information exists**, and reading it
-is what makes llmwatch different.
-
-Use otop if you want a system dashboard. Use llmwatch if you want to know why nothing has
-happened for four minutes.
-
-
-### Why there's no CPU or GPU percentage
-
-Deliberate. On Apple Silicon, generation is **memory-bandwidth bound**: during inference the GPU
-sits pinned near 100% and the CPU near idle, whether you're getting 13 tok/s or 8. Those numbers
-don't move when performance does, so they'd be decoration. (GPU utilisation also needs
-`powermetrics`, which requires sudo.)
-
-What actually costs you throughput, measured on an M1 Max:
-
-| cause | measured effect |
-|---|---|
-| A second model loaded (50 GB of 64) | ~28% slower |
-| Background apps competing for bandwidth | ~20% slower |
-| Another process hammering the GPU | ~44% slower |
-
-So llmwatch detects slowdowns from **its own rate measurements** — it already knows the only
-number that matters — and then uses cheap, sudo-free signals (loaded models, swap, memory
-pressure, load average) purely to explain them:
-
-```
-SYSTEM   ! 2 models loaded (34 GB), swapping 3.0/4.0 GB
-```
-
-## Setup
-
-Needs Python 3.9+, Ollama running locally, and read access to its log. No other dependencies.
+## Install
 
 ```bash
 uv tool install ollama-llmwatch      # or: pipx install ollama-llmwatch
-llmwatch
+ollama-llmwatch
 ```
 
-Or just take the single file:
+That's it. Python 3.9+, no dependencies, works with your existing Ollama install. Run it in a
+terminal next to whatever is using the model.
+
+Prefer a single file? It's one script with no dependencies:
 
 ```bash
 curl -O https://raw.githubusercontent.com/bingcheng45/ollama-llmwatch/main/llmwatch.py
 chmod +x llmwatch.py && ./llmwatch.py
 ```
 
-This installs two commands: **`ollama-llmwatch`** (canonical) and **`llmwatch`** (short alias).
-The name is `ollama-llmwatch` everywhere because the bare `llmwatch` is taken on PyPI by an
-unrelated cost-tracking project.
+Two commands are installed: `ollama-llmwatch` and the shorter `llmwatch`. Same program.
 
-It finds your log automatically. If it can't, it prints every location it tried:
+## The problem
 
-```bash
-llmwatch --log /opt/homebrew/var/log/ollama.log
-LLMWATCH_LOG=/path/to/ollama.log llmwatch
-```
+A local model request has two steps, and they behave completely differently:
 
-### Keys (full-screen mode)
+**1. It reads your prompt.** Silent. Nothing appears. This is usually the long part.
+**2. It writes the answer.** Now you see text.
 
-| key | what it does |
+A coding agent sends 30,000–55,000 tokens of instructions *every turn*. On an M1 Max running a
+27B model that's roughly **eight minutes of silent reading** before a single character appears,
+while the answer itself takes about twenty seconds.
+
+So you stare at a spinner with no idea whether it's working, stuck, or nearly done. Ollama's API
+sends nothing during that window, so every other monitor is blind to it too. The server log is
+the only place the information exists — that's what this reads.
+
+## Reading the screen
+
+| what you see | what it means |
 |---|---|
-| `h` | open/close the help screen — what every phase, column and number means |
-| `q` or `ctrl-c` | quit |
+| `PREFILL` | reading your prompt — the silent part, with a real ETA |
+| `GENERATE` | writing the answer |
+| `+41,009 cached` | reused from a previous request, costing nothing |
+| `WAIT ███░ 91%` | share of your session spent reading rather than writing |
+| `SYSTEM !` | something is competing for your machine |
+| `answer ready ~7m10s` | when the *whole answer* will be done, from your measured rates |
 
-The help screen keeps the live line visible, so you never lose sight of a running request just
-because you asked what a column means.
+And the line that helps you decide whether to wait it out:
 
-### Options
+```
+! cache gone - rereading all 39,528 tok (~6m35s)
+! same prompt 4x - agent may be stuck in a loop
+! 3 cancels in a row - client keeps timing out
+! slow: 40 vs 100 tok/s usual - 2 models loaded (34 GB), swapping 3.0/4.0 GB
+long chat: reading 45,000 tok this turn (~7m30s) - consider compacting
+cache working: only 244 of 41,253 tok to read
+```
+
+`cache gone` is the big one: nothing was reused, you're paying full price to re-read everything,
+and that's usually the moment to interrupt rather than wait.
+
+## Usage
 
 ```bash
-llmwatch                  # full-screen board
-llmwatch --plain          # scrolling single-line output, keeps shell scrollback
-llmwatch --last           # summarise the most recent request and exit
-llmwatch --json           # one JSON object per event, for status bars and scripts
-llmwatch --codex          # also show what Codex is doing (see below)
-llmwatch --debug-unparsed # show log lines it failed to understand (for bug reports)
+ollama-llmwatch              # full-screen board
+ollama-llmwatch --plain      # scrolling output, keeps your shell scrollback
+ollama-llmwatch --last       # summarise the most recent request and exit
+ollama-llmwatch --json       # one JSON object per event, for status bars
+ollama-llmwatch --codex      # also show what Codex is doing (opt-in, see FAQ)
+ollama-llmwatch --log PATH   # if your log isn't auto-detected
 ```
 
-### Seeing what your agent is doing (`--codex`)
+Press **`h`** for in-app help explaining every number. **`q`** or **ctrl-c** quits.
 
-Ollama's log contains no prompt content, so llmwatch can't know what your agent is up to from
-there. Codex, however, records its own activity, and `--codex` reads it:
+---
 
-```
-── codex ──────────────────────────────────────────────
-  last action  exec_command
-               cd ~/ai_projects/memory-chess && rg -lF "useGame" src…
-  this turn    10 tool calls
-  waiting on   model for 2m29s
-```
+## FAQ
 
-**Opt-in on purpose.** Unlike the Ollama log, your Codex session file contains real content —
-commands, file paths, message text — so llmwatch only reads it when you ask. Two caveats: it's
-Codex-specific (not Claude Code), and it's correlated to model activity **by time, not by
-request id**, because no shared identifier exists between the two.
+**Does this need an internet connection?**
+No. Neither does your model — local inference is entirely offline; the internet is only needed
+to *download* models. ollama-llmwatch makes no network calls at all: it reads a local log file.
+There's a test that fails if anyone adds a network client.
+
+**Does it read my prompts or send anything anywhere?**
+No. Ollama's log contains only timings and bookkeeping — no prompt text, no file names, no
+responses. Nothing leaves your machine. The one exception is opt-in: `--codex` reads your Codex
+session file, which *does* contain commands and file paths, which is exactly why it's off by
+default.
+
+**Will it slow down my model?**
+No. It reads a file and repaints a terminal. The expensive checks are rate-limited (`ollama ps`
+every 15 seconds, a process lookup only when a slowdown is already detected).
+
+**Why is my local model so slow?**
+Usually not the reason people assume. Generation is limited by memory bandwidth: your machine
+must read the entire model from memory *for every single token*. A 16 GB model on an M1 Max
+(400 GB/s) caps out around 25 tok/s no matter what. But the bigger cost is usually prefill —
+re-reading a huge agent prompt every turn. Watch the `WAIT` line: if it says 90%+, your problem
+is prompt size, not model speed.
+
+**What's a good tok/s?**
+Depends entirely on model size, because it's bandwidth-bound. Rough figures for an M1 Max:
+a 27B at Q4 gives 10–17 tok/s; a 14B roughly 25–30; a mixture-of-experts model like Qwen3-30B-A3B
+far more, since it only reads a fraction of its weights per token. If you want speed, a smaller
+or MoE model beats any amount of tuning.
+
+**How do I actually make things faster?**
+In the order that pays off: cut your agent's prompt size (fewer plugins/tools loaded), compact
+long conversations, close things competing for memory bandwidth, then consider a smaller or MoE
+model. Tuning flags is the least effective lever.
+
+**Nothing shows up / the board stays empty.**
+Run `ollama-llmwatch --debug-unparsed` and see whether log lines are arriving but not being
+understood. The parser reads an internal llama.cpp format that can change between Ollama
+versions — if you see `UNPARSED:` lines, please
+[open an issue](https://github.com/bingcheng45/ollama-llmwatch/issues) with a sample. If nothing
+appears at all, check the log path with `--log`.
+
+**Does it work with Claude Code / open-webui / my own script?**
+Yes. It watches the Ollama *server*, so it doesn't care which client is talking to it. The only
+Codex-specific part is the optional `--codex` pane.
+
+**Does it work with LM Studio, llama.cpp directly, or vLLM?**
+Not yet — the parser targets Ollama's bundled `llama-server`. llama.cpp's own server uses a
+similar format, so support is plausible; open an issue if you'd use it.
+
+**Linux? Windows?**
+Developed and verified on macOS. Linux (journald) and Docker paths are written but unverified —
+reports very welcome. Windows isn't supported.
+
+**Why is there no CPU or GPU percentage?**
+Because they don't move when performance does. During inference the GPU sits pinned near 100%
+and the CPU near idle whether you're getting 13 tok/s or 8 — the bottleneck is memory bandwidth,
+not compute. (GPU utilisation on macOS also requires sudo.) Instead, slowdowns are detected from
+actual measured throughput, and cheap signals like loaded models and swap are used to explain
+them.
+
+**Why two commands?**
+`llmwatch` alone was taken on PyPI by an unrelated project, so the package is
+`ollama-llmwatch`. Both commands are installed; use whichever you prefer.
+
+---
 
 ## How it works
 
-llmwatch never talks to Ollama's API. It reads the log that Ollama's inference engine
-(`llama-server`) already writes, and reconstructs what each request is doing.
-
-```mermaid
-flowchart TD
-    A[Your coding agent<br/>Codex / Claude Code] -->|HTTP request| B[Ollama server]
-    B --> C[llama-server<br/>the inference engine]
-    C -->|writes timing lines| D[(ollama.log)]
-    D -->|tail -F, background thread| E[parse_line<br/>one line to one event]
-    E --> F[Tracker<br/>groups events by slot + task id]
-    F --> G[Stats<br/>per-model totals]
-    F --> H[live view<br/>bar, ETA, spinner]
-    G --> I[stats board]
-    H --> I
-    I --> J[your terminal]
-```
-
-### How it knows which request is which
-
-`llama-server` handles requests in **slots**, and every log line is tagged with a slot id and a
-task id:
+It never talks to Ollama's API. It tails the log that Ollama's inference engine already writes:
 
 ```
-slot print_timing: id  0 | task 2313 | prompt processing, n_tokens = 4096, progress = 0.27 ...
+  your agent  ──HTTP──►  Ollama  ──►  llama-server  ──writes──►  ollama.log
+                                                                     │
+                                                                tail -F
+                                                                     ▼
+                                                    parse ─► track by slot+task ─► screen
+```
+
+Every log line is tagged with a slot and task id:
+
+```
+slot print_timing: id  0 | task 2313 | prompt processing, n_tokens = 4096, progress = 0.27
                    ^^^^^   ^^^^^^^^^
-                   slot    task
 ```
 
-llmwatch keys everything on `(slot, task)`, which is what lets it stay correct when two models
-are loaded and their log lines interleave. A request's life looks like this:
+Keying on `(slot, task)` is what keeps things straight when two models are loaded and their
+output interleaves. A request moves through: *reading* → *waiting for first token* → *writing* →
+*done*, or *cancelled* if the client disconnects.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Reading: "new prompt, task.n_tokens = N"
-    Reading --> Reading: "prompt processing, progress = ..."  (every 512 tokens)
-    Reading --> FirstToken: prompt batches finished
-    FirstToken --> Writing: "n_decoded = ..."  (first token appears)
-    Writing --> Writing: "n_decoded = ..."     (every ~50 tokens)
-    Writing --> Done: "total time = ..."
-    Reading --> Cancelled: a new task starts on the same slot
-    Writing --> Cancelled: a new task starts on the same slot
-    Done --> [*]
-    Cancelled --> [*]
-```
+Two details that cause most confusion:
 
-Two details that cause most of the confusion:
+- **Caching.** If part of your prompt is already cached, only the rest is computed.
+  ollama-llmwatch counts *only tokens that need work* and shows the cached amount separately.
+  Ollama's own progress number counts cached tokens too, which is why a naive reading says
+  "96% done" when ten seconds of work remain.
+- **The gap after reading.** Between the last prompt batch and the first output token, the server
+  builds logits and validates its cache while logging nothing. That shows as
+  `waiting for first token` with a running clock, rather than a full bar that looks stalled.
 
-- **Cache.** If part of your prompt is already in the server's cache, only the rest is
-  computed. llmwatch counts **only the tokens that actually need work**, and shows the cached
-  amount separately. Ollama's own progress number counts cached tokens too, which is why a
-  naive reading says "96% done" when 10 seconds of work remain.
-- **The gap after reading.** Between the last prompt batch and the first output token, the
-  server builds logits and validates its cache — and logs *nothing*. llmwatch shows
-  `prompt read - waiting for first token` with a running clock, instead of a full bar that
-  looks stalled.
+The server writes a progress line only every 512 tokens — 5–10 seconds apart — so position is
+projected from the last measured rate and repainted 10x/second, clamped so the bar can never
+claim work that hasn't happened.
 
-### Between log lines
+## Limitations
 
-The server writes a progress line only once per 512 tokens — every 5–10 seconds at typical
-speeds. Rather than freeze between them, llmwatch projects position from the last measured rate
-and repaints 10x a second, clamped so the bar can never claim work that hasn't happened. New
-log data repaints immediately.
+- **It can't show what your agent is doing** (file names, tool calls) — that isn't in Ollama's
+  log. `--codex` reads Codex's own session file to fill that gap.
+- **Needs local log access.** A remote Ollama server won't work.
+- **Depends on an internal log format** with no stability guarantee; it may change between
+  Ollama versions. Tests run against real captured logs to catch drift.
+- **TTFT is approximate** — measured as prefill duration, since the log has no record of when
+  your client sent the request.
+- **The full-screen board clears on quit** (that's how alternate-screen apps work); a text
+  summary is printed afterwards, and `--plain` keeps normal scrollback.
+- **Diagnosis thresholds are calibrated on an M1 Max with 27B models.** A 7B on a 4090 has very
+  different ideas about what counts as slow.
 
-## Limitations and known issues
+## Contributing
 
-Honest list. Please add to it via issues.
+Issues and PRs welcome — including "this number looks wrong". Several fixes so far came from
+exactly that.
 
-- **It cannot show what your agent is doing.** The log contains timings only — no prompts, no
-  file names, no tool calls. `Searching for src/store.ts` lives in your agent's own logs, not
-  here.
-- **It needs local log access.** A remote Ollama server won't work.
-- **It depends on an internal log format.** `llama-server`'s lines carry no stability guarantee
-  and may change between Ollama versions. Tests run against real captured logs to catch drift.
-  If output goes quiet after an upgrade, run `llmwatch --debug-unparsed` and open an issue with
-  a sample line.
-- **Ollama only** for now. The parser targets Ollama's bundled `llama-server`.
-- **Linux (journald) and Docker are experimental** — developed and verified on macOS/Homebrew.
-- **TTFT is approximate.** It's measured as prefill duration; the log has no record of when
-  your client actually sent the request, so queueing time is invisible.
-- **The full-screen board clears when you quit** (that's how alternate-screen apps work). A
-  plain-text session summary is printed on exit, and `--plain` keeps normal scrollback.
-- **Numbers can snap once** if cache information arrives after a progress estimate has started.
-  Self-correcting, but visible.
-- **Attaching mid-request** means the prompt size was never seen, so that request shows less
-  detail until the next one starts.
-- **Very small terminals** (under ~10 rows) fall back to `--plain` automatically.
-
-## Contributing and feedback
-
-Issues and PRs are welcome, including "this number looks wrong" — several of the fixes so far
-came from exactly that.
-
-**The most useful bug report** includes your Ollama version (`ollama --version`), your OS, and
-a few lines of output from `llmwatch --debug-unparsed`. If the parser mishandles a log format,
-a fixture in `tests/fixtures/` plus a test asserting the expected values is the single most
-valuable contribution.
+The most useful bug report includes your Ollama version (`ollama --version`), your OS, and a few
+lines from `ollama-llmwatch --debug-unparsed`.
 
 ```bash
 git clone https://github.com/bingcheng45/ollama-llmwatch
@@ -287,9 +228,9 @@ cd ollama-llmwatch
 python3 -m unittest discover tests -v
 ```
 
-The code is one file, standard library only, deliberately. `parse_line`, `Tracker`, `Stats` and
-the `render_*` functions are pure — they take data and return data — so almost everything can
-be tested without a terminal or a running model.
+One file, standard library only. The parsing, tracking, stats and rendering functions are pure —
+they take data and return data — so almost everything is testable without a terminal or a running
+model.
 
 ## License
 
