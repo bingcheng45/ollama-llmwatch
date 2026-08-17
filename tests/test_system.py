@@ -198,3 +198,69 @@ class TestProbeMechanics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestServerDownDetection(unittest.TestCase):
+    """Idle is ambiguous: nothing has happened yet, or nothing can happen.
+
+    With Ollama stopped the log file still exists, so llmwatch starts fine and
+    waits forever. A newcomer cannot tell whether the tool is broken or the
+    server is.
+    """
+
+    def test_stopped_server_is_named(self):
+        from llmwatch import render_idle
+        line = strip_ansi(render_idle(30.0, PLAIN,
+                                      {"server_ok": False,
+                                       "server_problem": "Ollama is not running"}))
+        self.assertIn("Ollama is not running", line)
+        self.assertIn("pick up automatically", line)
+
+    def test_missing_binary_is_named_differently(self):
+        from llmwatch import render_idle
+        line = strip_ansi(render_idle(1.0, PLAIN,
+                                      {"server_ok": False,
+                                       "server_problem": "ollama not found on PATH"}))
+        self.assertIn("not found on PATH", line)
+
+    def test_running_but_no_model_warns_about_the_load(self):
+        from llmwatch import render_idle
+        line = strip_ansi(render_idle(5.0, PLAIN,
+                                      {"server_ok": True, "models_loaded": 0}))
+        self.assertIn("no model loaded", line)
+        self.assertIn("first request", line)
+
+    def test_healthy_idle_is_the_plain_message(self):
+        from llmwatch import render_idle
+        line = strip_ansi(render_idle(5.0, PLAIN,
+                                      {"server_ok": True, "models_loaded": 1}))
+        self.assertIn("waiting for a request", line)
+        self.assertNotIn("not running", line)
+
+    def test_unknown_state_does_not_accuse(self):
+        """Before the first probe completes, saying 'not running' would be a lie."""
+        from llmwatch import render_idle
+        self.assertIn("waiting for a request", strip_ansi(render_idle(1.0, PLAIN, None)))
+        self.assertIn("waiting for a request",
+                      strip_ansi(render_idle(1.0, PLAIN, {"server_ok": None})))
+
+    def test_first_poll_probes_immediately(self):
+        """time.monotonic() can start near zero, in which case an interval check
+        against 0.0 silently skips the first poll -- delaying "Ollama is not
+        running" by 15s, exactly when someone is staring at the screen."""
+        probe = SystemProbe(clock=lambda: 0.05)
+        calls = []
+        probe._read_load = lambda: calls.append("load")
+        probe._read_swap = lambda: calls.append("swap")
+        probe._read_memory = lambda: calls.append("memory")
+        probe._read_models = lambda: calls.append("models")
+        probe.poll()
+        self.assertEqual(sorted(calls), ["load", "memory", "models", "swap"])
+
+    def test_second_poll_respects_the_interval(self):
+        probe = SystemProbe(clock=lambda: 0.05)
+        probe.poll()
+        calls = []
+        probe._read_models = lambda: calls.append("models")
+        probe.poll()
+        self.assertEqual(calls, [], "should not re-probe within the interval")

@@ -4,7 +4,7 @@
 with a progress bar, an ETA, and a plain-English answer to *"should I keep waiting?"*
 
 ```
- ollama-llmwatch 0.5.2   qwen3.8:27b-mtp-128k   12 req - 18m04s
+ ollama-llmwatch 0.5.3   qwen3.8:27b-mtp-128k   12 req - 18m04s
 PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
          ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
 GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
@@ -19,7 +19,8 @@ SYSTEM   ! swapping 2.5/4.0 GB
   2288    6,633 tok    1m26s      77.1 tok/s    97% reading
 ── live ────────────────────────────────────────────────────────────────
   ⠹ PREFILL ████████░░░░░░░░ 41% 6,144/14,906 tok  101 tok/s  elapsed 1m01s | eta 1m27s
-    cache working: only 6,144 of 21,050 tok to read   answer ready ~1m45s
+    cache working: only 6,144 of 21,050 tok to read
+    answer ready ~1m45s
 ```
 
 ## Install
@@ -71,12 +72,14 @@ And the line that helps you decide whether to wait it out:
 
 ```
 ! cache gone - rereading all 39,528 tok (~6m35s)
-! same prompt 4x - agent may be stuck in a loop
+! same prompt 5x - likely stuck - interrupt ~11m00s spent
 ! 3 cancels in a row - client keeps timing out
 ! slow: 40 vs 100 tok/s usual - 2 models loaded (34 GB), swapping 3.0/4.0 GB
 long chat: reading 45,000 tok this turn (~7m30s) - consider compacting
 cache working: only 244 of 41,253 tok to read
 ```
+
+Each appears on its own line, and at most two at once, so the display stays glanceable.
 
 `cache gone` is the big one: nothing was reused, you're paying full price to re-read everything,
 and that's usually the moment to interrupt rather than wait.
@@ -98,68 +101,107 @@ Press **`h`** for in-app help explaining every number. **`q`** or **ctrl-c** qui
 
 ## FAQ
 
-**Does this need an internet connection?**
-No. Neither does your model — local inference is entirely offline; the internet is only needed
-to *download* models. ollama-llmwatch makes no network calls at all: it reads a local log file.
-There's a test that fails if anyone adds a network client.
+### Does this need an internet connection?
 
-**Does it read my prompts or send anything anywhere?**
+No — and neither does your model. Local inference is entirely offline; the internet is only
+needed to *download* models in the first place.
+
+ollama-llmwatch itself makes **no network calls at all**. It reads a local log file. There's a
+test that fails if anyone adds a network client.
+
+### Does it read my prompts, or send anything anywhere?
+
 No. Ollama's log contains only timings and bookkeeping — no prompt text, no file names, no
-responses. Nothing leaves your machine. The one exception is opt-in: `--codex` reads your Codex
-session file, which *does* contain commands and file paths, which is exactly why it's off by
-default.
+responses. Nothing leaves your machine.
 
-**Will it slow down my model?**
-No. It reads a file and repaints a terminal. The expensive checks are rate-limited (`ollama ps`
-every 15 seconds, a process lookup only when a slowdown is already detected).
+One exception, and it's opt-in: `--codex` reads your Codex session file, which *does* contain
+commands and file paths. That's exactly why it's off by default.
 
-**Why is my local model so slow?**
-Usually not the reason people assume. Generation is limited by memory bandwidth: your machine
-must read the entire model from memory *for every single token*. A 16 GB model on an M1 Max
-(400 GB/s) caps out around 25 tok/s no matter what. But the bigger cost is usually prefill —
-re-reading a huge agent prompt every turn. Watch the `WAIT` line: if it says 90%+, your problem
-is prompt size, not model speed.
+### Will it slow down my model?
 
-**What's a good tok/s?**
-Depends entirely on model size, because it's bandwidth-bound. Rough figures for an M1 Max:
-a 27B at Q4 gives 10–17 tok/s; a 14B roughly 25–30; a mixture-of-experts model like Qwen3-30B-A3B
-far more, since it only reads a fraction of its weights per token. If you want speed, a smaller
-or MoE model beats any amount of tuning.
+No. It reads a file and repaints a terminal. The costlier checks are rate-limited — `ollama ps`
+every 15 seconds, and a process lookup only once a slowdown has already been detected.
 
-**How do I actually make things faster?**
-In the order that pays off: cut your agent's prompt size (fewer plugins/tools loaded), compact
-long conversations, close things competing for memory bandwidth, then consider a smaller or MoE
-model. Tuning flags is the least effective lever.
+### How do I know if Ollama isn't running?
 
-**Nothing shows up / the board stays empty.**
-Run `ollama-llmwatch --debug-unparsed` and see whether log lines are arriving but not being
-understood. The parser reads an internal llama.cpp format that can change between Ollama
-versions — if you see `UNPARSED:` lines, please
-[open an issue](https://github.com/bingcheng45/ollama-llmwatch/issues) with a sample. If nothing
-appears at all, check the log path with `--log`.
+It tells you. The idle line distinguishes three states:
 
-**Does it work with Claude Code / open-webui / my own script?**
+```
+⠹ Ollama is not running - start it and this will pick up automatically
+⠹ no model loaded - the first request pays a load (~10s for a 27B)
+⠹ waiting for a request  (idle 12.4s)
+```
+
+### Why is my local model so slow?
+
+Usually not for the reason people assume.
+
+**Generation** is limited by memory bandwidth — your machine reads the entire model from memory
+*for every single token*. A 16 GB model on an M1 Max (400 GB/s) caps out around 25 tok/s no
+matter what you tune.
+
+**Prefill** is usually the bigger cost: re-reading a huge agent prompt every turn. Watch the
+`WAIT` line — if it says 90%+, your problem is prompt size, not model speed.
+
+### What counts as a good tok/s?
+
+It depends almost entirely on model size, because it's bandwidth-bound. Rough figures for an
+M1 Max:
+
+| model | tok/s |
+|---|---|
+| 27B at Q4 | 10–17 |
+| 14B at Q4 | 25–30 |
+| MoE (e.g. Qwen3-30B-A3B) | much higher — only a fraction of weights are read per token |
+
+### How do I actually make things faster?
+
+In the order that pays off:
+
+1. **Cut your agent's prompt size** — fewer plugins and tools loaded
+2. **Compact long conversations**
+3. **Close things competing for memory bandwidth**
+4. **Use a smaller or MoE model**
+
+Tuning flags is the least effective lever.
+
+### Nothing shows up, or the board stays empty
+
+Run `ollama-llmwatch --debug-unparsed`.
+
+- **`UNPARSED:` lines appear** — the parser reads an internal llama.cpp format that changes
+  between Ollama versions. Please [open an issue](https://github.com/bingcheng45/ollama-llmwatch/issues)
+  with a sample line.
+- **Nothing at all appears** — check the log path with `--log`.
+
+### Does it work with Claude Code, open-webui, or my own script?
+
 Yes. It watches the Ollama *server*, so it doesn't care which client is talking to it. The only
 Codex-specific part is the optional `--codex` pane.
 
-**Does it work with LM Studio, llama.cpp directly, or vLLM?**
+### Does it work with LM Studio, llama.cpp directly, or vLLM?
+
 Not yet — the parser targets Ollama's bundled `llama-server`. llama.cpp's own server uses a
-similar format, so support is plausible; open an issue if you'd use it.
+similar format, so support is plausible. Open an issue if you'd use it.
 
-**Linux? Windows?**
-Developed and verified on macOS. Linux (journald) and Docker paths are written but unverified —
-reports very welcome. Windows isn't supported.
+### Linux? Windows?
 
-**Why is there no CPU or GPU percentage?**
-Because they don't move when performance does. During inference the GPU sits pinned near 100%
-and the CPU near idle whether you're getting 13 tok/s or 8 — the bottleneck is memory bandwidth,
-not compute. (GPU utilisation on macOS also requires sudo.) Instead, slowdowns are detected from
-actual measured throughput, and cheap signals like loaded models and swap are used to explain
-them.
+Developed and verified on **macOS**. Linux (journald) and Docker paths are written but
+unverified — reports very welcome. Windows isn't supported.
 
-**Why two commands?**
-`llmwatch` alone was taken on PyPI by an unrelated project, so the package is
-`ollama-llmwatch`. Both commands are installed; use whichever you prefer.
+### Why is there no CPU or GPU percentage?
+
+Because those numbers don't move when performance does. During inference the GPU sits pinned
+near 100% and the CPU near idle whether you're getting 13 tok/s or 8 — the bottleneck is memory
+bandwidth, not compute. (GPU utilisation on macOS also requires sudo.)
+
+Instead, slowdowns are detected from actual measured throughput, and cheap signals like loaded
+models and swap are used to explain them.
+
+### Why are there two commands?
+
+`llmwatch` alone was already taken on PyPI by an unrelated project, so the package is
+`ollama-llmwatch`. Both commands are installed — use whichever you prefer.
 
 ---
 

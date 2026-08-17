@@ -295,3 +295,34 @@ class TestLoopAndCancelTracking(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestLoopEscalation(unittest.TestCase):
+    """At 3 repeats it might resolve; by 5 it will not. The message should say
+    so, and quantify the cost, because "may be stuck" is advice while
+    "5x, ~11m spent" is a decision."""
+
+    DATA = {"event": "prefill_tick", "to_process": 14517, "cached": 50688, "rate": 38.0}
+
+    def line(self, repeats):
+        from llmwatch import LOOP_ESCALATE  # noqa: F401
+        snap = {"looping": True, "repeat_count": repeats, "avg_prefill_seconds": 132.0}
+        return strip_ansi(diagnose(self.DATA, snap, PLAIN)[0])
+
+    def test_early_repeats_are_tentative(self):
+        line = self.line(3)
+        self.assertIn("may be stuck", line)
+        self.assertNotIn("interrupt", line)
+
+    def test_persistent_repeats_recommend_interrupting(self):
+        line = self.line(5)
+        self.assertIn("interrupt", line)
+
+    def test_time_already_spent_is_quantified(self):
+        self.assertIn("11m00s", self.line(5))    # 5 x 132s
+
+    def test_no_timing_history_means_no_invented_number(self):
+        snap = {"looping": True, "repeat_count": 5}
+        line = strip_ansi(diagnose(self.DATA, snap, PLAIN)[0])
+        self.assertIn("interrupt", line)
+        self.assertNotIn("spent", line)

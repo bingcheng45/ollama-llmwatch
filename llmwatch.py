@@ -51,7 +51,7 @@ try:
 except ImportError:  # pragma: no cover - py2 only, never hit
     queue = None
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 # Frame pacing. The loop wakes on new log data OR on these deadlines, whichever
 # comes first, so fresh data appears immediately while animation (spinner,
@@ -582,6 +582,8 @@ class ModelStats:
         # actually be finished rather than just started.
         avg_out = (self.generation.tokens / float(self.generation.count)
                    if self.generation.count else None)
+        avg_prefill_s = (self.prefill.seconds / float(self.prefill.count)
+                         if self.prefill.count else None)
         return {
             "requests": self.requests,
             "prefill": self.prefill.snapshot(),
@@ -594,6 +596,7 @@ class ModelStats:
             "looping": self.repeat_count() >= LOOP_REPEATS,
             "recent_cancels": self.recent_cancels,
             "avg_output_tokens": avg_out,
+            "avg_prefill_seconds": avg_prefill_s,
             "ttft": ttft,
             "prefill_share_pct": share,
             "recent": list(reversed(self.recent)),
@@ -639,6 +642,40 @@ class Stats:
 
 SPINNER_UNICODE = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SPINNER_ASCII = "|/-\\"
+
+RE_ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+
+def visible_len(text):
+    """Length as the terminal sees it. ANSI escapes occupy no columns."""
+    return len(RE_ANSI.sub("", text))
+
+
+def truncate_visible(text, width):
+    """Cut to `width` visible columns, keeping escape sequences intact.
+
+    Without this a long line wraps onto the next row, which pushes every
+    subsequent row down while the next repaint still starts from cursor-home --
+    so frames overlay each other and the display turns to garbage. Clipping is
+    the safety net; renderers also shorten their content when space is tight.
+    """
+    if width <= 0:
+        return ""
+    if visible_len(text) <= width:
+        return text
+    out, count, i, saw_escape = [], 0, 0, False
+    while i < len(text) and count < width:
+        match = RE_ANSI.match(text, i)
+        if match:
+            out.append(match.group())
+            i = match.end()
+            saw_escape = True
+            continue
+        out.append(text[i])
+        i += 1
+        count += 1
+    # Reset, or the colour of the cut-off text bleeds into the rest of the line.
+    return "".join(out) + ("\033[0m" if saw_escape else "")
 
 
 class Style:
@@ -785,6 +822,7 @@ def project_completion(snap, data, age):
 LONG_CONTEXT_TOKENS = 30000     # beyond this, re-reading dominates every turn
 LOW_DRAFT_ACCEPT = 0.35         # below this, speculative decoding is losing
 LOOP_REPEATS = 3                # identical prompt sizes in a row = likely retry loop
+LOOP_ESCALATE = 5               # by here it is not going to resolve on its own
 
 
 SLOWDOWN_RATIO = 0.7        # below 70% of the usual rate is worth explaining
@@ -853,8 +891,13 @@ def diagnose(data, snap, style, codex=None, system=None):
                                 % codex["error_repeats"]))
 
     if snap.get("looping"):
-        out.append(style.yellow("! same prompt %dx - agent may be stuck in a loop"
-                                % snap.get("repeat_count", LOOP_REPEATS)))
+        repeats = snap.get("repeat_count", LOOP_REPEATS)
+        # Quantify it. "May be stuck" is advice; "5x, ~11m spent" is a decision.
+        spent = snap.get("avg_prefill_seconds")
+        cost = (" ~%s spent" % fmt_duration(spent * repeats)) if spent else ""
+        verdict = "likely stuck - interrupt" if repeats >= LOOP_ESCALATE else \
+                  "agent may be stuck in a loop"
+        out.append(style.yellow("! same prompt %dx - %s%s" % (repeats, verdict, cost)))
 
     if snap.get("recent_cancels", 0) >= 2:
         out.append(style.yellow("! %d cancels in a row - client keeps timing out"
@@ -883,15 +926,29 @@ def diagnose(data, snap, style, codex=None, system=None):
 
 def render_live_detail(data, snap, style, age=0.0, codex=None, system=None):
     """Second live line: why this is slow, and when the answer will be ready."""
-    bits = diagnose(data, snap, style, codex, system)
+    # One finding per LINE, not joined with spaces. Concatenated, two findings
+    # plus a projection ran past 120 columns -- a run-on that both wrapped (and
+    # corrupted the frame) and read as a wall of text.
+    lines = list(diagnose(data, snap, style, codex, system))
     finish = project_completion(snap or {}, data, age)
     if finish is not None:
-        bits.append(style.dim("answer ready ~%s" % fmt_duration(finish)))
-    return "   ".join(bits)
+        lines.append(style.dim("answer ready ~%s" % fmt_duration(finish)))
+    return lines
 
 
-def render_idle(age, style):
+def render_idle(age, style, system=None):
+    """Idle is ambiguous: nothing has happened yet, or nothing CAN happen.
+    Saying which is the difference between waiting patiently and waiting
+    pointlessly."""
     spin = spinner_frame(time.time(), style)
+    system = system or {}
+    if system.get("server_ok") is False:
+        problem = system.get("server_problem") or "Ollama is not running"
+        return style.yellow("%s %s - start it and this will pick up automatically"
+                            % (spin, problem))
+    if system.get("models_loaded") == 0:
+        return style.dim("%s no model loaded - the first request pays a load "
+                         "(~10s for a 27B)  (idle %s)" % (spin, fmt_duration(age)))
     return style.dim("%s waiting for a request  (idle %s)" % (spin, fmt_duration(age)))
 
 
@@ -1285,16 +1342,26 @@ class Screen:
         self.resized.clear()
         return shutil.get_terminal_size((80, 24))
 
-    def draw(self, lines, rows):
-        """One write per frame. Several writes at 10 fps flicker visibly."""
+    def draw(self, lines, rows, cols=None):
+        """One write per frame. Several writes at 10 fps flicker visibly.
+
+        Clipped in BOTH dimensions. Height alone is not enough: one over-long
+        line wraps, every row below it shifts down, and the next cursor-home
+        repaint lands on the wrong rows -- the frame overlays itself and the
+        screen fills with fragments of two frames at once.
+        """
         clipped = lines[:max(1, rows - 1)]
+        if cols:
+            # cols - 1: writing exactly to the last column triggers auto-wrap on
+            # some terminals, which is the very thing being avoided.
+            clipped = [truncate_visible(line, max(1, cols - 1)) for line in clipped]
         body = "\033[K\n".join(clipped)
         self.stream.write("\033[H" + body + "\033[K\033[J")
         self.stream.flush()
 
 
 def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=False,
-                  live_detail="", codex=None, system=None):
+                  live_detail=None, codex=None, system=None):
     """Build the whole TUI frame. Pure: takes a snapshot, returns lines.
 
     Panes drop in priority order when the terminal is short -- sparklines first,
@@ -1314,15 +1381,15 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
         # sight of the running request just because you asked what a column means.
         help_lines = render_help(style, cols, rows - 4)
         tail = ["", divider("live"), "  " + (live_text or style.dim("idle"))]
-        if live_detail:
-            tail.append("    " + live_detail)
+        for detail in (live_detail or []):
+            tail.append("    " + detail)
         return help_lines + tail
 
     # Reserved first and never trimmed: everything else is context, but this is
     # the answer to "is it still reading my prompt, or is it writing?".
     live_block = ["", divider("live"), "  " + (live_text or style.dim("idle"))]
-    if live_detail:
-        live_block.append("    " + live_detail)
+    for detail in (live_detail or []):
+        live_block.append("    " + detail)
     if len(live_block) >= budget:
         return live_block[-budget:]
 
@@ -1394,14 +1461,20 @@ class SystemProbe:
 
     def __init__(self, clock=time.monotonic):
         self._clock = clock
-        self._cheap_at = 0.0
-        self._models_at = 0.0
+        # -inf, not 0: time.monotonic() can start near zero, in which case
+        # `now - 0 < INTERVAL` and the very first poll probes nothing. That would
+        # delay "Ollama is not running" by 15s -- precisely when the user is
+        # staring at the screen wondering why nothing is happening.
+        self._cheap_at = float("-inf")
+        self._models_at = float("-inf")
         self.swap_used_gb = None
         self.swap_total_gb = None
         self.memory_free_pct = None
         self.load1 = None
         self.models_loaded = None
         self.models_gb = None
+        self.server_ok = None          # None = not checked yet
+        self.server_problem = None
 
     def poll(self):
         now = self._clock()
@@ -1435,9 +1508,30 @@ class SystemProbe:
         self.memory_free_pct = int(match.group(1)) if match else None
 
     def _read_models(self):
-        out = self._run(["ollama", "ps"])
-        if not out:
+        """Also establishes whether the server is up at all.
+
+        `ollama ps` exits non-zero when the daemon isn't running, which is the
+        difference between "nothing has happened yet" and "nothing CAN happen".
+        Without this, a stopped Ollama looks identical to an idle one, and the
+        first thing a new user sees is a spinner that never resolves.
+        """
+        try:
+            result = subprocess.run(["ollama", "ps"], capture_output=True,
+                                    text=True, timeout=5)
+        except FileNotFoundError:
+            self.server_ok = False
+            self.server_problem = "ollama not found on PATH"
             return
+        except (OSError, subprocess.SubprocessError):
+            return                      # transient; leave the last known state
+        if result.returncode != 0:
+            self.server_ok = False
+            self.server_problem = "Ollama is not running"
+            self.models_loaded = None
+            return
+        self.server_ok = True
+        self.server_problem = None
+        out = result.stdout
         rows = [r for r in out.splitlines()[1:] if r.strip()]
         self.models_loaded = len(rows)
         total = 0.0
@@ -1471,7 +1565,8 @@ class SystemProbe:
         return out
 
     def snapshot(self):
-        return {"swap_used_gb": self.swap_used_gb, "swap_total_gb": self.swap_total_gb,
+        return {"server_ok": self.server_ok, "server_problem": self.server_problem,
+                "swap_used_gb": self.swap_used_gb, "swap_total_gb": self.swap_total_gb,
                 "memory_free_pct": self.memory_free_pct, "load1": self.load1,
                 "models_loaded": self.models_loaded, "models_gb": self.models_gb,
                 "contention": self.contention()}
@@ -1747,7 +1842,7 @@ def follow(args):
     screen = Screen() if tui else None
     keyboard = Keyboard() if tui else None
     codex_tail = CodexTail() if (tui and args.codex) else None
-    probe = SystemProbe() if tui else None
+    probe = SystemProbe()          # cheap and rate-limited; useful in both modes
     help_visible = False
     live_data = None
     live_at = time.time()
@@ -1826,11 +1921,14 @@ def follow(args):
     def live_text():
         if live_data is not None:
             return render_live(live_data, time.time() - live_at, style)
-        return render_idle(time.time() - idle_since, style)
+        return render_idle(time.time() - idle_since, style,
+                           probe.snapshot() if probe else None)
 
     def paint():
         if not interactive:
             return
+        if probe:
+            probe.poll()               # self-rate-limited: 5s cheap, 15s models
         if tui:
             cols, rows = screen.size()
             snap = stats.snapshot(tracker.model)
@@ -1838,19 +1936,19 @@ def follow(args):
             if codex_tail:
                 codex_tail.poll()
             codex_state = codex_tail.state() if codex_tail else None
-            if probe:
-                probe.poll()
             system_state = probe.snapshot() if probe else None
+            style.width = cols          # keep renderers in step with resizes
             screen.draw(compose_frame(
                 snap, live_text(), style, cols, rows,
                 help_visible=help_visible,
                 live_detail=render_live_detail(live_data, snap, style, age,
                                               codex_state, system_state),
-                codex=codex_state, system=system_state), rows)
+                codex=codex_state, system=system_state), rows, cols)
         else:
             text = live_text()
             if text:
-                sys.stdout.write("\r\033[K  " + text)
+                width = shutil.get_terminal_size((80, 24)).columns
+                sys.stdout.write("\r\033[K  " + truncate_visible(text, max(1, width - 3)))
                 sys.stdout.flush()
     # `dirty` is only meaningful for the plain single-line renderer.
 

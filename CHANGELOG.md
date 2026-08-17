@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.5.3
+
+**Fixes a display corruption bug**, reported from a real session:
+
+```
+2,537/14,517 tok +50,688 ca─red     53 tok/s8 cached     38 tok/s
+! 5 cancels in acin a row - client keeps timing out
+```
+
+Frames were clipped to the terminal's height but never its width. A line longer than the
+terminal wrapped, every row below shifted down, and the next cursor-home repaint landed on the
+wrong rows — so two frames overlaid each other. Lines are now truncated to the visible width
+(ANSI-aware, so escape sequences don't count toward it and colour can't bleed past the cut), and
+the diagnosis line drops to a single finding on narrower terminals rather than relying on the
+cut.
+
+**Detects when Ollama isn't running.** Previously a stopped server looked identical to an idle
+one — the log file still exists, so llmwatch waited forever with no hint that nothing could
+happen. The idle line now distinguishes "not running", "no model loaded", and genuinely idle.
+
+Found while implementing that: `SystemProbe` initialised its rate-limit timestamps to `0.0`, but
+`time.monotonic()` can start near zero, so the *first* poll probed nothing and the warning was
+delayed by 15 seconds — exactly when someone is staring at the screen wondering what's wrong.
+
+**Loop warnings now quantify the cost.** `! same prompt 5x - likely stuck - interrupt ~11m00s
+spent` rather than a vague "may be stuck". Escalates at 5 repeats, and stays silent about time
+when there's no history to base it on.
+
+**README:** the FAQ is now one heading per question instead of a wall of bold paragraphs.
+
+Tests: 167 → 187.
+
 ## 0.5.2
 
 First public release on PyPI: `uv tool install ollama-llmwatch`.
