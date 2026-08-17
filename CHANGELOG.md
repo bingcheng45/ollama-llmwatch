@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+**Answers "should I keep waiting, or kill it?"** A one-line diagnosis under the progress bar,
+built from log lines llmwatch previously ignored:
+
+- `! cache gone - rereading all 39,528 tok (~6m35s)` — nothing was reused, you are paying full
+  price. Usually the moment to interrupt.
+- `! same prompt 4x - agent may be stuck in a loop` — identical prompt sizes in a row, which is
+  what a client retry loop looks like from the server side and is otherwise invisible.
+- `! 3 cancels in a row - client keeps timing out`
+- `long chat: reading 45,000 tok this turn (~7m30s) - consider compacting`
+- `cache working: only 244 of 41,253 tok to read`
+- `drafts 22% accepted - MTP is slowing this one down`
+
+At most two findings at a time, each under 70 characters: this line exists to be read in about
+a second, not to dump telemetry.
+
+**`answer ready ~7m10s`** — projected finish for the whole answer, not just for the moment text
+starts appearing, using the session's measured generation rate and typical output length. Shown
+only once there is history to base it on; it never invents a number.
+
+**MTP draft acceptance**, live and on the board — `DRAFT 53% accepted`, with a verdict on
+whether speculative decoding is earning its keep on this workload.
+
+**`--codex`** (opt-in) shows what your agent is doing: last tool call, argument summary, tool
+calls this turn, and how long it has been waiting on the model. Reads Codex's own session file,
+which contains commands and file paths — hence opt-in. Codex-specific, and correlated by time
+rather than request id, since no shared identifier exists.
+
+New parsing: cache misses, context checkpoint create/restore/erase, and draft acceptance. A
+state change now re-emits the live view immediately rather than waiting for the next 512-token
+batch, so warnings appear at once.
+
+**Fix:** the long-chat warning keyed on total context size, so a 41k conversation that was
+fully cached — costing nothing — was warned about as "41,253 tok reread each turn (~6m52s)".
+It now keys on tokens actually being read.
+
+Tests: 84 → 120.
+
 ## 0.3.0 — unreleased
 
 **Full-screen stats board.** Peak / average / low rates for both phases, cache hit rate, TTFT,

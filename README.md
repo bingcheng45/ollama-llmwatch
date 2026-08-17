@@ -50,6 +50,25 @@ It sits beside your agent in another terminal and answers the questions the spin
 | "Why was that one so fast?" | how much of the prompt came from cache |
 | "Is my machine getting slower?" | peak / average / low speeds, plus a trend line |
 | "Which model build is faster?" | stats kept per model, never mixed together |
+| **"Should I keep waiting or kill it?"** | **a one-line diagnosis — see below** |
+
+### The line that helps you decide
+
+Under the progress bar, llmwatch says what's actually going on, in a few words:
+
+```
+! cache gone - rereading all 39,528 tok (~6m35s)        answer ready ~7m10s
+! same prompt 4x - agent may be stuck in a loop
+! 3 cancels in a row - client keeps timing out
+long chat: reading 45,000 tok this turn (~7m30s) - consider compacting
+cache working: only 244 of 41,253 tok to read
+drafts 22% accepted - MTP is slowing this one down
+```
+
+The first one is the big one: if the cache is gone, you're paying full price to re-read
+everything, and that's usually the moment to interrupt rather than wait. `answer ready ~7m10s`
+estimates when the *whole answer* will be finished — not just when text starts appearing —
+using your own measured rates.
 
 ## Why not just use an existing tool
 
@@ -109,8 +128,27 @@ llmwatch                  # full-screen board
 llmwatch --plain          # scrolling single-line output, keeps shell scrollback
 llmwatch --last           # summarise the most recent request and exit
 llmwatch --json           # one JSON object per event, for status bars and scripts
+llmwatch --codex          # also show what Codex is doing (see below)
 llmwatch --debug-unparsed # show log lines it failed to understand (for bug reports)
 ```
+
+### Seeing what your agent is doing (`--codex`)
+
+Ollama's log contains no prompt content, so llmwatch can't know what your agent is up to from
+there. Codex, however, records its own activity, and `--codex` reads it:
+
+```
+── codex ──────────────────────────────────────────────
+  last action  exec_command
+               cd ~/ai_projects/memory-chess && rg -lF "useGame" src…
+  this turn    10 tool calls
+  waiting on   model for 2m29s
+```
+
+**Opt-in on purpose.** Unlike the Ollama log, your Codex session file contains real content —
+commands, file paths, message text — so llmwatch only reads it when you ask. Two caveats: it's
+Codex-specific (not Claude Code), and it's correlated to model activity **by time, not by
+request id**, because no shared identifier exists between the two.
 
 ## How it works
 

@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # so the distribution is `ollama-llmwatch`. The installed command is still
 # `llmwatch` (see [project.scripts]).
 name = "ollama-llmwatch"
-version = "0.3.0"
+version = "0.4.0"
 description = "See what your local Ollama model is actually doing: live prefill progress, ETA, and tok/s."
 readme = "README.md"
 license = { text = "MIT" }

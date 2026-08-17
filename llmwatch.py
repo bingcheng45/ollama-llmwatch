@@ -51,7 +51,7 @@ try:
 except ImportError:  # pragma: no cover - py2 only, never hit
     queue = None
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Frame pacing. The loop wakes on new log data OR on these deadlines, whichever
 # comes first, so fresh data appears immediately while animation (spinner,
@@ -83,6 +83,15 @@ GenTick = namedtuple("GenTick", "slot task decoded rate rate_3s")
 GenDone = namedtuple("GenDone", "slot task ms tokens rate")
 RequestEnd = namedtuple("RequestEnd", "slot task ms tokens")
 
+# Events that explain WHY a wait is long -- the difference between "20 seconds"
+# and "8 minutes" is usually whether the prompt cache survived.
+CacheMiss = namedtuple("CacheMiss", "slot task")
+CheckpointRestored = namedtuple("CheckpointRestored", "slot task tokens")
+CheckpointCreated = namedtuple("CheckpointCreated", "slot task index total")
+CheckpointErased = namedtuple("CheckpointErased", "slot task tokens")
+# Speculative decoding (the -mtp builds): how many drafted tokens survived.
+DraftAcceptance = namedtuple("DraftAcceptance", "slot task rate accepted generated mean_len")
+
 # --------------------------------------------------------------------------
 # Layer 1: parsing
 #
@@ -109,6 +118,15 @@ RE_GEN_TICK = re.compile(
 RE_GEN_DONE = re.compile(
     _SLOT + r".*?\beval time =\s*([\d.]+) ms /\s*(\d+) tokens.*?([\d.]+) tokens per second")
 RE_TOTAL = re.compile(_SLOT + r".*?total time =\s*([\d.]+) ms /\s*(\d+) tokens")
+RE_CACHE_MISS = re.compile(_SLOT + r".*?forcing full prompt re-processing")
+RE_CKPT_RESTORED = re.compile(
+    _SLOT + r".*?restored context checkpoint \(.*?n_tokens = (\d+)")
+RE_CKPT_CREATED = re.compile(_SLOT + r".*?created context checkpoint (\d+) of (\d+)")
+RE_CKPT_ERASED = re.compile(
+    _SLOT + r".*?erased invalidated context checkpoint \(.*?n_tokens = (\d+)")
+RE_DRAFT = re.compile(
+    _SLOT + r".*?draft acceptance = ([\d.]+) \(\s*(\d+) accepted /\s*(\d+) generated\),"
+            r"\s*mean len =\s*([\d.]+)")
 
 
 def parse_line(line):
@@ -143,6 +161,28 @@ def parse_line(line):
     m = RE_TOTAL.search(line)
     if m:
         return RequestEnd(int(m.group(1)), int(m.group(2)), float(m.group(3)), int(m.group(4)))
+
+    m = RE_DRAFT.search(line)
+    if m:
+        return DraftAcceptance(int(m.group(1)), int(m.group(2)), float(m.group(3)),
+                               int(m.group(4)), int(m.group(5)), float(m.group(6)))
+
+    m = RE_CACHE_MISS.search(line)
+    if m:
+        return CacheMiss(int(m.group(1)), int(m.group(2)))
+
+    m = RE_CKPT_RESTORED.search(line)
+    if m:
+        return CheckpointRestored(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+    m = RE_CKPT_CREATED.search(line)
+    if m:
+        return CheckpointCreated(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                                 int(m.group(4)))
+
+    m = RE_CKPT_ERASED.search(line)
+    if m:
+        return CheckpointErased(int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
     m = RE_REQ_START.search(line)
     if m:
@@ -213,6 +253,13 @@ class Request:
         # phase summaries are buffered and emitted in true order at request end.
         self.prefill = None   # (ms, tokens, rate)
         self.generation = None
+        # Why this request is slow, in the server's own words.
+        self.cache_miss = False
+        self.restored_tokens = 0
+        self.checkpoints = None      # (index, total)
+        self.draft = None            # (rate, accepted, generated, mean_len)
+        self.status = None           # short human phrase for the live line
+        self.last_live = None        # last emitted live payload, for re-emission
 
     @property
     def to_process(self):
@@ -239,6 +286,13 @@ class Tracker:
         if key not in self.requests:
             self.requests[key] = Request(ev.slot, ev.task, self.model)
         return self.requests[key]
+
+    @staticmethod
+    def _context(req):
+        """The 'why is this slow' fields, attached to every live payload."""
+        return {"cache_miss": req.cache_miss, "status": req.status,
+                "restored_tokens": req.restored_tokens,
+                "checkpoints": req.checkpoints, "draft": req.draft}
 
     def feed(self, ev):
         """Returns a list of Output. Never raises on unexpected ordering."""
@@ -293,12 +347,47 @@ class Tracker:
                 fraction = ev.progress
                 total = int(ev.processed / ev.progress) if ev.progress else ev.processed
             eta = (ev.elapsed / fraction - ev.elapsed) if fraction > 0 else None
-            return [Output("live", "",
-                           {"event": "prefill_tick", "task": ev.task,
-                            "model": req.model,
-                            "processed": ev.processed, "to_process": total,
-                            "cached": req.cached, "fraction": fraction,
-                            "rate": ev.rate, "elapsed": ev.elapsed, "eta_seconds": eta})]
+            payload = {"event": "prefill_tick", "task": ev.task,
+                       "model": req.model,
+                       "processed": ev.processed, "to_process": total,
+                       "cached": req.cached, "fraction": fraction,
+                       "rate": ev.rate, "elapsed": ev.elapsed, "eta_seconds": eta}
+            payload.update(self._context(req))
+            req.last_live = payload
+            return [Output("live", "", payload)]
+
+        # ---- state that explains the wait ---------------------------------
+        if isinstance(ev, (CacheMiss, CheckpointRestored, CheckpointCreated,
+                           CheckpointErased, DraftAcceptance)):
+            req = self._get(ev)
+            outs = []
+            if isinstance(ev, CacheMiss):
+                req.cache_miss = True
+                req.status = "cache miss - reprocessing the whole prompt"
+                # Committed as well as shown live: this is the single most useful
+                # thing to know when deciding whether to keep waiting.
+                outs.append(Output("line", "", {
+                    "event": "cache_miss", "task": ev.task,
+                    "prompt_tokens": req.prompt_tokens}))
+            elif isinstance(ev, CheckpointRestored):
+                req.restored_tokens = ev.tokens
+                req.status = "restored %s cached tokens" % format(ev.tokens, ",")
+            elif isinstance(ev, CheckpointCreated):
+                req.checkpoints = (ev.index, ev.total)
+                req.status = "saving cache checkpoint %d/%d" % (ev.index, ev.total)
+            elif isinstance(ev, CheckpointErased):
+                req.status = "discarding stale cache (%s tok)" % format(ev.tokens, ",")
+            else:
+                req.draft = (ev.rate, ev.accepted, ev.generated, ev.mean_len)
+
+            # Re-emit the current live view so the change shows immediately
+            # instead of waiting for the next 512-token batch.
+            if req.last_live:
+                payload = dict(req.last_live)
+                payload.update(self._context(req))
+                req.last_live = payload
+                outs.append(Output("live", "", payload))
+            return outs
 
         if isinstance(ev, PrefillDone):
             req = self._get(ev)
@@ -308,10 +397,12 @@ class Tracker:
         if isinstance(ev, GenTick):
             req = self._get(ev)
             elapsed = ev.decoded / ev.rate if ev.rate else 0.0
-            return [Output("live", "",
-                           {"event": "generate_tick", "task": ev.task,
-                            "model": req.model, "decoded": ev.decoded,
-                            "rate": ev.rate, "rate_3s": ev.rate_3s, "elapsed": elapsed})]
+            payload = {"event": "generate_tick", "task": ev.task,
+                       "model": req.model, "decoded": ev.decoded,
+                       "rate": ev.rate, "rate_3s": ev.rate_3s, "elapsed": elapsed}
+            payload.update(self._context(req))
+            req.last_live = payload
+            return [Output("live", "", payload)]
 
         if isinstance(ev, GenDone):
             req = self._get(ev)
@@ -345,6 +436,8 @@ class Tracker:
             "event": "request_end", "task": ev.task, "seconds": total_s,
             "model": req.model if req else "?",
             "prefill_share_pct": share,
+            "cache_miss": bool(req and req.cache_miss),
+            "draft": req.draft if req else None,
             "started": req.started if req else None}))
         return out
 
@@ -399,10 +492,48 @@ class ModelStats:
         self.wall_seconds = 0.0
         self.ttfts = []
         self.recent = []
+        self.cache_misses = 0
+        self.draft_accepted = 0
+        self.draft_generated = 0
+        self.prompt_sizes = []
+        self.recent_cancels = 0
+
+    def note_start(self, prompt_tokens):
+        if prompt_tokens:
+            self.prompt_sizes.append(prompt_tokens)
+            if len(self.prompt_sizes) > RECENT_LIMIT:
+                del self.prompt_sizes[0]
+
+    def note_cancel(self):
+        self.recent_cancels += 1
+
+    def repeat_count(self):
+        """How many times in a row the prompt size was identical.
+
+        A retry loop (client times out, resends the same context) looks exactly
+        like this, and is otherwise invisible -- you just see it feel slow.
+        """
+        if not self.prompt_sizes:
+            return 0
+        last = self.prompt_sizes[-1]
+        count = 0
+        for size in reversed(self.prompt_sizes):
+            if size != last:
+                break
+            count += 1
+        return count
 
     def record(self, prefill, generation, end):
         self.requests += 1
         self.wall_seconds += end.get("seconds") or 0.0
+        self.recent_cancels = 0            # a completion clears the streak
+        if end.get("cache_miss"):
+            self.cache_misses += 1
+        draft = end.get("draft")
+        if draft:
+            _rate_unused, accepted, generated, _mean = draft
+            self.draft_accepted += accepted
+            self.draft_generated += generated
         if prefill:
             self.prefill.record(prefill["tokens"], prefill["seconds"], prefill["rate"])
             self.cached_tokens += prefill.get("cached") or 0
@@ -432,12 +563,25 @@ class ModelStats:
         if self.ttfts:
             ttft = {"min": min(self.ttfts), "max": max(self.ttfts),
                     "avg": sum(self.ttfts) / len(self.ttfts)}
+        draft_pct = None
+        if self.draft_generated:
+            draft_pct = self.draft_accepted / float(self.draft_generated) * 100
+        # Mean output tokens per request, used to project when an answer will
+        # actually be finished rather than just started.
+        avg_out = (self.generation.tokens / float(self.generation.count)
+                   if self.generation.count else None)
         return {
             "requests": self.requests,
             "prefill": self.prefill.snapshot(),
             "generation": self.generation.snapshot(),
             "cache_pct": cache_rate,
             "cached_tokens": self.cached_tokens,
+            "cache_misses": self.cache_misses,
+            "draft_pct": draft_pct,
+            "repeat_count": self.repeat_count(),
+            "looping": self.repeat_count() >= LOOP_REPEATS,
+            "recent_cancels": self.recent_cancels,
+            "avg_output_tokens": avg_out,
             "ttft": ttft,
             "prefill_share_pct": share,
             "recent": list(reversed(self.recent)),
@@ -456,8 +600,17 @@ class Stats:
         self.started = clock()
         self.by_model = {}
 
+    def _model(self, model):
+        return self.by_model.setdefault(model or "?", ModelStats())
+
     def record(self, model, prefill, generation, end):
-        self.by_model.setdefault(model or "?", ModelStats()).record(prefill, generation, end)
+        self._model(model).record(prefill, generation, end)
+
+    def note_start(self, model, prompt_tokens):
+        self._model(model).note_start(prompt_tokens)
+
+    def note_cancel(self, model):
+        self._model(model).note_cancel()
 
     def snapshot(self, model):
         data = self.by_model.get(model)
@@ -593,6 +746,95 @@ def render_live(data, age, style, now=None):
     return ""
 
 
+def project_completion(snap, data, age):
+    """Seconds until the ANSWER is finished, not just started.
+
+    Prefill ETA only tells you when text will begin appearing. What people
+    actually want to know is when they can read the result, which needs the
+    session's measured generation rate and typical output length.
+    """
+    if not data:
+        return None
+    gen_rate = (snap.get("generation") or {}).get("avg")
+    avg_out = snap.get("avg_output_tokens")
+    if not gen_rate or not avg_out:
+        return None            # no history yet: don't invent a number
+    if data.get("event") == "prefill_tick":
+        eta = data.get("eta_seconds")
+        if eta is None:
+            return None
+        return max(0.0, eta - age) + avg_out / gen_rate
+    if data.get("event") == "generate_tick":
+        done = data.get("decoded", 0) + data.get("rate", 0) * age
+        return max(0.0, avg_out - done) / gen_rate
+    return None
+
+
+LONG_CONTEXT_TOKENS = 30000     # beyond this, re-reading dominates every turn
+LOW_DRAFT_ACCEPT = 0.35         # below this, speculative decoding is losing
+LOOP_REPEATS = 3                # identical prompt sizes in a row = likely retry loop
+
+
+def diagnose(data, snap, style):
+    """Short, plain-English reads on what's happening, worth acting on.
+
+    Deliberately terse: this line exists to help someone decide "keep waiting or
+    kill it?" in about a second. Raw telemetry belongs on the board, not here.
+    Returns at most two findings, most important first.
+    """
+    if not data:
+        return []
+    snap = snap or {}
+    out = []
+    rate = (snap.get("prefill") or {}).get("avg") or data.get("rate")
+    total = data.get("to_process") or data.get("prompt_tokens") or 0
+    cached = data.get("cached") or 0
+
+    def cost(tokens):
+        return (" (~%s)" % fmt_duration(tokens / rate)) if rate and tokens else ""
+
+    if data.get("cache_miss"):
+        out.append(style.yellow("! cache gone - rereading all %s tok%s"
+                                % (format(total, ","), cost(total))))
+
+    if snap.get("looping"):
+        out.append(style.yellow("! same prompt %dx - agent may be stuck in a loop"
+                                % snap.get("repeat_count", LOOP_REPEATS)))
+
+    if snap.get("recent_cancels", 0) >= 2:
+        out.append(style.yellow("! %d cancels in a row - client keeps timing out"
+                                % snap["recent_cancels"]))
+
+    # Key this on tokens actually being READ, not on total context size. A 41k
+    # conversation with 41k cached costs nothing to continue; warning about it
+    # would be both wrong and alarming.
+    if not out and total >= LONG_CONTEXT_TOKENS:
+        out.append(style.dim("long chat: reading %s tok this turn%s - consider compacting"
+                             % (format(total, ","), cost(total))))
+
+    draft = data.get("draft")
+    if draft and data.get("event") == "generate_tick" and draft[0] < LOW_DRAFT_ACCEPT:
+        out.append(style.dim("drafts %.0f%% accepted - MTP is slowing this one down"
+                             % (draft[0] * 100)))
+
+    if not out and cached and total:
+        out.append(style.dim("cache working: only %s of %s tok to read"
+                             % (format(total, ","), format(total + cached, ","))))
+
+    if not out and data.get("status"):
+        out.append(style.dim(data["status"]))
+    return out[:2]
+
+
+def render_live_detail(data, snap, style, age=0.0):
+    """Second live line: why this is slow, and when the answer will be ready."""
+    bits = diagnose(data, snap, style)
+    finish = project_completion(snap or {}, data, age)
+    if finish is not None:
+        bits.append(style.dim("answer ready ~%s" % fmt_duration(finish)))
+    return "   ".join(bits)
+
+
 def render_idle(age, style):
     spin = spinner_frame(time.time(), style)
     return style.dim("%s waiting for a request  (idle %s)" % (spin, fmt_duration(age)))
@@ -712,9 +954,19 @@ def render_board(snap, style, width=80, compact=False):
                                              style.dim("last %d" % len(gen["recent"]))))
 
     if snap.get("cache_pct") is not None:
+        misses = snap.get("cache_misses") or 0
+        note = ("%s tok never recomputed" % format(snap["cached_tokens"], ","))
+        if misses:
+            note += " - %d full reread%s" % (misses, "" if misses == 1 else "s")
         lines.append("%s %s reused - %s" % (
-            style.bold("CACHE   "), "%4.0f%%" % snap["cache_pct"],
-            style.dim("%s tok never recomputed" % format(snap["cached_tokens"], ","))))
+            style.bold("CACHE   "), "%4.0f%%" % snap["cache_pct"], style.dim(note)))
+
+    if snap.get("draft_pct") is not None:
+        pct = snap["draft_pct"]
+        verdict = "speculative decoding is paying off" if pct >= 50 else \
+                  "drafts often rejected - base build may be faster"
+        lines.append("%s %s accepted - %s" % (
+            style.bold("DRAFT   "), "%4.0f%%" % pct, style.dim(verdict)))
 
     ttft = snap.get("ttft")
     if ttft:
@@ -733,6 +985,32 @@ def render_board(snap, style, width=80, compact=False):
         lines.append("%s %s %s" % (style.bold("WAIT    "), style.yellow(bar),
                                    style.dim("%.0f%% of session spent in prefill" % share)))
     return lines
+
+
+def render_codex(state, style, width=80):
+    """What the agent itself is doing. Opt-in (--codex): this reads your Codex
+    session file, which contains command text and file paths."""
+    if not state:
+        return []
+    out = []
+    action = state.get("action")
+    if action:
+        out.append("  %s %s" % (style.bold("%-12s" % "last action"),
+                                style.cyan(action)))
+        if state.get("detail"):
+            # Keep it glanceable. The full command lives in your agent's window;
+            # here it only has to be recognisable.
+            limit = max(30, min(72, width - 20))
+            detail = state["detail"]
+            if len(detail) > limit:
+                detail = detail[:limit - 1] + "…" if style.unicode else detail[:limit - 3] + "..."
+            out.append("  %-12s %s" % ("", style.dim(detail)))
+    if state.get("calls"):
+        out.append("  %-12s %s" % ("this turn", style.dim("%d tool calls" % state["calls"])))
+    if state.get("waiting_since") is not None:
+        out.append("  %-12s %s" % ("waiting on", style.dim(
+            "model for %s" % fmt_duration(state["waiting_since"]))))
+    return out
 
 
 def render_recent(rows, style, width=80, limit=6):
@@ -774,6 +1052,21 @@ HELP_TEXT = [
     ("", "agent this is often above 90%, which is the point of the tool."),
     ("sparkline", "The last 20 request rates. A downward trend means throttling,"),
     ("", "memory pressure, or something else competing for the GPU."),
+    ("DRAFT", "Speculative decoding acceptance (-mtp builds). Above ~50% it is"),
+    ("", "winning; well below, the plain build is likely faster."),
+    ("", ""),
+    ("warnings", "The line under the live bar tells you whether to keep waiting:"),
+    ("cache gone", "Nothing was reused - the whole prompt is being reread. Slowest case."),
+    ("looping", "Same prompt size several times running: your client may be"),
+    ("", "retrying, so the wait may never end. Worth interrupting."),
+    ("cancels", "Your client keeps disconnecting - usually a timeout set too low."),
+    ("long chat", "You are re-reading a lot every turn. Compacting will help more"),
+    ("", "than any speed tuning."),
+    ("answer ready", "Estimated finish for the whole answer, from your own measured"),
+    ("", "rates -- not just when text starts appearing."),
+    ("", ""),
+    ("codex pane", "With --codex: what your agent last did, and how long it has been"),
+    ("", "waiting. Reads your Codex session file, so it is opt-in."),
     ("", ""),
     ("keys", "h close help   -   ctrl-c quit"),
 ]
@@ -911,7 +1204,8 @@ class Screen:
         self.stream.flush()
 
 
-def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=False):
+def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=False,
+                  live_detail="", codex=None):
     """Build the whole TUI frame. Pure: takes a snapshot, returns lines.
 
     Panes drop in priority order when the terminal is short -- sparklines first,
@@ -929,12 +1223,17 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
     if help_visible:
         # Help replaces the board but keeps the live line: you should never lose
         # sight of the running request just because you asked what a column means.
-        help_lines = render_help(style, cols, rows - 3)
-        return help_lines + ["", divider("live"), "  " + (live_text or style.dim("idle"))]
+        help_lines = render_help(style, cols, rows - 4)
+        tail = ["", divider("live"), "  " + (live_text or style.dim("idle"))]
+        if live_detail:
+            tail.append("    " + live_detail)
+        return help_lines + tail
 
     # Reserved first and never trimmed: everything else is context, but this is
     # the answer to "is it still reading my prompt, or is it writing?".
     live_block = ["", divider("live"), "  " + (live_text or style.dim("idle"))]
+    if live_detail:
+        live_block.append("    " + live_detail)
     if len(live_block) >= budget:
         return live_block[-budget:]
 
@@ -952,9 +1251,16 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
 
     # Highest priority first; a section is included only if it fits whole,
     # so the layout degrades in steps instead of tearing mid-pane.
+    codex_block = []
+    if codex:
+        rows_ = render_codex(codex, style, cols)
+        if rows_:
+            codex_block = ["", divider("codex")] + rows_
+
     head = []
     for block in ([title + "   " + style.dim(meta)],
                   render_board(snap, style, cols, compact=compact),
+                  codex_block,
                   recent_block,
                   ["", style.dim("  h help   -   ctrl-c quit")] if hint else []):
         if block and len(head) + len(block) + len(live_block) <= budget:
@@ -979,6 +1285,105 @@ def plan_frame(now, last_paint, next_frame, got_data, active):
     if (now - last_paint) < MIN_FRAME_GAP:
         return False, last_paint + MIN_FRAME_GAP      # defer briefly, don't drop
     return True, now + (FRAME_ACTIVE if active else FRAME_IDLE)
+
+
+class CodexTail:
+    """Reads Codex's own session rollout file to show what the agent is doing.
+
+    Opt-in, because unlike the Ollama log this file contains real content --
+    commands, file paths, message text. Correlation with a given model request is
+    by time only: no shared request id exists between Codex and Ollama.
+    """
+
+    SESSIONS = "~/.codex/sessions"
+
+    def __init__(self):
+        self.path = None
+        self.offset = 0
+        self.action = None
+        self.detail = None
+        self.calls = 0
+        self.last_call_at = None
+
+    @classmethod
+    def newest_session(cls):
+        root = os.path.expanduser(cls.SESSIONS)
+        newest, newest_mtime = None, 0
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                    continue
+                full = os.path.join(dirpath, name)
+                try:
+                    mtime = os.path.getmtime(full)
+                except OSError:
+                    continue
+                if mtime > newest_mtime:
+                    newest, newest_mtime = full, mtime
+        return newest
+
+    def poll(self):
+        """Read whatever is new. Cheap enough to call every frame."""
+        newest = self.newest_session()
+        if newest != self.path:
+            self.path, self.offset = newest, 0
+            self.calls = 0
+        if not self.path:
+            return
+        try:
+            with open(self.path, "r", errors="replace") as fh:
+                fh.seek(self.offset)
+                for line in fh:
+                    self._consume(line)
+                self.offset = fh.tell()
+        except OSError:
+            return
+
+    def _consume(self, line):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            return
+        payload = record.get("payload") or {}
+        kind = payload.get("type") or record.get("type")
+        if kind == "function_call":
+            self.calls += 1
+            self.action = payload.get("name") or "tool call"
+            self.detail = self._summarise(payload.get("arguments"))
+            self.last_call_at = time.time()
+        elif kind == "task_started":
+            self.calls = 0
+            self.action = "thinking"
+            self.detail = None
+            self.last_call_at = time.time()
+        elif kind == "task_complete":
+            self.action = "done"
+            self.detail = None
+            self.last_call_at = None
+
+    @staticmethod
+    def _summarise(arguments):
+        """One short line out of a JSON argument blob."""
+        if not arguments:
+            return None
+        try:
+            args = json.loads(arguments)
+        except (ValueError, TypeError):
+            return str(arguments)[:80]
+        for key in ("cmd", "command", "path", "file_path", "query", "pattern"):
+            if key in args:
+                value = args[key]
+                if isinstance(value, list):
+                    value = " ".join(str(v) for v in value)
+                return " ".join(str(value).split())[:100]
+        return " ".join(json.dumps(args).split())[:100]
+
+    def state(self):
+        if not self.path:
+            return None
+        waiting = (time.time() - self.last_call_at) if self.last_call_at else None
+        return {"action": self.action, "detail": self.detail,
+                "calls": self.calls, "waiting_since": waiting}
 
 
 class Keyboard:
@@ -1076,6 +1481,7 @@ def follow(args):
     stats = Stats()
     screen = Screen() if tui else None
     keyboard = Keyboard() if tui else None
+    codex_tail = CodexTail() if (tui and args.codex) else None
     help_visible = False
     live_data = None
     live_at = time.time()
@@ -1118,9 +1524,15 @@ def follow(args):
                 continue
 
             if name == "request_start":
+                stats.note_start(data.get("model") or tracker.model,
+                                 data.get("prompt_tokens"))
                 commit("")
                 commit(render_header(data, style))
                 live_data, live_at = data, time.time()
+            elif name == "cache_miss":
+                commit("  " + style.yellow(
+                    "! cache gone - rereading the whole %s-token prompt"
+                    % format(data.get("prompt_tokens") or 0, ",")))
             elif name in ("prefill_done", "generate_done"):
                 slot = pending.setdefault(data["task"], {})
                 slot["prefill" if name == "prefill_done" else "generation"] = data
@@ -1135,6 +1547,7 @@ def follow(args):
                 idle_since = time.time()
             elif name == "request_abandoned":
                 pending.pop(data["task"], None)
+                stats.note_cancel(data.get("model") or tracker.model)
                 commit("  " + style.dim("x task %s cancelled - client disconnected before "
                                         "completion" % data["task"]))
                 if live_data is not None and live_data.get("task") == data["task"]:
@@ -1155,8 +1568,14 @@ def follow(args):
         if tui:
             cols, rows = screen.size()
             snap = stats.snapshot(tracker.model)
-            screen.draw(compose_frame(snap, live_text(), style, cols, rows,
-                                      help_visible=help_visible), rows)
+            age = time.time() - live_at
+            if codex_tail:
+                codex_tail.poll()
+            screen.draw(compose_frame(
+                snap, live_text(), style, cols, rows,
+                help_visible=help_visible,
+                live_detail=render_live_detail(live_data, snap, style, age),
+                codex=codex_tail.state() if codex_tail else None), rows)
         else:
             text = live_text()
             if text:
@@ -1292,6 +1711,9 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true",
                         help="emit one JSON object per event (for status bars/scripts)")
     parser.add_argument("--log", metavar="PATH", help="path to the Ollama log")
+    parser.add_argument("--codex", action="store_true",
+                        help="show what Codex is doing, read from its session file "
+                             "(contains commands and file paths)")
     parser.add_argument("--plain", action="store_true",
                         help="scrolling single-line output instead of the full-screen board")
     parser.add_argument("--no-color", action="store_true", help="disable colour output")
