@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.1 — unreleased
+
+Renamed to **ollama-llmwatch** everywhere — PyPI, GitHub and the command — so the project has
+one name instead of three. The bare `llmwatch` was already taken on PyPI by an unrelated
+cost-tracking package, and having the repo, package and command disagree was going to confuse
+anyone trying to find or install it.
+
+- GitHub repo is now `bingcheng45/ollama-llmwatch` (GitHub redirects the old URL, so existing
+  clones keep working).
+- Installing provides two commands: `ollama-llmwatch` (canonical) and `llmwatch` (short alias).
+  The alias is the only name that could collide with the other PyPI package, which is exactly
+  why it is the alias and not the canonical name.
+
 ## 0.5.0 — unreleased
 
 **Notices when the model is running slow, and says what's competing.**

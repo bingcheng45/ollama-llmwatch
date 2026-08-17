@@ -51,7 +51,7 @@ try:
 except ImportError:  # pragma: no cover - py2 only, never hit
     queue = None
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 # Frame pacing. The loop wakes on new log data OR on these deadlines, whichever
 # comes first, so fresh data appears immediately while animation (spinner,

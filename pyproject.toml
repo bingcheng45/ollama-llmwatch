@@ -3,11 +3,13 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# The PyPI name `llmwatch` is taken by an unrelated LLM cost-tracking package,
-# so the distribution is `ollama-llmwatch`. The installed command is still
-# `llmwatch` (see [project.scripts]).
+# `ollama-llmwatch` everywhere -- PyPI, GitHub, and the command -- because the
+# bare name `llmwatch` is taken on PyPI by an unrelated cost-tracking package.
+# A short `llmwatch` alias is also installed for convenience (see
+# [project.scripts]); it is the one name that could collide if someone has both
+# packages installed, which is why it is the alias and not the canonical name.
 name = "ollama-llmwatch"
-version = "0.5.0"
+version = "0.5.1"
 description = "See what your local Ollama model is actually doing: live prefill progress, ETA, and tok/s."
 readme = "README.md"
 license = { text = "MIT" }
@@ -29,11 +31,12 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/bingcheng45/llmwatch"
-Issues = "https://github.com/bingcheng45/llmwatch/issues"
+Homepage = "https://github.com/bingcheng45/ollama-llmwatch"
+Issues = "https://github.com/bingcheng45/ollama-llmwatch/issues"
 
 [project.scripts]
-llmwatch = "llmwatch:main"
+ollama-llmwatch = "llmwatch:main"   # canonical, matches the package name
+llmwatch = "llmwatch:main"          # short alias
 
 [tool.setuptools]
 py-modules = ["llmwatch"]

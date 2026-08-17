@@ -1,6 +1,6 @@
-# llmwatch
+# ollama-llmwatch
 
-**Your local model isn't stuck — it's still reading your prompt.** `llmwatch` shows you that,
+**Your local model isn't stuck — it's still reading your prompt.** It shows you that,
 live, with a progress bar, an ETA, and a stats board.
 
 ```
@@ -128,12 +128,13 @@ llmwatch
 Or just take the single file:
 
 ```bash
-curl -O https://raw.githubusercontent.com/bingcheng45/llmwatch/main/llmwatch.py
+curl -O https://raw.githubusercontent.com/bingcheng45/ollama-llmwatch/main/llmwatch.py
 chmod +x llmwatch.py && ./llmwatch.py
 ```
 
-The installed command is `llmwatch`. The PyPI name is `ollama-llmwatch` because `llmwatch`
-belongs to an unrelated project.
+This installs two commands: **`ollama-llmwatch`** (canonical) and **`llmwatch`** (short alias).
+The name is `ollama-llmwatch` everywhere because the bare `llmwatch` is taken on PyPI by an
+unrelated cost-tracking project.
 
 It finds your log automatically. If it can't, it prints every location it tried:
 
@@ -281,8 +282,8 @@ a fixture in `tests/fixtures/` plus a test asserting the expected values is the 
 valuable contribution.
 
 ```bash
-git clone https://github.com/bingcheng45/llmwatch
-cd llmwatch
+git clone https://github.com/bingcheng45/ollama-llmwatch
+cd ollama-llmwatch
 python3 -m unittest discover tests -v
 ```
 
