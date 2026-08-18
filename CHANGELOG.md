@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.9.0
+
+**MLX models are no longer invisible.** Ollama runs GGUF models through `llama-server` but any
+`-mlx` model through its own MLX runner, which logs a completely different dialect. llmwatch
+read only the first, so on an Apple Silicon machine running something like `gemma4:26b-mlx` the
+board showed the model name and then `0 req`, forever, with nothing on screen to say why. That
+was the entire experience for MLX users: a tool that looked broken while the model worked fine.
+
+- Both dialects are now understood, automatically. Nothing selects between them and there is no
+  flag or setting to find: which engine runs is a property of the model, and a single log can
+  hold both across a restart, so sniffing once and locking it in would go blind halfway through
+  the file.
+- Full parity for what matters: prompt size, cache hits and misses, live prefill progress and
+  ETA, prefill and generation rates, total time, and speculative decoding acceptance.
+- **Generation token counts are reconstructed, because MLX never prints one.** With speculative
+  decoding each iteration commits one token from the target model plus whichever drafted tokens
+  were accepted that round, so `iterations + accepted` is the exact count rather than an
+  estimate standing in for one.
+- Durations come from the log's own timestamps, not the wall clock, so `--last` on a log from
+  yesterday reports what actually happened instead of measuring how long ago it happened.
+- The weight load is timed separately (~10s for a 26B model) and kept out of the request, where
+  it would otherwise be charged to your prompt. For the same reason the outer
+  `[GIN] POST "/api/chat"` line is ignored in favour of the runner's own completion timing.
+- The MLX runner writes its generation stats and its completion line from different places, so
+  either can reach the log first, and both orders occur within one session. A request is
+  therefore closed on `peak memory`, which across a full session appears exactly once per
+  request and always after both. Closing on the completion line instead would drop the
+  generation rate from the summary of every request that happened to lose the race, which is
+  roughly half of them. If a build ever stops printing that line, the next request still closes
+  the previous one rather than stranding it on the board.
+
+**Alignment.** The frame has two indent levels: column 0 for lines that head it, two spaces for
+content under a divider. The title and the key hints each carried a stray extra space, so the
+one line naming your model sat out of line with every row beneath it. Both now start at column
+0, with a test that fails on a stray indent anywhere in the frame.
+
 ## 0.8.0
 
 **How long did that whole thing take?** Everything llmwatch measured until now was one model

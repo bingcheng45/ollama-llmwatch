@@ -55,16 +55,21 @@ class TestPacing(unittest.TestCase):
         self.assertFalse(paint)
         self.assertAlmostEqual(nxt, 1.0 + MIN_FRAME_GAP)
 
-    def test_idle_uses_the_slower_floor(self):
+    def test_both_floors_are_scheduled_from_now(self):
         _, nxt_active = plan_frame(2.0, 0.0, 0.0, False, active=True)
         _, nxt_idle = plan_frame(2.0, 0.0, 0.0, False, active=False)
         self.assertAlmostEqual(nxt_active, 2.0 + FRAME_ACTIVE)
         self.assertAlmostEqual(nxt_idle, 2.0 + FRAME_IDLE)
-        self.assertGreater(nxt_idle, nxt_active)
 
     def test_active_floor_is_fluid_enough_to_animate(self):
         """A 1s floor would visibly stutter the spinner and jump the ETA."""
         self.assertLessEqual(FRAME_ACTIVE, 0.2)
+
+    def test_idle_animates_as_smoothly_as_active(self):
+        """Idle used to run at 2 fps, on the reasoning that a spinner needs no
+        more. It reads as a laggy tool rather than a resting one, which is the
+        opposite of the reassurance the idle screen exists to give."""
+        self.assertLessEqual(FRAME_IDLE, 0.2)
 
 
 class TestCancelledRequests(unittest.TestCase):

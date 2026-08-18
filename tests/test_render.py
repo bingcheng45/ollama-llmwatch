@@ -467,3 +467,69 @@ class TestEstimateKeepsMoving(unittest.TestCase):
 
     def test_the_clock_keeps_moving_while_overrun(self):
         self.assertNotEqual(self.last(90.0), self.last(120.0))
+
+
+class TestFrameAlignment(unittest.TestCase):
+    """Every line of the frame shares one left edge.
+
+    The margin is applied once to the finished frame rather than baked into
+    each renderer, so no pane can drift out of alignment with the others. The
+    only deeper indent is a continuation under a stat row, which lines up with
+    that row's data rather than starting a new one.
+    """
+
+    MARGIN = 2
+    CONTINUATION = MARGIN + 9      # under `PREFILL `, eight columns plus a space
+
+    def stats_snapshot(self):
+        stats = Stats(clock=lambda: 100.0)
+        for i in range(3):
+            stats.record("m",
+                         {"tokens": 10000, "cached": 2000, "seconds": 100.0, "rate": 100.0 + i},
+                         {"tokens": 200, "seconds": 20.0, "rate": 10.0 + i},
+                         {"task": i, "seconds": 120.0, "prefill_share_pct": 83.0})
+        return stats.snapshot("m")
+
+    def frame(self, **kwargs):
+        return [strip_ansi(line) for line
+                in compose_frame(self.stats_snapshot(), "waiting", PLAIN, 100, 30, **kwargs)]
+
+    def test_the_title_is_inset_like_everything_else(self):
+        self.assertEqual(self.frame()[0], "  " + self.frame()[0].strip())
+        self.assertTrue(self.frame()[0].strip().startswith("llmwatch "))
+
+    def test_the_title_lines_up_with_the_rows_it_heads(self):
+        frame = self.frame()
+        rows = [l for l in frame if l.strip().startswith(("PREFILL", "GENERATE"))]
+        self.assertTrue(rows)
+        self.assertEqual(_indent(frame[0]), _indent(rows[0]))
+
+    def test_content_under_a_divider_shares_the_same_edge(self):
+        """The divider rule separates a section; an extra indent under it would
+        give the frame a second left edge, which is what this replaced."""
+        frame = self.frame(live_detail=["detail line"])
+        divider = next(i for i, l in enumerate(frame) if "live" in l and "--" in l)
+        for line in frame[divider:]:
+            if line.strip():
+                self.assertEqual(_indent(line), self.MARGIN, "%r" % line)
+
+    def test_key_hints_share_it_too(self):
+        hint = [l for l in self.frame() if "ctrl-c quit" in l]
+        self.assertTrue(hint)
+        self.assertEqual(_indent(hint[0]), self.MARGIN)
+
+    def test_only_stat_continuations_go_deeper(self):
+        for line in self.frame():
+            if line.strip():
+                self.assertIn(_indent(line), (self.MARGIN, self.CONTINUATION),
+                              "stray indent: %r" % line)
+
+    def test_the_inset_costs_no_width(self):
+        """Shrinking the renderers' width to match is what keeps a divider from
+        running two columns past where it used to stop."""
+        for line in self.frame():
+            self.assertLessEqual(len(line), 100)
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip(" "))
