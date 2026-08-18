@@ -1,0 +1,27 @@
+tests/test_mlx.py
+  s_ea1480c13f8bd5::t_8484d8f85a13f1 264-296
+README.md
+  s_ea1480c13f8bd5::t_09d5b23d0dbbc4 39-41
+  s_ea1480c13f8bd5::t_c90eafa6fd3341 10
+pyproject.toml
+  s_ea1480c13f8bd5::t_63aee7ff485a47 17-18
+llmwatch.py
+  s_ea1480c13f8bd5::t_c950c7eb645f17 641-645,648-654,656
+  s_ea1480c13f8bd5::t_7155bfa5298cf1 678-683
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "05c75038146383f39caede04987c5a1630b70b97",
+  "prompts": {},
+  "sessions": {
+    "s_ea1480c13f8bd5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "036e0e35-3e99-4231-9e3e-e9d9218fc145",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Bing Cheng <bing.toh@foodpanda.com>"
+    }
+  }
+}
