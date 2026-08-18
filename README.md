@@ -50,17 +50,30 @@ Two commands are installed: `ollama-llmwatch` and the shorter `llmwatch`. Same p
 
 ### Upgrading
 
-Whichever way you installed it:
+**Press `u`.** When a newer version exists llmwatch says so, and `u` upgrades the copy you are
+running:
+
+```
+update available: 0.10.0 (you have 0.9.1) - press u, or run uv tool upgrade ollama-llmwatch
+```
+
+It shows the exact command first and waits for `y`, so the key that opens it is never the key
+that runs it. It quits afterwards, because the program it is running from is what just changed.
+
+It refuses rather than guessing when running it would be a bad idea, and tells you why: a
+checkout with uncommitted changes is never pulled over, and a missing tool is named rather than
+discovered halfway through. Then you run it yourself:
 
 ```bash
 uv tool upgrade ollama-llmwatch        # installed with uv
 pipx upgrade ollama-llmwatch           # installed with pipx
 pip install --upgrade ollama-llmwatch  # installed with pip
+git pull                               # running from a checkout
 curl -O https://raw.githubusercontent.com/bingcheng45/ollama-llmwatch/main/llmwatch.py
 ```
 
-llmwatch works out which of these applies to the copy you are running and prints that one when a
-new version exists, so you should not have to come back to this list.
+Nothing in that command comes from the log, a model name or a version string. It is chosen from
+the list above by where the file lives, and run as an argument list rather than through a shell.
 
 ## The problem
 

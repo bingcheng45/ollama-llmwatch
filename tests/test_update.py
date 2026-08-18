@@ -18,9 +18,10 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llmwatch import (  # noqa: E402
-    UPDATE_INTERVAL, Style, check_for_update, compose_frame, fetch_latest_version,
-    render_update, start_update_check, update_check_disabled, update_is_newer,
-    upgrade_command, version_tuple,
+    UPDATE_INTERVAL, Style, UIState, check_for_update, compose_frame,
+    fetch_latest_version, handle_key, render_update, start_update_check,
+    update_check_disabled, update_is_newer, upgrade_command, upgrade_plan,
+    version_tuple,
 )
 
 PLAIN = Style(color=False, unicode_ok=False, width=100)
@@ -231,6 +232,129 @@ class TestUpgradeCommand(unittest.TestCase):
         finally:
             os.rmdir(os.path.join(directory, ".git"))
             os.rmdir(directory)
+
+
+class TestUpgradePlan(unittest.TestCase):
+    """What `u` would actually run, and when it refuses to run anything.
+
+    Refusing is the feature. Pulling over somebody's uncommitted work, or
+    upgrading into an interpreter they are not running, fails in a way that is
+    far harder to understand than a sentence saying why it stopped.
+    """
+
+    HAVE = staticmethod(lambda tool: "/usr/bin/" + tool)
+    MISSING = staticmethod(lambda tool: None)
+
+    def test_uv_and_pipx_are_argument_lists_never_shell_strings(self):
+        for path, expected in [
+            ("/x/.local/share/uv/tools/ollama-llmwatch/lib/p/site-packages/llmwatch.py",
+             ["uv", "tool", "upgrade", "ollama-llmwatch"]),
+            ("/x/.local/pipx/venvs/ollama-llmwatch/lib/p/site-packages/llmwatch.py",
+             ["pipx", "upgrade", "ollama-llmwatch"]),
+        ]:
+            argv, blocker = upgrade_plan(path, which=self.HAVE)
+            self.assertIsNone(blocker)
+            self.assertEqual(argv, expected)
+
+    def test_pip_upgrades_the_interpreter_that_is_running(self):
+        """A bare `pip` may belong to a different interpreter entirely, and
+        upgrading into one you are not running is the most confusing possible
+        outcome: the notice never goes away."""
+        argv, blocker = upgrade_plan("/x/venv/lib/python3.12/site-packages/llmwatch.py",
+                                     which=self.HAVE)
+        self.assertIsNone(blocker)
+        self.assertEqual(argv[:3], [sys.executable, "-m", "pip"])
+
+    def test_a_missing_tool_blocks_rather_than_failing_later(self):
+        argv, blocker = upgrade_plan(
+            "/x/.local/share/uv/tools/ollama-llmwatch/lib/p/site-packages/llmwatch.py",
+            which=self.MISSING)
+        self.assertIsNone(argv)
+        self.assertIn("uv", blocker)
+
+    def test_a_dirty_checkout_is_never_pulled_over(self):
+        directory = tempfile.mkdtemp()
+        try:
+            os.mkdir(os.path.join(directory, ".git"))
+            argv, blocker = upgrade_plan(os.path.join(directory, "llmwatch.py"),
+                                         which=self.HAVE)
+            # Not a real repository, so git cannot report its state, and the
+            # answer to "I do not know" is the same as to "yes, dirty".
+            self.assertIsNone(argv)
+            self.assertTrue(blocker)
+        finally:
+            os.rmdir(os.path.join(directory, ".git"))
+            os.rmdir(directory)
+
+    def test_a_single_file_is_replaced_where_it_lives(self):
+        """`curl -O` writes to the current directory, which is where you
+        happened to be standing, not where the program is."""
+        directory = tempfile.mkdtemp()
+        try:
+            path = os.path.join(directory, "llmwatch.py")
+            argv, blocker = upgrade_plan(path, which=self.HAVE)
+            self.assertIsNone(blocker)
+            self.assertIn("-o", argv)
+            self.assertEqual(argv[argv.index("-o") + 1], path)
+        finally:
+            os.rmdir(directory)
+
+    def test_nothing_in_the_command_comes_from_outside(self):
+        """Every argument is a constant or a path this program already knows.
+        Nothing from a log line, a model name or a version reaches it."""
+        for path in ("/x/.local/share/uv/tools/ollama-llmwatch/lib/p/site-packages/llmwatch.py",
+                     "/x/.local/pipx/venvs/ollama-llmwatch/lib/p/site-packages/llmwatch.py",
+                     "/x/venv/lib/python3.12/site-packages/llmwatch.py"):
+            argv, _ = upgrade_plan(path, which=self.HAVE)
+            for argument in argv:
+                self.assertNotIn(";", argument)
+                self.assertNotIn("&", argument)
+                self.assertNotIn("|", argument)
+
+
+class TestUpgradeKeyRequiresConfirmation(unittest.TestCase):
+
+    def test_u_does_nothing_when_there_is_no_update(self):
+        """Otherwise the key invites people to reinstall what they already
+        have, and the pane has nothing true to put in its heading."""
+        state = UIState()
+        self.assertFalse(handle_key(state, "u", [], update=None))
+        self.assertEqual(state.view, "live")
+
+    def test_u_opens_the_confirmation_rather_than_upgrading(self):
+        state = UIState()
+        self.assertTrue(handle_key(state, "u", [], update="999.0.0"))
+        self.assertEqual(state.view, "upgrade")
+        self.assertFalse(state.upgrade_requested)
+
+    def test_the_same_key_cannot_open_and_confirm(self):
+        """One keystroke opens, a different one commits. Nobody should change
+        what is installed by leaning on the keyboard."""
+        state = UIState()
+        handle_key(state, "u", [], update="999.0.0")
+        handle_key(state, "u", [], update="999.0.0")
+        self.assertFalse(state.upgrade_requested)
+        self.assertEqual(state.view, "live")
+
+    def test_y_confirms(self):
+        state = UIState()
+        handle_key(state, "u", [], update="999.0.0")
+        handle_key(state, "y", [], update="999.0.0")
+        self.assertTrue(state.upgrade_requested)
+
+    def test_escape_backs_out(self):
+        for key in ("ESC", "n"):
+            state = UIState()
+            handle_key(state, "u", [], update="999.0.0")
+            handle_key(state, key, [], update="999.0.0")
+            self.assertFalse(state.upgrade_requested, key)
+            self.assertEqual(state.view, "live", key)
+
+    def test_quit_still_works_from_the_confirmation(self):
+        state = UIState()
+        handle_key(state, "u", [], update="999.0.0")
+        with self.assertRaises(KeyboardInterrupt):
+            handle_key(state, "q", [], update="999.0.0")
 
 
 class TestDisplay(unittest.TestCase):

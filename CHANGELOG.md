@@ -30,6 +30,18 @@ tells you when it is behind.
   fails in front of them and teaches them to ignore the line. It reads its own location and says
   `uv tool upgrade`, `pipx upgrade`, `pip install --upgrade`, `git pull` or `curl` accordingly.
 
+- **Press `u` to take the upgrade.** Naming the right command still leaves you to copy it, so the
+  notice is now actionable: `u` opens a confirmation showing the exact command, `y` runs it, and
+  llmwatch quits afterwards because the program it is running from is what changes. The key that
+  opens the pane is never the key that confirms it, so nobody upgrades by leaning on a keyboard.
+- It refuses rather than guessing when running the command would be a bad idea, and says why. A
+  checkout with uncommitted changes is never pulled over. A missing `uv`, `pipx`, `git` or `curl`
+  is named up front instead of discovered halfway through. `pip` runs as `sys.executable -m pip`,
+  because a bare `pip` can belong to an interpreter you are not running, and upgrading into that
+  one leaves the notice on screen forever.
+- Nothing in the command comes from the log, a model name or a version string: it is chosen from
+  a fixed set by where the file lives, and run as an argument list rather than through a shell.
+
 **Community files.** CONTRIBUTING, SECURITY, a code of conduct and a pull request template, none
 of which existed. The security policy routes reports to a private advisory rather than a public
 issue, and says what is in scope for a tool whose attack surface is log content it prints to your

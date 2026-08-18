@@ -1672,7 +1672,8 @@ HELP_TEXT = [
     ("", "speed, time-to-first-token, cache, what it saves per request, and"),
     ("", "median turn time split by effort level. See also --turns."),
     ("", ""),
-    ("keys", "h help   -   c compare   -   q or ctrl-c quit"),
+    ("keys", "h help   -   c compare   -   u upgrade, when one is available"
+             "   -   q or ctrl-c quit"),
 ]
 
 
@@ -1687,10 +1688,13 @@ class UIState:
     """
 
     def __init__(self):
-        self.view = "live"          # live | help | picker | compare
+        self.view = "live"          # live | help | picker | compare | upgrade
         self.cursor = 0
         self.model_a = None
         self.model_b = None
+        # Set only by an explicit confirmation in the upgrade view. The loop
+        # watches it; nothing else in here runs a command.
+        self.upgrade_requested = False
 
     def reset_selection(self):
         self.cursor = 0
@@ -1698,12 +1702,32 @@ class UIState:
         self.model_b = None
 
 
-def handle_key(state, key, models):
+def handle_key(state, key, models, update=None):
     """Apply a keypress. Returns True if anything changed (so we repaint now)."""
     names = [m["model"] for m in models]
 
     if key in ("q", "Q"):
         raise KeyboardInterrupt
+
+    # Confirmation, handled before the general keys so `u` cannot both open this
+    # pane and confirm it. One keystroke opens, a different one commits.
+    if state.view == "upgrade":
+        if key in ("y", "Y"):
+            state.upgrade_requested = True
+            return True
+        if key in ("ESC", "n", "N", "u", "U"):
+            state.view = "live"
+            return True
+        return False
+
+    if key in ("u", "U"):
+        # Offered only when there is something to upgrade to. Otherwise the key
+        # would invite people to reinstall the version they already have.
+        if not update:
+            return False
+        state.view = "upgrade"
+        return True
+
     if key in ("h", "H", "?"):
         state.view = "live" if state.view == "help" else "help"
         return True
@@ -2238,6 +2262,136 @@ def upgrade_command(path=None):
             "bingcheng45/ollama-llmwatch/main/llmwatch.py")
 
 
+class _UpgradeRequested(Exception):
+    """Leave the loop and upgrade. Not an error: the frame cannot keep drawing
+    a program that is being replaced underneath it."""
+
+
+def run_upgrade(style, plan=None):
+    """Run the upgrade on the normal screen, then stop.
+
+    Deliberately does not restart llmwatch afterwards. The file it would
+    re-exec has just been overwritten, and a program that relaunches itself
+    from something it just replaced is a good way to turn a failed download
+    into a confusing crash. Telling someone to run one word is fine.
+    """
+    argv, blocker = plan if plan is not None else upgrade_plan()
+    if blocker:
+        sys.stderr.write("llmwatch: cannot upgrade automatically: %s\n"
+                         "Run this instead:\n  %s\n" % (blocker, upgrade_command()))
+        return 1
+    sys.stdout.write("\n%s\n\n" % style.dim("$ " + " ".join(argv)))
+    sys.stdout.flush()
+    try:
+        code = subprocess.call(argv)
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write("llmwatch: upgrade failed to start: %s\n" % exc)
+        return 1
+    if code != 0:
+        sys.stderr.write("\nllmwatch: upgrade exited %d. Nothing was changed by "
+                         "llmwatch itself.\n" % code)
+        return code
+    sys.stdout.write("\n%s\n" % style.bold("upgraded. start llmwatch again."))
+    return 0
+
+
+def upgrade_plan(path=None, which=None):
+    """(argv, blocker) for upgrading this copy in place.
+
+    argv is always an argument list, never a shell string, and never contains
+    anything derived from the log, a model name or a version: the whole command
+    comes from a fixed set chosen by where this file lives. Nothing an attacker
+    can reach gets to influence what runs.
+
+    A blocker means "do not run this, and say why". Refusing is the right answer
+    more often than it looks: pulling over somebody's uncommitted work, or
+    writing a file the user cannot write, fails in a way that is much harder to
+    understand than a sentence explaining it up front.
+    """
+    path = os.path.abspath(path or __file__)
+    directory = os.path.dirname(path)
+    lowered = path.replace("\\", "/").lower()
+    which = which or shutil.which
+
+    def needs(tool, argv):
+        if not which(tool):
+            return None, "%s is not on PATH" % tool
+        return argv, None
+
+    if "/uv/tools/" in lowered:
+        return needs("uv", ["uv", "tool", "upgrade", "ollama-llmwatch"])
+    if "/pipx/" in lowered:
+        return needs("pipx", ["pipx", "upgrade", "ollama-llmwatch"])
+    if "site-packages" in lowered or "dist-packages" in lowered:
+        # sys.executable, not a bare `pip`: the pip first on PATH may belong to
+        # an entirely different interpreter, and "upgraded" into one you are not
+        # running is the most confusing possible outcome.
+        return [sys.executable, "-m", "pip", "install", "--upgrade",
+                "ollama-llmwatch"], None
+    if os.path.isdir(os.path.join(directory, ".git")):
+        if not which("git"):
+            return None, "git is not on PATH"
+        # --ff-only, and only on a clean tree. This is a contributor's checkout;
+        # merging into their work uninvited is not an upgrade, it is a mess.
+        dirty = _git_is_dirty(directory)
+        if dirty is None:
+            return None, "cannot read the state of this checkout"
+        if dirty:
+            return None, "this checkout has uncommitted changes"
+        return ["git", "-C", directory, "pull", "--ff-only"], None
+
+    # A single downloaded file: replace it where it actually lives, rather than
+    # dropping a second copy into whatever directory you happened to be in.
+    if not which("curl"):
+        return None, "curl is not on PATH"
+    if not os.access(directory, os.W_OK):
+        return None, "%s is not writable" % directory
+    return ["curl", "-fsSL", "-o", path,
+            "https://raw.githubusercontent.com/bingcheng45/"
+            "ollama-llmwatch/main/llmwatch.py"], None
+
+
+def _git_is_dirty(directory):
+    """True, False, or None when git cannot tell us."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", directory, "status", "--porcelain"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
+def render_upgrade_confirm(latest, style, cols=80, plan=None):
+    """The confirmation pane. Shows the exact command before it runs.
+
+    An upgrade is one keystroke away, so the keystroke that starts it must not
+    be the same one that opened this. Nobody should be able to change what is
+    installed by leaning on the keyboard.
+    """
+    argv, blocker = plan if plan is not None else upgrade_plan()
+    out = ["", style.bold("upgrade to %s" % latest) if latest else
+           style.bold("upgrade"), ""]
+    if blocker:
+        out.append(style.yellow("cannot upgrade automatically: %s" % blocker))
+        out.append("")
+        out.append("run this yourself instead:")
+        out.append(style.cyan("  " + upgrade_command()))
+        out.append("")
+        out.append(style.dim("esc  back"))
+        return out
+    out.append("this will run:")
+    out.append(style.cyan("  " + " ".join(argv)))
+    out.append("")
+    out.append(style.dim("llmwatch quits afterwards, because the program it is "
+                         "running from is what changes."))
+    out.append("")
+    out.append(style.dim("y  do it     esc  back"))
+    return out
+
+
 def render_update(latest, style):
     """One dim line. An update is worth mentioning, not worth interrupting for.
 
@@ -2248,7 +2402,7 @@ def render_update(latest, style):
     """
     if not update_is_newer(__version__, latest):
         return None
-    return style.dim("update available: %s (you have %s) - %s"
+    return style.dim("update available: %s (you have %s) - press u, or run %s"
                      % (latest, __version__, upgrade_command()))
 
 
@@ -2380,6 +2534,10 @@ def frame_lines(snap, live_text, style, cols, rows, hint=True, help_visible=Fals
     if ui is not None and ui.view == "compare":
         head = divider("%s  vs  %s" % (ui.model_a or "?", ui.model_b or "?"))
         return with_live([head, ""] + (compare or []), "live")
+
+    if ui is not None and ui.view == "upgrade":
+        return with_live([divider("upgrade")]
+                         + render_upgrade_confirm(update, style, cols), "live")
 
     if help_visible:
         # Help replaces the board but keeps the live line: you should never lose
@@ -3418,6 +3576,7 @@ def follow(args):
     # excluded in update_check_disabled()'s caller below: that output is parsed
     # by other programs and usually runs unattended.
     update_box = {}
+    upgrading = False
     if not args.json:
         start_update_check(update_box)
 
@@ -3616,8 +3775,14 @@ def follow(args):
             for kind_, payload in batch:
                 if kind_ == "key":
                     was = ui.view
-                    if handle_key(ui, payload, picker_models):
+                    if handle_key(ui, payload, picker_models,
+                                  update=update_box.get("latest")):
                         got_data = True          # repaint at once, don't wait
+                    if ui.upgrade_requested:
+                        # Confirmed. Everything after this is teardown, so it
+                        # leaves the loop rather than trying to keep drawing a
+                        # program that is being replaced underneath it.
+                        raise _UpgradeRequested()
                     if ui.view == "picker" and was != "picker":
                         picker_models = pickable_models(history)
                     if ui.view == "compare" and was != "compare":
@@ -3641,6 +3806,8 @@ def follow(args):
                     dirty = True
                 paint()
                 last_paint = now
+    except _UpgradeRequested:
+        upgrading = True
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
@@ -3655,6 +3822,11 @@ def follow(args):
         elif interactive:
             clear()
             sys.stdout.write("\n")
+
+    # After the screen is restored, so the package manager's own output is
+    # visible on the normal terminal rather than painted over by a frame.
+    if upgrading:
+        return run_upgrade(style)
 
     # The alternate buffer takes the whole session with it when it closes, so
     # hand the numbers back on the normal screen before exiting.
