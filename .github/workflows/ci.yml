@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+# A second push to a pull request makes the first run's answer irrelevant, so
+# stop paying for it. Pushes to main are never cancelled: that history is the
+# record of what was actually green.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     # macOS is where this was developed; ubuntu guards the journald/Linux paths
@@ -24,7 +34,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Run tests
-        run: python -m unittest discover tests -v
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover tests -v 2>&1 | tee /tmp/tests.log
+
+      # So the run page answers "how many tests, on what" without anyone
+      # opening the log of one job out of ten.
+      - name: Summarise
+        if: always()
+        shell: bash
+        run: |
+          line=$(grep -E "^Ran [0-9]+ tests" /tmp/tests.log | tail -1 || true)
+          echo "- \`${{ matrix.os }}\` Python ${{ matrix.python-version }}: ${line:-no test output}" \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check the CLI starts and reports its version
         run: python llmwatch.py --version
