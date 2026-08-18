@@ -66,7 +66,13 @@ __version__ = "0.9.0"
 # silent -- llama-server logs progress only once per 512-token batch, 5-10s
 # apart at typical rates.
 FRAME_ACTIVE = 0.1     # 10 fps while a request is in flight
-FRAME_IDLE = 0.5       # 2 fps when nothing is running: a spinner needs no more
+# Also 10 fps when nothing is running. This was 2 fps on the reasoning that an
+# idle spinner needs no more, which was true of the spinner and wrong about the
+# tool: a board that updates twice a second reads as laggy, and "is this thing
+# even alive?" is the doubt llmwatch exists to remove. A frame is one write of
+# at most a screenful, so the cost of the faster floor is a few KB/s and ten
+# wakeups a second while you are watching it; MIN_FRAME_GAP still caps the rest.
+FRAME_IDLE = 0.1
 MIN_FRAME_GAP = 1 / 30.0   # hard ceiling so a log flood can't spin the CPU
 
 # Requests smaller than this are excluded from peak/low. A cached prompt can
