@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # A named environment means the publish step can be held for approval in
+    # repository settings. Nothing reaches PyPI by accident.
+    environment: pypi
+    permissions:
+      id-token: write        # Trusted Publishing: no API token to store or leak
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # v0.8.0 was tagged and never published, so the tag, the code and PyPI
+      # drifted apart with nothing to notice. A version on PyPI can never be
+      # reused or corrected, so disagreement about the number has to stop the
+      # release rather than ship under whichever value happened to win.
+      - name: Check the tag, the module and the package agree
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          module=$(python -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('llmwatch.py').read()).group(1))")
+          package=$(python -c "import re; print(re.search(r'^version = \"([^\"]+)\"', open('pyproject.toml').read(), re.M).group(1))")
+          echo "tag=$tag module=$module package=$package"
+          if [ "$tag" != "$module" ] || [ "$tag" != "$package" ]; then
+            echo "::error::version mismatch - tag $tag, __version__ $module, pyproject $package"
+            exit 1
+          fi
+
+      # The tag is what gets published, so it is tested here too rather than
+      # trusting that the commit was green when it was on a branch.
+      - name: Run tests
+        run: python -m unittest discover tests -v
+
+      - run: pip install build
+      - run: python -m build
+
+      - name: Verify the console scripts work from the built wheel
+        run: |
+          pip install dist/*.whl
+          ollama-llmwatch --version
+          llmwatch --version
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

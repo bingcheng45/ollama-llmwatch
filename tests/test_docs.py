@@ -14,6 +14,8 @@ def read(name):
 class TestPublishedText(unittest.TestCase):
 
     FILES = ["README.md", "CHANGELOG.md",
+             "CONTRIBUTING.md", "SECURITY.md", "CODE_OF_CONDUCT.md",
+             ".github/PULL_REQUEST_TEMPLATE.md",
              ".github/ISSUE_TEMPLATE/parser_drift.md",
              ".github/ISSUE_TEMPLATE/wrong_number.md",
              ".github/ISSUE_TEMPLATE/feedback.md"]
@@ -95,3 +97,32 @@ class TestNoShadowedDefinitions(unittest.TestCase):
         used |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
         orphans = sorted(defined - used - {"main"})
         self.assertEqual(orphans, [], "defined but never used: %s" % orphans)
+
+
+class TestCommunityHealthFiles(unittest.TestCase):
+    """GitHub looks for these by exact name and path, and a file in the wrong
+    place is invisible rather than broken: nothing fails, the checklist just
+    stays unticked and nobody finds out.
+    """
+
+    EXPECTED = ["README.md", "LICENSE", "CONTRIBUTING.md", "SECURITY.md",
+                "CODE_OF_CONDUCT.md", ".github/PULL_REQUEST_TEMPLATE.md"]
+
+    def test_every_file_exists_where_github_looks_for_it(self):
+        for name in self.EXPECTED:
+            self.assertTrue(os.path.exists(os.path.join(ROOT, name)),
+                            "missing community health file: %s" % name)
+
+    def test_there_is_at_least_one_issue_template(self):
+        templates = os.listdir(os.path.join(ROOT, ".github", "ISSUE_TEMPLATE"))
+        self.assertTrue([t for t in templates if t.endswith(".md")])
+
+    def test_security_policy_routes_reports_away_from_public_issues(self):
+        """A security policy that says "open an issue" is worse than none: it
+        invites disclosure of the bug before there is a fix to disclose."""
+        policy = read("SECURITY.md")
+        self.assertIn("security/advisories/new", policy)
+        self.assertIn("do not open a public issue", policy.lower())
+
+    def test_contributing_names_the_command_that_runs_the_tests(self):
+        self.assertIn("unittest discover tests", read("CONTRIBUTING.md"))

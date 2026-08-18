@@ -7,7 +7,7 @@ And when it finishes: how long that whole thing actually took, at what reasoning
 whether that was normal. See [How long does a turn take?](#how-long-does-a-turn-take)
 
 ```
-  ollama-llmwatch 0.9.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
+  ollama-llmwatch 0.9.1   qwen3.8:27b-mtp-128k   12 req - 18m04s
   PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
            ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
   GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
@@ -47,6 +47,33 @@ chmod +x llmwatch.py && ./llmwatch.py
 ```
 
 Two commands are installed: `ollama-llmwatch` and the shorter `llmwatch`. Same program.
+
+### Upgrading
+
+**Press `u`.** When a newer version exists llmwatch says so, and `u` upgrades the copy you are
+running:
+
+```
+update available: 0.10.0 (you have 0.9.1) - press u, or run uv tool upgrade ollama-llmwatch
+```
+
+It shows the exact command first and waits for `y`, so the key that opens it is never the key
+that runs it. It quits afterwards, because the program it is running from is what just changed.
+
+It refuses rather than guessing when running it would be a bad idea, and tells you why: a
+checkout with uncommitted changes is never pulled over, and a missing tool is named rather than
+discovered halfway through. Then you run it yourself:
+
+```bash
+uv tool upgrade ollama-llmwatch        # installed with uv
+pipx upgrade ollama-llmwatch           # installed with pipx
+pip install --upgrade ollama-llmwatch  # installed with pip
+git pull                               # running from a checkout
+curl -O https://raw.githubusercontent.com/bingcheng45/ollama-llmwatch/main/llmwatch.py
+```
+
+Nothing in that command comes from the log, a model name or a version string. It is chosen from
+the list above by where the file lives, and run as an argument list rather than through a shell.
 
 ## The problem
 
@@ -243,15 +270,33 @@ Press **`h`** for in-app help explaining every number. **`q`** or **ctrl-c** qui
 ### Does this need an internet connection?
 
 No - and neither does your model. Local inference is entirely offline; the internet is only
-needed to *download* models in the first place.
+needed to *download* models in the first place. Everything llmwatch actually does works with the
+network unplugged: it reads a local log file.
 
-ollama-llmwatch itself makes **no network calls at all**. It reads a local log file. There's a
-test that fails if anyone adds a network client.
+There is exactly one network call, and it is not part of the job: **once a day it asks PyPI
+whether there is a newer version.** It runs on a background thread, times out after two seconds,
+and stays silent if anything at all goes wrong. Turn it off and nothing else changes:
+
+```bash
+export LLMWATCH_NO_UPDATE_CHECK=1
+```
+
+It is off automatically under `--json`, which is usually running unattended in a script.
+
+This used to say "no network calls at all", and that was true until 0.9.1. It changed because
+0.8.0 shipped to GitHub and never reached PyPI, and nobody running an older copy had any way to
+find out. Tests keep it to the one call: a single import, inside a single function, with no
+second network client allowed anywhere in the file.
 
 ### Does it read my prompts, or send anything anywhere?
 
 No. Ollama's log contains only timings and bookkeeping - no prompt text, no file names, no
-responses. Nothing leaves your machine.
+responses. **Nothing about you or your models ever leaves your machine.**
+
+The daily update check is the only thing that goes out, and it carries nothing: an empty GET to
+the same public URL every user of the package requests, `https://pypi.org/pypi/ollama-llmwatch/json`.
+No query string, no model names, no identifier, no usage data. PyPI learns that somebody asked,
+which it already knew when you installed. Disable it with `LLMWATCH_NO_UPDATE_CHECK=1`.
 
 One exception, and it's opt-in: `--codex` reads your Codex session file, which *does* contain
 commands and file paths. That's exactly why it's off by default. Of what it reads, only turn
@@ -441,7 +486,7 @@ claim work that hasn't happened.
 ## Contributing
 
 Issues and PRs welcome - including "this number looks wrong". Several fixes so far came from
-exactly that.
+exactly that, and a wrong number is the worst bug this project can have.
 
 The most useful bug report includes your Ollama version (`ollama --version`), your OS, and a few
 lines from `ollama-llmwatch --debug-unparsed`.
@@ -452,9 +497,19 @@ cd ollama-llmwatch
 python3 -m unittest discover tests -v
 ```
 
-One file, standard library only. The parsing, tracking, stats and rendering functions are pure  - 
-they take data and return data - so almost everything is testable without a terminal or a running
-model.
+That is the whole setup: one file, standard library only, no build step. The parsing, tracking,
+stats and rendering functions are pure  -  they take data and return data  -  so almost
+everything is testable without a terminal or a running model.
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the rest: how the four layers fit together, what the tests
+are really guarding against, the style rules, and how a release goes out. Security problems go
+through [SECURITY.md](SECURITY.md) rather than a public issue. Everyone here is expected to
+follow the [Code of Conduct](CODE_OF_CONDUCT.md), which is two paragraphs of "be decent" and some
+detail underneath.
+
+Every push and PR runs the tests on Python 3.9 to 3.13, on Linux and macOS, plus Bandit, CodeQL
+and a dependency audit. The security scans also run weekly, because advisories appear after the
+last commit does.
 
 ## License
 

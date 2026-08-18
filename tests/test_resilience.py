@@ -3,12 +3,14 @@
 llmwatch runs for hours beside an agent while Ollama restarts, logs rotate, tools
 fail and clients disconnect. It must degrade quietly rather than lie or crash.
 
-Note on networking: llmwatch makes NO network calls. A local model needs no
-internet either -- only pulling models does. So "network down" is not a failure
-mode for either; what actually breaks is the local server, the log file, or the
-agent's tools, which is what these cover.
+Note on networking: llmwatch makes exactly one network call, the daily update
+check, and it is written to fail silent. A local model needs no internet either
+-- only pulling models does. So "network down" is not a failure mode for either;
+what actually breaks is the local server, the log file, or the agent's tools,
+which is what these cover.
 """
 
+import ast
 import json
 import os
 import shutil
@@ -31,17 +33,49 @@ def strip_ansi(text):
 
 
 class TestNoNetworkDependency(unittest.TestCase):
+    """This started as "no network client, at all", and that is still nearly
+    true. The update check is the single exception, and these tests are what
+    keep it single: one import, inside one function, reachable only through the
+    check, and no second network client sneaking in beside it.
+    """
 
-    def test_llmwatch_imports_no_network_client(self):
-        """If this ever fails, someone added a network dependency to a tool whose
-        entire premise is watching a LOCAL model."""
+    def source(self):
         path = os.path.join(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))), "llmwatch.py")
         with open(path) as fh:
-            source = fh.read()
-        for module in ("import urllib", "import requests", "import socket",
-                       "import http"):
-            self.assertNotIn(module, source, module)
+            return fh.read()
+
+    def test_no_network_client_other_than_urllib(self):
+        """A tool whose entire premise is watching a LOCAL model has no business
+        with an HTTP stack."""
+        for module in ("import requests", "import socket", "import http",
+                       "import httpx", "from urllib3"):
+            self.assertNotIn(module, self.source(), module)
+
+    def test_urllib_is_imported_once_and_only_for_the_update_check(self):
+        source = self.source()
+        self.assertEqual(source.count("import urllib"), 1)
+        tree = ast.parse(source)
+        holders = [node.name for node in ast.walk(tree)
+                   if isinstance(node, ast.FunctionDef)
+                   and any(isinstance(inner, (ast.Import, ast.ImportFrom))
+                           and "urllib" in ast.dump(inner)
+                           for inner in ast.walk(node))]
+        self.assertEqual(holders, ["fetch_latest_version"])
+
+    def test_it_is_not_imported_at_module_scope(self):
+        """Keeping the import inside that one function means starting llmwatch
+        never loads an HTTP stack unless the check actually runs."""
+        tree = ast.parse(self.source())
+        top_level = [ast.dump(node) for node in tree.body
+                     if isinstance(node, (ast.Import, ast.ImportFrom))]
+        self.assertEqual([d for d in top_level if "urllib" in d], [])
+
+    def test_the_url_carries_nothing_about_the_user(self):
+        """The same URL for everyone: no query string, no version, no model."""
+        from llmwatch import UPDATE_URL
+        self.assertEqual(UPDATE_URL, "https://pypi.org/pypi/ollama-llmwatch/json")
+        self.assertNotIn("?", UPDATE_URL)
 
 
 class TestBrokenLogFile(unittest.TestCase):

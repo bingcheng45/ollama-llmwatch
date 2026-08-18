@@ -1,0 +1,77 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # A dependency-free project cannot go stale, but the advisory databases and
+    # the CodeQL queries do. Weekly catches a problem found after the last push.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  bandit:
+    name: static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - run: pip install bandit
+
+      # Gated at medium and above. The low findings here are the design, not
+      # defects: subprocess is called with an argument list and never a shell
+      # string, which is the form bandit's own advice recommends, and the bare
+      # `except: pass` cases are the documented fail-soft contract -- a monitor
+      # must never take down the thing it is watching. Failing the build on
+      # those would train everyone to ignore this job.
+      - name: Fail on medium or high findings
+        run: bandit -r llmwatch.py --severity-level medium
+
+      # Still printed, so a new low finding is visible to a reviewer rather
+      # than silently swallowed by the gate above.
+      - name: Full report, informational
+        if: always()
+        run: bandit -r llmwatch.py || true
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - run: pip install pip-audit
+
+      # The project declares no dependencies on purpose, so today this is a
+      # guard rather than a check: it is what fails the day one is added
+      # carrying a known advisory, which is exactly when nobody is looking.
+      # --strict so a dependency pip-audit cannot resolve fails the job instead
+      # of being reported as nothing to worry about.
+      - name: Audit the project's dependencies
+        run: pip-audit --strict --progress-spinner off .
+
+  codeql:
+    name: codeql
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-extended
+
+      - uses: github/codeql-action/analyze@v3
