@@ -1,0 +1,27 @@
+tests/test_render.py
+  s_ea1480c13f8bd5::t_f9330ee0daab6a 473,475-478,481-483,493,495,497-499,503,507-516,519,521,524-531
+README.md
+  s_ea1480c13f8bd5::t_31da24fac822fa 109-113,115,119-141,165
+  s_ea1480c13f8bd5::t_331fd4e3cf6ff8 10-19,23,25-26
+llmwatch.py
+  s_ea1480c13f8bd5::t_0cbff7dc18453e 2149-2151,2155-2173
+  s_ea1480c13f8bd5::t_282f8545388c6b 2008,2190,2192,2207,2209,2214,2216
+  s_ea1480c13f8bd5::t_29417aea6a2403 1602,1607
+  s_ea1480c13f8bd5::t_d56f0e54c7d290 1525,1534,1539,1556,1558,1580,1595
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "47f7f8ee6b03336e4aef816cda0fd1048132e24c",
+  "prompts": {},
+  "sessions": {
+    "s_ea1480c13f8bd5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "036e0e35-3e99-4231-9e3e-e9d9218fc145",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Bing Cheng <bing.toh@foodpanda.com>"
+    }
+  }
+}
