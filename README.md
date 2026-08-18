@@ -1,5 +1,10 @@
 # ollama-llmwatch
 
+[![tests](https://github.com/bingcheng45/ollama-llmwatch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bingcheng45/ollama-llmwatch/actions/workflows/ci.yml)
+[![security](https://github.com/bingcheng45/ollama-llmwatch/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/bingcheng45/ollama-llmwatch/actions/workflows/security.yml)
+[![PyPI](https://img.shields.io/pypi/v/ollama-llmwatch)](https://pypi.org/project/ollama-llmwatch/)
+[![Python](https://img.shields.io/pypi/pyversions/ollama-llmwatch)](https://pypi.org/project/ollama-llmwatch/)
+
 **Your local model isn't frozen - it's still reading your prompt.** This shows you that, live,
 with a progress bar, an ETA, and a plain-English answer to *"should I keep waiting?"*
 
