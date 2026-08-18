@@ -1,0 +1,23 @@
+.github/workflows/ci.yml
+  s_ea1480c13f8bd5::t_d61b8695ea6913 8-17,37-50
+.github/workflows/security.yml
+  s_ea1480c13f8bd5::t_cbe4c38d2d9399 15-18
+README.md
+  s_ea1480c13f8bd5::t_46c6770b15e77e 3-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "a924df039405f49108de3cb211fbd01e51ac37bf",
+  "prompts": {},
+  "sessions": {
+    "s_ea1480c13f8bd5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "036e0e35-3e99-4231-9e3e-e9d9218fc145",
+        "model": "claude-opus-5"
+      },
+      "human_author": "bingcheng45 <bingcheng45@gmail.com>"
+    }
+  }
+}
