@@ -1522,7 +1522,7 @@ def render_codex(state, style, width=80):
     out = []
     action = state.get("action")
     if action:
-        out.append("  %s %s" % (style.bold("%-12s" % "last action"),
+        out.append("%s %s" % (style.bold("%-12s" % "last action"),
                                 style.cyan(action)))
         if state.get("detail"):
             # Keep it glanceable. The full command lives in your agent's window;
@@ -1531,12 +1531,12 @@ def render_codex(state, style, width=80):
             detail = state["detail"]
             if len(detail) > limit:
                 detail = detail[:limit - 1] + "…" if style.unicode else detail[:limit - 3] + "..."
-            out.append("  %-12s %s" % ("", style.dim(detail)))
+            out.append("%-12s %s" % ("", style.dim(detail)))
     if state.get("error"):
         repeats = state.get("error_repeats") or 1
         label = "tool failed" if repeats < 2 else "failing %dx" % repeats
         limit = max(30, min(72, width - 20))
-        out.append("  %s %s" % (style.bold("%-12s" % label),
+        out.append("%s %s" % (style.bold("%-12s" % label),
                                 style.yellow(state["error"][:limit])))
     # The turn clock: how long since you pressed enter. Every other number here
     # is about one model request; this is the one you are actually waiting on.
@@ -1553,9 +1553,9 @@ def render_codex(state, style, width=80):
         if running and state.get("effort"):
             facts.append("effort %s" % state["effort"])
         if facts:
-            out.append("  %-12s %s" % ("this turn", style.dim(" - ".join(facts))))
+            out.append("%-12s %s" % ("this turn", style.dim(" - ".join(facts))))
     if state.get("waiting_since") is not None:
-        out.append("  %-12s %s" % ("waiting on", style.dim(
+        out.append("%-12s %s" % ("waiting on", style.dim(
             "model for %s" % fmt_duration(state["waiting_since"]))))
     out.extend(render_last_turn(state.get("last_turn"), style))
     return out
@@ -1577,7 +1577,7 @@ def render_last_turn(turn, style):
         parts.append("%d tool calls" % turn["tool_calls"])
     if not turn.get("completed"):
         parts.append(turn.get("reason") or "interrupted")
-    line = "  %-12s %s" % ("last turn", style.bold(parts[0]))
+    line = "%-12s %s" % ("last turn", style.bold(parts[0]))
     if len(parts) > 1:
         line += style.dim(" - " + " - ".join(parts[1:]))
 
@@ -1592,19 +1592,19 @@ def render_last_turn(turn, style):
             note = "faster than your usual %s" % fmt_duration(typical)
         else:
             note = "about your usual %s" % fmt_duration(typical)
-        out.append("  %-12s %s" % ("", style.dim(note)))
+        out.append("%-12s %s" % ("", style.dim(note)))
     return out
 
 
 def render_recent(rows, style, width=80, limit=6):
     """Recent requests, newest first. Carries a header row: without one the
     columns are four unlabelled numbers and the reader has to guess."""
-    out = [style.dim("  %-6s %12s %9s %14s   %s"
+    out = [style.dim("%-6s %12s %9s %14s   %s"
                      % ("task", "prompt", "total", "prefill speed", "share of wait"))]
     for row in rows[:limit]:
         share = ("%3.0f%% reading" % row["share"]) if row.get("share") is not None else ""
         rate = ("%6.1f tok/s" % row["rate"]) if row.get("rate") is not None else ""
-        out.append("  %-6s %12s %9s %14s   %s" % (
+        out.append("%-6s %12s %9s %14s   %s" % (
             row.get("task", "?"), format(row.get("tokens", 0), ",") + " tok",
             fmt_duration(row.get("seconds")), rate, style.dim(share)))
     return out
@@ -2005,7 +2005,7 @@ def build_compare(history, model_a, model_b, style, cols=100, days=30, now=None)
 
 
 def render_help(style, cols, rows):
-    out = [style.bold(" llmwatch %s - how to read this" % __version__), ""]
+    out = [style.bold("llmwatch %s - how to read this" % __version__), ""]
     for label, text in HELP_TEXT:
         # Pad BEFORE colouring: ANSI escapes have no width on screen but do count
         # in %-12s, which silently destroys column alignment.
@@ -2146,10 +2146,31 @@ class Screen:
         self.stream.flush()
 
 
+FRAME_MARGIN = 2       # columns of breathing room between the frame and the edge
+
+
 def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=False,
                   live_detail=None, codex=None, system=None,
                   ui=None, picker=None, compare=None):
-    """Build the whole TUI frame. Pure: takes a snapshot, returns lines.
+    """Build the whole TUI frame, inset from the terminal edge.
+
+    One margin applied here rather than an indent baked into each renderer:
+    every line then shares a single left edge, including content under a
+    divider, and no pane can drift out of alignment with the others. The width
+    the renderers are given shrinks to match, so the inset costs no content.
+    """
+    pad = " " * FRAME_MARGIN
+    return [pad + line if line else line
+            for line in frame_lines(snap, live_text, style,
+                                    max(20, cols - FRAME_MARGIN), rows, hint,
+                                    help_visible, live_detail, codex, system,
+                                    ui, picker, compare)]
+
+
+def frame_lines(snap, live_text, style, cols, rows, hint=True, help_visible=False,
+                live_detail=None, codex=None, system=None,
+                ui=None, picker=None, compare=None):
+    """The frame itself, written as if it started at column 0.
 
     Panes drop in priority order when the terminal is short -- sparklines first,
     then the recent list -- but the live line is never dropped, because that is
@@ -2166,9 +2187,9 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
     def with_live(body, label):
         """Every modal keeps the live line visible: you should not lose sight of
         a running request because you opened a menu."""
-        tail = ["", divider(label), "  " + (live_text or style.dim("idle"))]
+        tail = ["", divider(label), live_text or style.dim("idle")]
         for detail in (live_detail or []):
-            tail.append("    " + detail)
+            tail.append(detail)
         return body[:max(1, budget - len(tail))] + tail
 
     if ui is not None and ui.view == "picker":
@@ -2183,22 +2204,19 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
         # Help replaces the board but keeps the live line: you should never lose
         # sight of the running request just because you asked what a column means.
         help_lines = render_help(style, cols, rows - 4)
-        tail = ["", divider("live"), "  " + (live_text or style.dim("idle"))]
+        tail = ["", divider("live"), live_text or style.dim("idle")]
         for detail in (live_detail or []):
-            tail.append("    " + detail)
+            tail.append(detail)
         return help_lines + tail
 
     # Reserved first and never trimmed: everything else is context, but this is
     # the answer to "is it still reading my prompt, or is it writing?".
-    live_block = ["", divider("live"), "  " + (live_text or style.dim("idle"))]
+    live_block = ["", divider("live"), live_text or style.dim("idle")]
     for detail in (live_detail or []):
-        live_block.append("    " + detail)
+        live_block.append(detail)
     if len(live_block) >= budget:
         return live_block[-budget:]
 
-    # Column 0, like the PREFILL/GENERATE/SYSTEM rows directly beneath it. The
-    # leading space this used to carry put the one line naming the model half a
-    # character out of line with every row it heads.
     title = "llmwatch %s   %s" % (__version__, style.bold(snap.get("model", "?")))
     meta = "%d req - %s" % (snap.get("requests", 0),
                             fmt_duration(snap.get("session_seconds", 0)))
@@ -2224,8 +2242,6 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
                   render_board(snap, style, cols, compact=compact, system=system),
                   codex_block,
                   recent_block,
-                  # Column 0: the two-space indent is for content sitting under
-                  # a divider, and this line heads no section.
                   ["", style.dim("h help   -   c compare   -   ctrl-c quit")] if hint else []):
         if block and len(head) + len(block) + len(live_block) <= budget:
             head.extend(block)

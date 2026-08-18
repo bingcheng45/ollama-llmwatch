@@ -7,23 +7,23 @@ And when it finishes: how long that whole thing actually took, at what reasoning
 whether that was normal. See [How long does a turn take?](#how-long-does-a-turn-take)
 
 ```
-ollama-llmwatch 0.9.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
-PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
-         ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
-GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
-         ▂▃▄▅▆▇█▇▆▅▄▃▂▁▂▃ last 16
-CACHE      68% reused - 149,204 tok never recomputed
-TTFT     min 0.3s - avg 1m52s - max 8m11s (approx: prefill time)
-WAIT     ██████████████████░░ 91% of session spent in prefill
-SYSTEM   ! swapping 2.5/4.0 GB
-── recent ──────────────────────────────────────────────────────────────
+  ollama-llmwatch 0.9.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
+  PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
+           ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
+  GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
+           ▂▃▄▅▆▇█▇▆▅▄▃▂▁▂▃ last 16
+  CACHE      68% reused - 149,204 tok never recomputed
+  TTFT     min 0.3s - avg 1m52s - max 8m11s (approx: prefill time)
+  WAIT     ██████████████████░░ 91% of session spent in prefill
+  SYSTEM   ! swapping 2.5/4.0 GB
+  ── recent ────────────────────────────────────────────────────────────
   task     prompt      total   prefill speed   share of wait
   2313   14,906 tok    2m47s      89.1 tok/s    98% reading
   2288    6,633 tok    1m26s      77.1 tok/s    97% reading
-── live ────────────────────────────────────────────────────────────────
+  ── live ──────────────────────────────────────────────────────────────
   ⠹ PREFILL ████████░░░░░░░░ 41% 6,144/14,906 tok  101 tok/s  elapsed 1m01s | eta 1m27s
-    cache working: only 6,144 of 21,050 tok to read
-    answer ready ~1m45s
+  cache working: only 6,144 of 21,050 tok to read
+  answer ready ~1m45s
 ```
 
 ## Install
@@ -106,39 +106,39 @@ ollama-llmwatch --log PATH   # if your log isn't auto-detected
 Press `c` and pick two models with the arrow keys:
 
 ```
-── compare: pick two models ──────────────────────────────────────────
-   #  model                        req    gen tok/s   last seen
- > 1  qwen3.8:27b-mtp-128k          48       14.3     2h ago
-   2  qwen3.8:27b-128k              44       10.0     1d ago
-   3  qwen3.8:27b-q4_K_M             0          -     no data yet
+  ── compare: pick two models ──────────────────────────────────────────
+     #  model                        req    gen tok/s   last seen
+   > 1  qwen3.8:27b-mtp-128k          48       14.3     2h ago
+     2  qwen3.8:27b-128k              44       10.0     1d ago
+     3  qwen3.8:27b-q4_K_M             0          -     no data yet
 
-  up/down move   1-9 jump   enter pick   esc back
+    up/down move   1-9 jump   enter pick   esc back
 ```
 
 ```
-── qwen3.8:27b-mtp-128k  vs  qwen3.8:27b-128k ────────────────────────
-   48 requests, last 2h ago      44 requests, last 1d ago
+  ── qwen3.8:27b-mtp-128k  vs  qwen3.8:27b-128k ────────────────────────
+     48 requests, last 2h ago      44 requests, last 1d ago
 
-   GENERATE   A ████████████████████   14.3 tok/s  A 1.43x faster
-              B ██████████████░░░░░░   10.0 tok/s
-   PREFILL    A ████████████████████  101.7 tok/s
-              B ███████████████████░   98.4 tok/s
-   TTFT       A 1m58s      B 2m02s      A 4.0s sooner
-   CACHE      A 33%        B 31%
-   DRAFT      A 53%        B not a speculative build
+     GENERATE   A ████████████████████   14.3 tok/s  A 1.43x faster
+                B ██████████████░░░░░░   10.0 tok/s
+     PREFILL    A ████████████████████  101.7 tok/s
+                B ███████████████████░   98.4 tok/s
+     TTFT       A 1m58s      B 2m02s      A 4.0s sooner
+     CACHE      A 33%        B 31%
+     DRAFT      A 53%        B not a speculative build
 
-   by prompt size          A            B          result
-     large   hit   14.3 (n=48)  10.0 (n=44)      A 1.43x faster
+     by prompt size          A            B          result
+       large   hit   14.3 (n=48)  10.0 (n=44)      A 1.43x faster
 
-   on your median request (12,000 tok prompt, 207 tok answer)
-     A  2m12s    ███████████████████
-     B  2m22s    ████████████████████
-     A saves 10.2s per request
+     on your median request (12,000 tok prompt, 207 tok answer)
+       A  2m12s    ███████████████████
+       B  2m22s    ████████████████████
+       A saves 10.2s per request
 
-   median agent turn: your prompt to the final answer, tool time included
-   TURN       A 6m19s (n=11)       B 12m56s (n=9)       all efforts pooled
-     low      A 57.3s (n=6)        B 1m44s (n=4)        A 1.81x quicker
-     high     A 33m29s (n=5)       B 41m02s (n=5)       A 1.23x quicker
+     median agent turn: your prompt to the final answer, tool time included
+     TURN       A 6m19s (n=11)       B 12m56s (n=9)       all efforts pooled
+       low      A 57.3s (n=6)        B 1m44s (n=4)        A 1.81x quicker
+       high     A 33m29s (n=5)       B 41m02s (n=5)       A 1.23x quicker
 ```
 
 That third block is the point. Generation is 1.43x faster, but on a real request that is only
@@ -162,7 +162,7 @@ Run with `--codex` and llmwatch reads the turn boundaries out of the Codex sessi
 turn runs you get a clock; when it ends you get the total, and whether that was normal:
 
 ```
-── codex ─────────────────────────────────────────────────────────────
+  ── codex ─────────────────────────────────────────────────────────────
   last action  shell
                pytest tests/
   this turn    12m32s so far - 6 tool calls - effort high
