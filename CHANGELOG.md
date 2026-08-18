@@ -24,8 +24,17 @@ was the entire experience for MLX users: a tool that looked broken while the mod
   it would otherwise be charged to your prompt. For the same reason the outer
   `[GIN] POST "/api/chat"` line is ignored in favour of the runner's own completion timing.
 - The MLX runner writes its generation stats and its completion line from different places, so
-  either can reach the log first. Both orders occur within one session, and both are handled:
-  a late stats line no longer resurrects the request that just finished.
+  either can reach the log first, and both orders occur within one session. A request is
+  therefore closed on `peak memory`, which across a full session appears exactly once per
+  request and always after both. Closing on the completion line instead would drop the
+  generation rate from the summary of every request that happened to lose the race, which is
+  roughly half of them. If a build ever stops printing that line, the next request still closes
+  the previous one rather than stranding it on the board.
+
+**Alignment.** The frame has two indent levels: column 0 for lines that head it, two spaces for
+content under a divider. The title and the key hints each carried a stray extra space, so the
+one line naming your model sat out of line with every row beneath it. Both now start at column
+0, with a test that fails on a stray indent anywhere in the frame.
 
 ## 0.8.0
 

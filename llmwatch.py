@@ -117,9 +117,14 @@ MlxRequestStart = namedtuple("MlxRequestStart", "prompt_tokens cached miss ts")
 MlxPrefillTick = namedtuple("MlxPrefillTick", "processed total ts")
 MlxGenStats = namedtuple("MlxGenStats", "iterations drafted accepted acceptance avg_draft ts")
 MlxRequestEnd = namedtuple("MlxRequestEnd", "seconds ts")
+# The last line of a request, and the only one whose position is fixed: the
+# completion and stats lines are written from different places and either can
+# land first, but `peak memory` always follows both. It is what makes a request
+# safe to close, so a rate is never missing just because the log raced.
+MlxPeakMemory = namedtuple("MlxPeakMemory", "ts")
 
 MLX_EVENTS = (MlxRunnerStart, MlxRunnerReady, MlxRequestStart, MlxPrefillTick,
-              MlxGenStats, MlxRequestEnd)
+              MlxGenStats, MlxRequestEnd, MlxPeakMemory)
 
 # --------------------------------------------------------------------------
 # Layer 1: parsing
@@ -166,6 +171,7 @@ RE_MLX_RUNNER_START = re.compile(r'msg="starting mlx runner subprocess" model=(\
 RE_MLX_RUNNER_READY = re.compile(r'msg="mlx runner is ready"')
 RE_MLX_CACHE = re.compile(r'msg="cache (miss|hit)" total=(\d+) matched=(\d+)')
 RE_MLX_PREFILL = re.compile(r'msg="Prompt processing progress" processed=(\d+) total=(\d+)')
+RE_MLX_PEAK = re.compile(r'msg="peak memory"')
 RE_MLX_SPEC = re.compile(
     r'msg="speculative decode stats" iterations=(\d+) drafted=(\d+) accepted=(\d+)'
     r' acceptance=([\d.]+) avg_draft=([\d.]+)')
@@ -255,6 +261,9 @@ def parse_mlx_line(line):
     m = RE_MLX_RUNNER_START.search(line)
     if m:
         return MlxRunnerStart(short_model_name(m.group(1)), parse_mlx_timestamp(line))
+
+    if RE_MLX_PEAK.search(line):
+        return MlxPeakMemory(parse_mlx_timestamp(line))
 
     if RE_MLX_RUNNER_READY.search(line):
         return MlxRunnerReady(parse_mlx_timestamp(line))
@@ -427,8 +436,8 @@ class Tracker:
         self._mlx_task = 0
         self._mlx_started = None    # ts of the current request's first line
         self._mlx_prefilled = None  # ts prefill finished == generation began
-        self._mlx_loading = None    # ts the runner subprocess was spawned
-        self._mlx_ended = None      # (task, ts) awaiting a late stats line
+        self._mlx_loading = None     # ts the runner subprocess was spawned
+        self._mlx_pending_end = None  # request duration, held until it can close
 
     def _key(self, ev):
         return (ev.slot, ev.task)
@@ -593,14 +602,17 @@ class Tracker:
             return self.feed(ServerStarted(seconds))
 
         if isinstance(ev, MlxRequestStart):
+            # Belt and braces: if a build ever stops printing the closing line,
+            # the previous request still closes here instead of hanging on the
+            # board forever.
+            outs = self._mlx_close()
             self._mlx_task += 1
             self._mlx_started = ev.ts
             self._mlx_prefilled = None
-            self._mlx_ended = None
             task = self._mlx_task
             # MLX gives no context size; None keeps the ctx field honestly empty
             # rather than inventing a window the renderer would then draw.
-            outs = self.feed(RequestStart(self.MLX_SLOT, task, ev.prompt_tokens, None))
+            outs.extend(self.feed(RequestStart(self.MLX_SLOT, task, ev.prompt_tokens, None)))
             outs.extend(self.feed(CacheInfo(self.MLX_SLOT, task, ev.cached)))
             if ev.miss:
                 outs.extend(self.feed(CacheMiss(self.MLX_SLOT, task)))
@@ -622,22 +634,6 @@ class Tracker:
             tokens = ev.iterations + ev.accepted
             seconds = self._mlx_elapsed_since(self._mlx_prefilled, ev.ts)
             rate = (tokens / seconds) if seconds > 0 else 0.0
-
-            # The runner writes this line and its ServeHTTP line from different
-            # places, so which one reaches the log first is a coin flip -- both
-            # orders occur within the same session. Arriving late must not
-            # recreate the request that just finished, or the next one starts by
-            # reporting a phantom abandoned request.
-            if self._mlx_ended is not None:
-                task, started = self._mlx_ended
-                self._mlx_ended = None
-                seconds = self._mlx_elapsed_since(started, ev.ts)
-                if not tokens or seconds <= 0:
-                    return []
-                return [Output("line", "", {
-                    "event": "generate_done", "task": task, "tokens": tokens,
-                    "seconds": seconds, "rate": tokens / seconds})]
-
             outs = self.feed(DraftAcceptance(self.MLX_SLOT, self._mlx_task, ev.acceptance,
                                              ev.accepted, ev.drafted, ev.avg_draft))
             outs.extend(self.feed(GenDone(self.MLX_SLOT, self._mlx_task,
@@ -645,26 +641,35 @@ class Tracker:
             return outs
 
         if isinstance(ev, MlxRequestEnd):
-            req = self.requests.get((self.MLX_SLOT, self._mlx_task))
-            # The prefill summary llama-server prints as its own line has to be
-            # derived here, from where generation was seen to start.
-            if req is not None and req.prefill is None and req.last_live:
-                seconds = self._mlx_elapsed_since(self._mlx_started, self._mlx_prefilled)
-                processed = req.last_live.get("processed") or 0
-                if seconds > 0 and processed:
-                    req.prefill = (seconds * 1000.0, processed, processed / seconds)
-            tokens = (req.generation[1] if req and req.generation else 0)
-            # Remember what a late stats line would belong to. Cleared when the
-            # next request starts, because at that point the log no longer says
-            # which of the two the stats describe, and a rate on the wrong
-            # request is worse than no rate at all.
-            if req is not None and req.generation is None:
-                self._mlx_ended = (self._mlx_task, self._mlx_prefilled)
-            self._mlx_started = self._mlx_prefilled = None
-            return self.feed(RequestEnd(self.MLX_SLOT, self._mlx_task,
-                                        ev.seconds * 1000.0, tokens))
+            # Held, not emitted. The stats line carrying the generation rate is
+            # written from somewhere else in the runner and lands either side of
+            # this one; closing here would drop that rate from the summary on
+            # every request that happened to lose the race.
+            self._mlx_pending_end = ev.seconds
+            return []
+
+        if isinstance(ev, MlxPeakMemory):
+            return self._mlx_close()
 
         return []
+
+    def _mlx_close(self):
+        """Emit the held request end, once nothing more can arrive for it."""
+        if self._mlx_pending_end is None:
+            return []
+        seconds, self._mlx_pending_end = self._mlx_pending_end, None
+        req = self.requests.get((self.MLX_SLOT, self._mlx_task))
+        # The prefill summary llama-server prints as its own line has to be
+        # derived here, from where generation was seen to start.
+        if req is not None and req.prefill is None and req.last_live:
+            elapsed = self._mlx_elapsed_since(self._mlx_started, self._mlx_prefilled)
+            processed = req.last_live.get("processed") or 0
+            if elapsed > 0 and processed:
+                req.prefill = (elapsed * 1000.0, processed, processed / elapsed)
+        tokens = (req.generation[1] if req and req.generation else 0)
+        self._mlx_started = self._mlx_prefilled = None
+        return self.feed(RequestEnd(self.MLX_SLOT, self._mlx_task,
+                                    seconds * 1000.0, tokens))
 
     @staticmethod
     def _mlx_elapsed_since(start, now):
@@ -2169,7 +2174,10 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
     if len(live_block) >= budget:
         return live_block[-budget:]
 
-    title = " llmwatch %s   %s" % (__version__, style.bold(snap.get("model", "?")))
+    # Column 0, like the PREFILL/GENERATE/SYSTEM rows directly beneath it. The
+    # leading space this used to carry put the one line naming the model half a
+    # character out of line with every row it heads.
+    title = "llmwatch %s   %s" % (__version__, style.bold(snap.get("model", "?")))
     meta = "%d req - %s" % (snap.get("requests", 0),
                             fmt_duration(snap.get("session_seconds", 0)))
     if snap.get("models_seen", 0) > 1:
@@ -2194,7 +2202,9 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
                   render_board(snap, style, cols, compact=compact, system=system),
                   codex_block,
                   recent_block,
-                  ["", style.dim("  h help   -   c compare   -   ctrl-c quit")] if hint else []):
+                  # Column 0: the two-space indent is for content sitting under
+                  # a divider, and this line heads no section.
+                  ["", style.dim("h help   -   c compare   -   ctrl-c quit")] if hint else []):
         if block and len(head) + len(block) + len(live_block) <= budget:
             head.extend(block)
     return head + live_block

@@ -13,6 +13,7 @@ time=2026-08-18T13:17:08.821+08:00 level=INFO source=server.go:225 msg=ServeHTTP
 time=2026-08-18T13:17:14.130+08:00 level=INFO source=speculate_stats.go:62 msg="speculative decode stats" iterations=117 drafted=115 accepted=84 acceptance=0.73 avg_draft=0.98 max_draft=4 avg_accepted=0.72 depth_over_time="0.4/1 0.7/2 0.1/1 0.1/1 0.0/0 2.3/3 2.9/4 1.3/3"
 time=2026-08-18T13:17:14.131+08:00 level=INFO source=server.go:225 msg=ServeHTTP method=POST path=/v1/completions took=7.298789917s status="200 OK"
 [GIN] 2026/08/18 - 13:17:14 | 200 | 17.630247208s |       127.0.0.1 | POST     "/api/chat"
+time=2026-08-18T13:17:14.383+08:00 level=INFO source=pipeline.go:91 msg="peak memory" size="16.37 GiB"
 time=2026-08-18T13:19:06.388+08:00 level=INFO source=prefix_cache.go:124 msg="cache hit" total=633 matched=68 cached=68 left=565
 time=2026-08-18T13:19:07.714+08:00 level=INFO source=pipeline.go:200 msg="Prompt processing progress" processed=564 total=565
 [GIN] 2026/08/18 - 13:19:09 | 200 |     337.208µs |       127.0.0.1 | HEAD     "/"
@@ -24,3 +25,4 @@ time=2026-08-18T13:19:26.050+08:00 level=INFO source=server.go:225 msg=ServeHTTP
 time=2026-08-18T13:19:30.522+08:00 level=INFO source=server.go:225 msg=ServeHTTP method=POST path=/v1/completions took=24.143523833s status="200 OK"
 [GIN] 2026/08/18 - 13:19:30 | 200 |   24.4988505s |       127.0.0.1 | POST     "/api/chat"
 time=2026-08-18T13:19:30.576+08:00 level=INFO source=speculate_stats.go:62 msg="speculative decode stats" iterations=189 drafted=453 accepted=341 acceptance=0.75 avg_draft=2.40 max_draft=6 avg_accepted=1.80 depth_over_time="1.9/3 3.5/5 1.2/5 4.3/6 1.5/6 1.5/4 4.3/6 0.8/3"
+time=2026-08-18T13:19:30.623+08:00 level=INFO source=pipeline.go:91 msg="peak memory" size="16.88 GiB"

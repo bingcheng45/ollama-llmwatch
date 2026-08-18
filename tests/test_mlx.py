@@ -193,11 +193,36 @@ class TestTrackedRequests(unittest.TestCase):
         self.assertAlmostEqual(ends[1]["seconds"], 24.143523833)
 
 
+CACHE_MISS = ('time=2026-08-18T13:17:06.834+08:00 source=prefix_cache.go:124 '
+              'msg="cache miss" total=337 matched=0 cached=0 left=337')
+PREFILL = ('time=2026-08-18T13:17:07.785+08:00 source=pipeline.go:200 '
+           'msg="Prompt processing progress" processed=336 total=337')
+COMPLETED = ('time=2026-08-18T13:17:14.131+08:00 source=server.go:225 msg=ServeHTTP '
+             'method=POST path=/v1/completions took=7.298789917s status="200 OK"')
+STATS = ('time=2026-08-18T13:17:14.130+08:00 source=speculate_stats.go:62 '
+         'msg="speculative decode stats" iterations=117 drafted=115 accepted=84 '
+         'acceptance=0.73 avg_draft=0.98')
+PEAK = ('time=2026-08-18T13:17:14.383+08:00 source=pipeline.go:91 '
+        'msg="peak memory" size="16.37 GiB"')
+
+
+def feed_lines(lines):
+    tracker = Tracker()
+    out = []
+    for line in lines:
+        out.extend(tracker.feed(parse_line(line)))
+    return out
+
+
 class TestGenerationStatsRace(unittest.TestCase):
     """The runner writes its stats line and its ServeHTTP line from different
-    places, so either can reach the log first -- both orders appear in the
-    fixture. An out-of-order stats line must not resurrect the request that
-    just finished, or the next one opens by reporting a phantom abandoned one.
+    places, so either can reach the log first, and both orders appear in the
+    fixture. Closing a request on the ServeHTTP line would therefore drop the
+    generation rate from every request that happened to lose the race.
+
+    `peak memory` is what makes this tractable: across a full session it appears
+    exactly once per request and always after both, so it is the one line whose
+    position can be relied on.
     """
 
     def test_no_phantom_abandoned_requests(self):
@@ -206,37 +231,34 @@ class TestGenerationStatsRace(unittest.TestCase):
 
     def test_generation_recorded_in_either_order(self):
         """Request 1's stats arrive before its completion line, request 2's
-        after. Both must still report a generation rate."""
-        generated = events_named(outputs("mlx-request.log"), "generate_done")
-        self.assertEqual(len(generated), 2)
-        for record in generated:
-            self.assertGreater(record["rate"], 0)
+        after. Both report a rate, and both report it in time to be summarised
+        with the request rather than stranded after it."""
+        outs = outputs("mlx-request.log")
+        self.assertEqual(len(events_named(outs, "generate_done")), 2)
+        order = [o.data["event"] for o in outs
+                 if o.data.get("event") in ("generate_done", "request_end")]
+        self.assertEqual(order, ["generate_done", "request_end"] * 2)
 
-    def test_late_stats_are_dropped_once_the_next_request_starts(self):
-        """If a request begins inside the race window the log no longer says
-        which of the two the stats describe. A rate on the wrong request is
-        worse than no rate, so it is dropped rather than guessed."""
-        tracker = Tracker()
-        out = []
-        for line in [
-            'time=2026-08-18T13:17:06.834+08:00 source=prefix_cache.go:124 '
-            'msg="cache miss" total=337 matched=0 cached=0 left=337',
-            'time=2026-08-18T13:17:07.785+08:00 source=pipeline.go:200 '
-            'msg="Prompt processing progress" processed=336 total=337',
-            'time=2026-08-18T13:17:14.131+08:00 source=server.go:225 msg=ServeHTTP '
-            'method=POST path=/v1/completions took=7.298789917s status="200 OK"',
-            # The next request beats the stats line into the log.
-            'time=2026-08-18T13:17:14.140+08:00 source=prefix_cache.go:124 '
-            'msg="cache hit" total=400 matched=100 cached=100 left=300',
-            'time=2026-08-18T13:17:14.150+08:00 source=speculate_stats.go:62 '
-            'msg="speculative decode stats" iterations=117 drafted=115 accepted=84 '
-            'acceptance=0.73 avg_draft=0.98',
-        ]:
-            out.extend(tracker.feed(parse_line(line)))
+    def test_stats_after_completion_still_reach_the_summary(self):
+        outs = feed_lines([CACHE_MISS, PREFILL, COMPLETED, STATS, PEAK])
+        self.assertEqual(events_named(outs, "generate_done")[0]["tokens"], 117 + 84)
 
-        # Nothing is attributed to request 2, which has not generated anything.
-        for record in events_named(out, "generate_done"):
-            self.assertNotEqual(record["task"], 2)
+    def test_stats_before_completion_still_reach_the_summary(self):
+        outs = feed_lines([CACHE_MISS, PREFILL, STATS, COMPLETED, PEAK])
+        self.assertEqual(events_named(outs, "generate_done")[0]["tokens"], 117 + 84)
+
+    def test_the_request_stays_open_until_the_closing_line(self):
+        """Nothing is summarised early: until `peak memory` lands, a stats line
+        can still arrive and change what the summary says."""
+        self.assertEqual(events_named(feed_lines([CACHE_MISS, PREFILL, COMPLETED]),
+                                      "request_end"), [])
+
+    def test_a_missing_closing_line_cannot_strand_a_request(self):
+        """If a build ever stops printing it, the next request still closes the
+        previous one rather than leaving it on the board forever."""
+        outs = feed_lines([CACHE_MISS, PREFILL, STATS, COMPLETED, CACHE_MISS])
+        self.assertEqual(len(events_named(outs, "request_end")), 1)
+        self.assertEqual(events_named(outs, "request_abandoned"), [])
 
 
 class TestEnginesCoexist(unittest.TestCase):

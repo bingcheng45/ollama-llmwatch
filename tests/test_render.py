@@ -467,3 +467,53 @@ class TestEstimateKeepsMoving(unittest.TestCase):
 
     def test_the_clock_keeps_moving_while_overrun(self):
         self.assertNotEqual(self.last(90.0), self.last(120.0))
+
+
+class TestFrameAlignment(unittest.TestCase):
+    """The frame has exactly two indent levels, and mixing them looks like a
+    rendering bug rather than a hierarchy.
+
+    Top-level lines (the title, the stat rows, the key hints) sit at column 0.
+    Two spaces mean "content belonging to the divider above me". The title and
+    the hint line each used to carry a stray indent, which left the one line
+    naming the model out of line with every row it heads.
+    """
+
+    def stats_snapshot(self):
+        stats = Stats(clock=lambda: 100.0)
+        for i in range(3):
+            stats.record("m",
+                         {"tokens": 10000, "cached": 2000, "seconds": 100.0, "rate": 100.0 + i},
+                         {"tokens": 200, "seconds": 20.0, "rate": 10.0 + i},
+                         {"task": i, "seconds": 120.0, "prefill_share_pct": 83.0})
+        return stats.snapshot("m")
+
+    def frame(self):
+        return [strip_ansi(line) for line
+                in compose_frame(self.stats_snapshot(), "waiting", PLAIN, 100, 30)]
+
+    def test_the_title_starts_at_column_zero(self):
+        self.assertTrue(self.frame()[0].startswith("llmwatch "))
+
+    def test_the_title_lines_up_with_the_rows_it_heads(self):
+        frame = self.frame()
+        rows = [l for l in frame if l.startswith(("PREFILL", "GENERATE"))]
+        self.assertTrue(rows)
+        self.assertEqual(_indent(frame[0]), _indent(rows[0]))
+
+    def test_key_hints_start_at_column_zero(self):
+        hint = [l for l in self.frame() if "ctrl-c quit" in l]
+        self.assertTrue(hint)
+        self.assertEqual(_indent(hint[0]), 0)
+
+    def test_indents_are_one_of_the_three_meaningful_ones(self):
+        """0 heads the frame, 2 is content under a divider, and 9 continues a
+        stat row underneath its label (`PREFILL ` is eight columns plus a
+        space). Anything else is a stray space, which is what this guards."""
+        for line in self.frame():
+            if line.strip():
+                self.assertIn(_indent(line), (0, 2, 9), "stray indent: %r" % line)
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip(" "))
