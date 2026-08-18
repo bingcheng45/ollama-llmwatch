@@ -1,0 +1,21 @@
+llmwatch.py
+  s_ea1480c13f8bd5::t_1e2a0f27c3b1af 1675-1676,1691,1695-1697,1705,1711-1730,2265-2394,2405,2538-2541,3579,3778-3779,3781-3785,3809-3810,3826-3830
+tests/test_update.py
+  s_ea1480c13f8bd5::t_5eb9a2e3b39be3 21-24,237-359
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "83ee587daef76b970fda5dc733449a19e9730e26",
+  "prompts": {},
+  "sessions": {
+    "s_ea1480c13f8bd5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "036e0e35-3e99-4231-9e3e-e9d9218fc145",
+        "model": "claude-opus-5"
+      },
+      "human_author": "bingcheng45 <bingcheng45@gmail.com>"
+    }
+  }
+}
