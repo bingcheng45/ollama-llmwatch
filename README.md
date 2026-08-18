@@ -456,6 +456,24 @@ One file, standard library only. The parsing, tracking, stats and rendering func
 they take data and return data - so almost everything is testable without a terminal or a running
 model.
 
+Every push and PR runs the tests on Python 3.9 to 3.13, on Linux and macOS, plus Bandit, CodeQL
+and a dependency audit. The security scans also run weekly, because advisories appear after the
+last commit does.
+
+### Releasing
+
+Bump the version in **both** `llmwatch.py` and `pyproject.toml`, put that version at the top of
+the changelog, then tag it:
+
+```bash
+git tag v0.9.0 && git push origin v0.9.0
+```
+
+The tag builds, tests, and publishes to PyPI through Trusted Publishing, so there is no API token
+anywhere. It refuses to publish if the tag, `__version__` and `pyproject.toml` disagree: a version
+on PyPI can never be reused or corrected, so the number has to be right before it goes out rather
+than after.
+
 ## License
 
 MIT
