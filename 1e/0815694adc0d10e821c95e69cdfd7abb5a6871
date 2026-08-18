@@ -1,0 +1,50 @@
+CHANGELOG.md
+  s_ea1480c13f8bd5::t_498938ba8956e5 3-27
+tests/test_update.py
+  s_ea1480c13f8bd5::t_27529581deda68 184-185,187
+  s_ea1480c13f8bd5::t_e4832d4fc71b65 59-70
+  s_ea1480c13f8bd5::t_1d30daa0a612a4 1-20,24-58,71-183,186,188-189,192,200-207,210-213,215-221
+  s_ea1480c13f8bd5::t_d8f909d3a3075a 190-191,193-199
+  s_ea1480c13f8bd5::t_14aa7cc55eefcd 21-23
+  s_ea1480c13f8bd5::t_fca4f692903583 208-209,214
+tests/test_resilience.py
+  s_ea1480c13f8bd5::t_8936fe0cc59835 36-40,42,46-66,68-69,73-78
+  s_ea1480c13f8bd5::t_53e576e058481e 67,70-72
+  s_ea1480c13f8bd5::t_5365f38143c9fc 6-10,13
+llmwatch.py
+  s_ea1480c13f8bd5::t_92b27eac81fcdb 2324
+  s_ea1480c13f8bd5::t_870ebf0ce50f20 3393-3399
+  s_ea1480c13f8bd5::t_8713341d56b168 2218-2225
+  s_ea1480c13f8bd5::t_de1f4cf3a0b9cb 61
+  s_ea1480c13f8bd5::t_b4cddce190ba71 85-96
+  s_ea1480c13f8bd5::t_01779a0365c7bc 2086-2151,2159-2160,2163-2217,2226-2230
+  s_ea1480c13f8bd5::t_b062e4f193156a 2329
+  s_ea1480c13f8bd5::t_65bfaf474bafb9 2402-2404
+  s_ea1480c13f8bd5::t_c82d76b1931559 2311
+  s_ea1480c13f8bd5::t_eec461d5f10820 3536-3540
+  s_ea1480c13f8bd5::t_b5895a3b563154 3556-3557
+  s_ea1480c13f8bd5::t_fd97a196a787cf 2161-2162
+  s_ea1480c13f8bd5::t_20149573fde3e9 2152-2158
+README.md
+  s_ea1480c13f8bd5::t_2d18be60956727 246-247,249-262
+  s_ea1480c13f8bd5::t_de1f4cf3a0b9cb 10
+  s_ea1480c13f8bd5::t_b8c99aba8a61db 267-272
+pyproject.toml
+  s_ea1480c13f8bd5::t_de1f4cf3a0b9cb 12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "1e0815694adc0d10e821c95e69cdfd7abb5a6871",
+  "prompts": {},
+  "sessions": {
+    "s_ea1480c13f8bd5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "036e0e35-3e99-4231-9e3e-e9d9218fc145",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Bing Cheng <bing.toh@foodpanda.com>"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+llmwatch.py
+  s_ea1480c13f8bd5::t_90588bd1cef1a1 2217-2240,2251-2252
+README.md
+  s_ea1480c13f8bd5::t_d5ea0cbdccb61c 476,487-495
+  s_ea1480c13f8bd5::t_ca5b72b0d97313 51-64
+SECURITY.md
+  s_ea1480c13f8bd5::t_bcd5a006b55ee7 1-68
+tests/test_update.py
+  s_ea1480c13f8bd5::t_fc1cb5bb940532 181-235
+  s_ea1480c13f8bd5::t_d59be92bd2dfd5 23
+  s_ea1480c13f8bd5::t_ca8fd0401173c9 245-247,250
+CODE_OF_CONDUCT.md
+  s_ea1480c13f8bd5::t_c67aaa8f5151d3 1-65
+.github/PULL_REQUEST_TEMPLATE.md
+  s_ea1480c13f8bd5::t_cfbce05dbccfe7 1-43
+tests/test_docs.py
+  s_ea1480c13f8bd5::t_a9374c8522e96f 100-128
+  s_ea1480c13f8bd5::t_12214a3e940bcb 17-18
+CHANGELOG.md
+  s_ea1480c13f8bd5::t_72af5f800ad839 27-37
+CONTRIBUTING.md
+  s_ea1480c13f8bd5::t_a494c9fc15835f 1-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "0ff63fefb2171ccddc9b2f0aaf6000655e3b01d2",
+  "prompts": {},
+  "sessions": {
+    "s_ea1480c13f8bd5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "036e0e35-3e99-4231-9e3e-e9d9218fc145",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Bing Cheng <bing.toh@foodpanda.com>"
+    }
+  }
+}
