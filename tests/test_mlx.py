@@ -261,6 +261,39 @@ class TestGenerationStatsRace(unittest.TestCase):
         self.assertEqual(events_named(outs, "request_abandoned"), [])
 
 
+class TestUnmeasurableRequests(unittest.TestCase):
+    """A rate nobody can measure must be absent, not zero.
+
+    A zero rate is not a cosmetic wart on one request: 201 tokens clears the
+    small-request noise guard, so it lands in `low`, adds tokens with no seconds
+    to the token-weighted average, and skews the median that slowdown detection
+    compares against. One unmeasurable request would recolour the whole board.
+    """
+
+    FULLY_CACHED = ('time=2026-08-18T13:17:06.000+08:00 source=prefix_cache.go:124 '
+                    'msg="cache hit" total=337 matched=337 cached=337 left=0')
+
+    def test_a_fully_cached_prompt_still_times_generation(self):
+        """The cache can serve a prompt whole, and MLX then prints no progress
+        line at all. The request start is the only mark left to measure from."""
+        outs = feed_lines([self.FULLY_CACHED, STATS, COMPLETED, PEAK])
+        generated = events_named(outs, "generate_done")
+        self.assertEqual(len(generated), 1)
+        self.assertGreater(generated[0]["rate"], 0)
+
+    def test_no_zero_rate_reaches_the_board(self):
+        """Same request, but nothing to measure from either: no start, no
+        prefill. Then there is no generation record at all."""
+        outs = feed_lines([STATS, COMPLETED, PEAK])
+        self.assertEqual(events_named(outs, "generate_done"), [])
+
+    def test_attaching_mid_request_reports_nothing(self):
+        """Only the tail of a request is visible, so there is no model, no
+        prompt size and no phase. A duration alone under a model named '?'
+        reads as a bug rather than as the partial view it is."""
+        self.assertEqual(events_named(feed_lines([COMPLETED, PEAK]), "request_end"), [])
+
+
 class TestEnginesCoexist(unittest.TestCase):
     """Which engine runs is a property of the model, not the install, so one log
     can hold both across a restart. Nothing selects between them."""

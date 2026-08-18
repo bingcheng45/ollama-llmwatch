@@ -14,8 +14,8 @@ description = "See what your local Ollama model is actually doing: live prefill 
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
-keywords = ["ollama", "llm", "local-llm", "llama.cpp", "monitoring", "tokens-per-second",
-            "prefill", "codex", "coding-agent"]
+keywords = ["ollama", "llm", "local-llm", "llama.cpp", "mlx", "apple-silicon",
+            "monitoring", "tokens-per-second", "prefill", "codex", "coding-agent"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",

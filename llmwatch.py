@@ -638,12 +638,22 @@ class Tracker:
             # plus whichever drafted tokens were accepted, which reconstructs it
             # exactly rather than approximately.
             tokens = ev.iterations + ev.accepted
-            seconds = self._mlx_elapsed_since(self._mlx_prefilled, ev.ts)
-            rate = (tokens / seconds) if seconds > 0 else 0.0
+            # Generation began when prefill ended, except on a prompt the cache
+            # served whole: MLX prints no progress line then, so the request
+            # start is the only honest mark.
+            began = self._mlx_prefilled or self._mlx_started
+            seconds = self._mlx_elapsed_since(began, ev.ts)
             outs = self.feed(DraftAcceptance(self.MLX_SLOT, self._mlx_task, ev.acceptance,
                                              ev.accepted, ev.drafted, ev.avg_draft))
+            # No duration means no rate. Reporting 0 tok/s here would not just
+            # look odd on one request: it passes the small-request noise guard,
+            # so it lands in `low`, drags the token-weighted average up by
+            # adding tokens with no seconds, and skews the median that slowdown
+            # detection reads. One unmeasurable request would recolour the board.
+            if seconds <= 0 or tokens <= 0:
+                return outs
             outs.extend(self.feed(GenDone(self.MLX_SLOT, self._mlx_task,
-                                          seconds * 1000.0, tokens, rate)))
+                                          seconds * 1000.0, tokens, tokens / seconds)))
             return outs
 
         if isinstance(ev, MlxRequestEnd):
@@ -665,6 +675,12 @@ class Tracker:
             return []
         seconds, self._mlx_pending_end = self._mlx_pending_end, None
         req = self.requests.get((self.MLX_SLOT, self._mlx_task))
+        if req is None:
+            # Attaching to a log mid-request: the tail of one is visible but its
+            # start never was, so there is no model, no prompt size and no phase
+            # to report. A summary of nothing but a duration, under a model
+            # named "?", reads as a bug rather than as the partial view it is.
+            return []
         # The prefill summary llama-server prints as its own line has to be
         # derived here, from where generation was seen to start.
         if req is not None and req.prefill is None and req.last_live:

@@ -7,7 +7,7 @@ And when it finishes: how long that whole thing actually took, at what reasoning
 whether that was normal. See [How long does a turn take?](#how-long-does-a-turn-take)
 
 ```
- ollama-llmwatch 0.9.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
+ollama-llmwatch 0.9.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
 PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
          ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
 GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
@@ -35,6 +35,9 @@ ollama-llmwatch
 
 That's it. Python 3.9+, no dependencies, works with your existing Ollama install. Run it in a
 terminal next to whatever is using the model.
+
+Both of Ollama's engines are read automatically: `llama-server` for GGUF models, and the MLX
+runner for `-mlx` models on Apple Silicon. Nothing to pick or configure.
 
 Prefer a single file? It's one script with no dependencies:
 
