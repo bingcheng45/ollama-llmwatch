@@ -24,6 +24,17 @@ tells you when it is behind.
 - The version comparison is numeric, not lexicographic. `"0.10.0" < "0.9.0"` as strings, which
   would have told everyone to downgrade the day 0.10 shipped. Pre-releases are refused outright
   rather than ordered by guesswork.
+- **The notice names the command that upgrades your copy**, not one command for everybody. There
+  are four supported ways to install this and they upgrade differently; telling a pipx user to
+  run `uv`, or someone who downloaded a single file to run a package manager they never used,
+  fails in front of them and teaches them to ignore the line. It reads its own location and says
+  `uv tool upgrade`, `pipx upgrade`, `pip install --upgrade`, `git pull` or `curl` accordingly.
+
+**Community files.** CONTRIBUTING, SECURITY, a code of conduct and a pull request template, none
+of which existed. The security policy routes reports to a private advisory rather than a public
+issue, and says what is in scope for a tool whose attack surface is log content it prints to your
+terminal. A test now fails if any of these files goes missing, since GitHub's checklist notices
+quietly and nobody else does.
 
 ## 0.9.0
 

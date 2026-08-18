@@ -48,6 +48,20 @@ chmod +x llmwatch.py && ./llmwatch.py
 
 Two commands are installed: `ollama-llmwatch` and the shorter `llmwatch`. Same program.
 
+### Upgrading
+
+Whichever way you installed it:
+
+```bash
+uv tool upgrade ollama-llmwatch        # installed with uv
+pipx upgrade ollama-llmwatch           # installed with pipx
+pip install --upgrade ollama-llmwatch  # installed with pip
+curl -O https://raw.githubusercontent.com/bingcheng45/ollama-llmwatch/main/llmwatch.py
+```
+
+llmwatch works out which of these applies to the copy you are running and prints that one when a
+new version exists, so you should not have to come back to this list.
+
 ## The problem
 
 A local model request has two steps, and they behave completely differently:
@@ -459,7 +473,7 @@ claim work that hasn't happened.
 ## Contributing
 
 Issues and PRs welcome - including "this number looks wrong". Several fixes so far came from
-exactly that.
+exactly that, and a wrong number is the worst bug this project can have.
 
 The most useful bug report includes your Ollama version (`ollama --version`), your OS, and a few
 lines from `ollama-llmwatch --debug-unparsed`.
@@ -470,27 +484,19 @@ cd ollama-llmwatch
 python3 -m unittest discover tests -v
 ```
 
-One file, standard library only. The parsing, tracking, stats and rendering functions are pure  - 
-they take data and return data - so almost everything is testable without a terminal or a running
-model.
+That is the whole setup: one file, standard library only, no build step. The parsing, tracking,
+stats and rendering functions are pure  -  they take data and return data  -  so almost
+everything is testable without a terminal or a running model.
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the rest: how the four layers fit together, what the tests
+are really guarding against, the style rules, and how a release goes out. Security problems go
+through [SECURITY.md](SECURITY.md) rather than a public issue. Everyone here is expected to
+follow the [Code of Conduct](CODE_OF_CONDUCT.md), which is two paragraphs of "be decent" and some
+detail underneath.
 
 Every push and PR runs the tests on Python 3.9 to 3.13, on Linux and macOS, plus Bandit, CodeQL
 and a dependency audit. The security scans also run weekly, because advisories appear after the
 last commit does.
-
-### Releasing
-
-Bump the version in **both** `llmwatch.py` and `pyproject.toml`, put that version at the top of
-the changelog, then tag it:
-
-```bash
-git tag v0.9.0 && git push origin v0.9.0
-```
-
-The tag builds, tests, and publishes to PyPI through Trusted Publishing, so there is no API token
-anywhere. It refuses to publish if the tag, `__version__` and `pyproject.toml` disagree: a version
-on PyPI can never be reused or corrected, so the number has to be right before it goes out rather
-than after.
 
 ## License
 

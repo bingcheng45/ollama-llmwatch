@@ -2214,6 +2214,30 @@ def start_update_check(box, current=None, path=None, fetch=None):
     return thread
 
 
+def upgrade_command(path=None):
+    """The command that upgrades *this* copy, worked out from where it lives.
+
+    There are four supported ways to install this and they upgrade differently.
+    Telling a pipx user to run uv, or someone who curled a single file to run a
+    package manager they never used, is worse than saying nothing: the advice
+    fails in front of them and they learn to ignore the line.
+    """
+    path = os.path.abspath(path or __file__).replace("\\", "/")
+    lowered = path.lower()
+    if "/uv/tools/" in lowered:
+        return "uv tool upgrade ollama-llmwatch"
+    if "/pipx/" in lowered:
+        return "pipx upgrade ollama-llmwatch"
+    if "site-packages" in lowered or "dist-packages" in lowered:
+        return "pip install --upgrade ollama-llmwatch"
+    if os.path.isdir(os.path.join(os.path.dirname(path), ".git")):
+        return "git pull"      # a checkout, which is how contributors run it
+    # A single file someone downloaded: there is no package to upgrade, so the
+    # only honest instruction is to fetch it again.
+    return ("curl -O https://raw.githubusercontent.com/"
+            "bingcheng45/ollama-llmwatch/main/llmwatch.py")
+
+
 def render_update(latest, style):
     """One dim line. An update is worth mentioning, not worth interrupting for.
 
@@ -2224,8 +2248,8 @@ def render_update(latest, style):
     """
     if not update_is_newer(__version__, latest):
         return None
-    return style.dim("update available: %s (you have %s) - "
-                     "uv tool upgrade ollama-llmwatch" % (latest, __version__))
+    return style.dim("update available: %s (you have %s) - %s"
+                     % (latest, __version__, upgrade_command()))
 
 
 class Screen:

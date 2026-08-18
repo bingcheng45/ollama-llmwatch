@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from llmwatch import (  # noqa: E402
     UPDATE_INTERVAL, Style, check_for_update, compose_frame, fetch_latest_version,
     render_update, start_update_check, update_check_disabled, update_is_newer,
-    version_tuple,
+    upgrade_command, version_tuple,
 )
 
 PLAIN = Style(color=False, unicode_ok=False, width=100)
@@ -178,6 +178,61 @@ class TestOptOut(unittest.TestCase):
         self.assertEqual(box, {})
 
 
+class TestUpgradeCommand(unittest.TestCase):
+    """Four supported installs, four different upgrade commands.
+
+    Naming the wrong one is worse than naming none: it fails in front of the
+    user, and the next notice gets ignored.
+    """
+
+    def test_uv_tool(self):
+        self.assertEqual(
+            upgrade_command("/home/x/.local/share/uv/tools/ollama-llmwatch/"
+                            "lib/python3.12/site-packages/llmwatch.py"),
+            "uv tool upgrade ollama-llmwatch")
+
+    def test_pipx(self):
+        self.assertEqual(
+            upgrade_command("/home/x/.local/pipx/venvs/ollama-llmwatch/"
+                            "lib/python3.12/site-packages/llmwatch.py"),
+            "pipx upgrade ollama-llmwatch")
+
+    def test_plain_pip(self):
+        self.assertEqual(
+            upgrade_command("/usr/lib/python3/dist-packages/llmwatch.py"),
+            "pip install --upgrade ollama-llmwatch")
+        self.assertEqual(
+            upgrade_command("/home/x/venv/lib/python3.12/site-packages/llmwatch.py"),
+            "pip install --upgrade ollama-llmwatch")
+
+    def test_uv_wins_over_the_site_packages_inside_it(self):
+        """A uv tool install contains a site-packages directory, so the more
+        specific marker has to be tested first or every uv user is told to
+        run pip, which will not upgrade the tool they are running."""
+        path = ("/home/x/.local/share/uv/tools/ollama-llmwatch/"
+                "lib/python3.12/site-packages/llmwatch.py")
+        self.assertIn("uv tool upgrade", upgrade_command(path))
+
+    def test_a_single_downloaded_file_is_told_to_fetch_it_again(self):
+        directory = tempfile.mkdtemp()
+        try:
+            command = upgrade_command(os.path.join(directory, "llmwatch.py"))
+            self.assertIn("curl", command)
+            self.assertIn("llmwatch.py", command)
+        finally:
+            os.rmdir(directory)
+
+    def test_a_git_checkout_is_told_to_pull(self):
+        directory = tempfile.mkdtemp()
+        try:
+            os.mkdir(os.path.join(directory, ".git"))
+            self.assertEqual(upgrade_command(os.path.join(directory, "llmwatch.py")),
+                             "git pull")
+        finally:
+            os.rmdir(os.path.join(directory, ".git"))
+            os.rmdir(directory)
+
+
 class TestDisplay(unittest.TestCase):
 
     def snapshot(self):
@@ -187,9 +242,12 @@ class TestDisplay(unittest.TestCase):
                 "prefill": dict(phase), "generation": dict(phase), "recent": []}
 
     def test_the_notice_names_the_versions_and_the_command(self):
+        """Not a hardcoded command: which one is right depends on how this copy
+        was installed, and the suite runs from a checkout where it is `git
+        pull` rather than any package manager."""
         line = render_update("999.0.0", PLAIN)
         self.assertIn("999.0.0", line)
-        self.assertIn("upgrade", line)
+        self.assertIn(upgrade_command(), line)
 
     def test_it_refuses_to_advertise_a_downgrade(self):
         """Belt and braces against a future caller passing the raw fetch result
