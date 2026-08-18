@@ -7,7 +7,7 @@ And when it finishes: how long that whole thing actually took, at what reasoning
 whether that was normal. See [How long does a turn take?](#how-long-does-a-turn-take)
 
 ```
- ollama-llmwatch 0.8.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
+ ollama-llmwatch 0.9.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
 PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
          ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
 GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
@@ -307,10 +307,25 @@ Tuning flags is the least effective lever.
 
 Run `ollama-llmwatch --debug-unparsed`.
 
-- **`UNPARSED:` lines appear** - the parser reads an internal llama.cpp format that changes
+- **`UNPARSED:` lines appear** - the parser reads an internal engine format that changes
   between Ollama versions. Please [open an issue](https://github.com/bingcheng45/ollama-llmwatch/issues)
   with a sample line.
 - **Nothing at all appears** - check the log path with `--log`.
+
+If the header shows your model name but the counter sits at `0 req`, the log is being read
+fine and the requests are not being recognised. On versions before 0.9.0 that was what an
+`-mlx` model looked like; upgrading fixes it.
+
+### Does it work with MLX models?
+
+Yes, since 0.9.0, with nothing to configure. Ollama runs GGUF models through `llama-server`
+and `-mlx` models through its own MLX runner, and the two write completely different logs.
+Both are read automatically, including in the same log across a restart.
+
+One number differs in how it is obtained. MLX never prints a generation token count, so it is
+reconstructed from the speculative decoding stats: each iteration commits one token from the
+target model plus whichever drafted tokens were accepted, which is the exact count rather than
+an approximation. Prefill and total times are measured, as with any other model.
 
 ### Does it work with Claude Code, open-webui, or my own script?
 
@@ -319,8 +334,9 @@ Codex-specific part is the optional `--codex` pane.
 
 ### Does it work with LM Studio, llama.cpp directly, or vLLM?
 
-Not yet - the parser targets Ollama's bundled `llama-server`. llama.cpp's own server uses a
-similar format, so support is plausible. Open an issue if you'd use it.
+Not yet - the parser targets the two engines Ollama bundles, `llama-server` and the MLX runner.
+llama.cpp's own server uses a similar format to the first, so support is plausible. Open an
+issue if you'd use it.
 
 ### Linux? Windows?
 
@@ -360,12 +376,16 @@ else is, which is why `turns` has no column that could hold text either.
 It never talks to Ollama's API. It tails the log that Ollama's inference engine already writes:
 
 ```
-  your agent  ──HTTP──►  Ollama  ──►  llama-server  ──writes──►  ollama.log
-                                                                     │
-                                                                tail -F
-                                                                     ▼
+                                    ┌─►  llama-server  ─┐   GGUF
+  your agent  ──HTTP──►  Ollama  ───┤                   ├──writes──►  ollama.log
+                                    └─►  MLX runner   ──┘   -mlx          │
+                                                                     tail -F
+                                                                          ▼
                                                     parse ─► track by slot+task ─► screen
 ```
+
+Which engine serves a request depends on the model, and the two log nothing alike. Both are
+parsed into the same shape, so everything downstream of `parse` is engine-agnostic.
 
 Every log line is tagged with a slot and task id:
 
@@ -401,6 +421,9 @@ claim work that hasn't happened.
   Ollama versions. Tests run against real captured logs to catch drift.
 - **TTFT is approximate** - measured as prefill duration, since the log has no record of when
   your client sent the request.
+- **On MLX, generation tokens are reconstructed** from the speculative decoding stats rather
+  than read directly, because that runner never prints a count. Prefill and total times are
+  measured normally. A model running without speculative decoding reports no generation rate.
 - **Turn times need `--codex`**, and only Codex. The Ollama log cannot tell that twelve requests
   were one question, so turn boundaries have to come from the agent. Other agents record the
   same thing in their own formats; support for them is not written yet.

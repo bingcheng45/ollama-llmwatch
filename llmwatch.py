@@ -12,6 +12,10 @@ only after prefill finishes. llama.cpp added a `prompt_progress` field for exact
 this (ggml-org/llama.cpp#14685) but Ollama does not pass it through. So the server
 log is currently the only place the information exists.
 
+Ollama serves GGUF models with llama-server and `-mlx` models with its own MLX
+runner. The two log nothing alike, so both dialects are parsed, into one set of
+events; nothing above the parser knows which engine ran.
+
 llmwatch tails that log and answers the question the spinner can't:
     "is it still reading my prompt, or is it actually writing -- and how long
      until it starts?"
@@ -27,6 +31,8 @@ Requires Python 3.9+. Standard library only, on purpose.
 
 import argparse
 import atexit
+import calendar
+import datetime
 import json
 import os
 import re
@@ -52,7 +58,7 @@ try:
 except ImportError:  # pragma: no cover - py2 only, never hit
     queue = None
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 # Frame pacing. The loop wakes on new log data OR on these deadlines, whichever
 # comes first, so fresh data appears immediately while animation (spinner,
@@ -98,6 +104,23 @@ CheckpointErased = namedtuple("CheckpointErased", "slot task tokens")
 # Speculative decoding (the -mtp builds): how many drafted tokens survived.
 DraftAcceptance = namedtuple("DraftAcceptance", "slot task rate accepted generated mean_len")
 
+# Ollama runs GGUF models through llama-server but `-mlx` models through its own
+# MLX runner, which logs a different dialect entirely. These carry the raw facts
+# off one MLX line each; the Tracker turns them into the events above, so only
+# the parser and one Tracker branch know MLX exists. Each keeps the log's own
+# timestamp because MLX splits a timing across lines and never prints a rate --
+# elapsed has to be reconstructed from the gap, and using wall-clock time here
+# would silently produce nonsense when replaying an old log with --last.
+MlxRunnerStart = namedtuple("MlxRunnerStart", "model ts")
+MlxRunnerReady = namedtuple("MlxRunnerReady", "ts")
+MlxRequestStart = namedtuple("MlxRequestStart", "prompt_tokens cached miss ts")
+MlxPrefillTick = namedtuple("MlxPrefillTick", "processed total ts")
+MlxGenStats = namedtuple("MlxGenStats", "iterations drafted accepted acceptance avg_draft ts")
+MlxRequestEnd = namedtuple("MlxRequestEnd", "seconds ts")
+
+MLX_EVENTS = (MlxRunnerStart, MlxRunnerReady, MlxRequestStart, MlxPrefillTick,
+              MlxGenStats, MlxRequestEnd)
+
 # --------------------------------------------------------------------------
 # Layer 1: parsing
 #
@@ -133,6 +156,110 @@ RE_CKPT_ERASED = re.compile(
 RE_DRAFT = re.compile(
     _SLOT + r".*?draft acceptance = ([\d.]+) \(\s*(\d+) accepted /\s*(\d+) generated\),"
             r"\s*mean len =\s*([\d.]+)")
+
+# ---- MLX engine (Apple Silicon) -------------------------------------------
+# Same fail-soft contract as above: these are internal Ollama log lines with no
+# stability guarantee, and an unrecognised one returns None rather than raising.
+RE_MLX_TS = re.compile(
+    r"\btime=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)(Z|[+-]\d{2}:\d{2})?")
+RE_MLX_RUNNER_START = re.compile(r'msg="starting mlx runner subprocess" model=(\S+)')
+RE_MLX_RUNNER_READY = re.compile(r'msg="mlx runner is ready"')
+RE_MLX_CACHE = re.compile(r'msg="cache (miss|hit)" total=(\d+) matched=(\d+)')
+RE_MLX_PREFILL = re.compile(r'msg="Prompt processing progress" processed=(\d+) total=(\d+)')
+RE_MLX_SPEC = re.compile(
+    r'msg="speculative decode stats" iterations=(\d+) drafted=(\d+) accepted=(\d+)'
+    r' acceptance=([\d.]+) avg_draft=([\d.]+)')
+# The runner's own completion timing. Deliberately not the outer `[GIN] POST
+# "/api/chat"` line, which also includes however long the model took to load --
+# attributing a 10s weight load to the request would wreck every rate on screen.
+RE_MLX_DONE = re.compile(
+    r'msg=ServeHTTP method=POST path=/v1/(?:completions|chat/completions)'
+    r' took=([\d.]+(?:ns|µs|us|ms|h|m|s)(?:[\d.]+(?:ns|µs|us|ms|h|m|s))*)')
+
+# Go prints a duration in whichever units keep it readable and concatenates them
+# past a minute, so the one number on screen can arrive as `7.29s`, `166.792µs`
+# or `1m30.5s`. Longest units first: `ms` has to win over `m` followed by `s`.
+RE_GO_DURATION = re.compile(r"([\d.]+)(ns|µs|us|ms|h|m|s)")
+_GO_UNITS = {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3,
+             "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def parse_go_duration(text):
+    """Seconds from a Go duration string, or None if none of it parses.
+
+    Reading `1m30.5s` as one minute would quietly drop half a minute off a slow
+    request, which is exactly the request someone is watching this tool to
+    understand.
+    """
+    total, seen = 0.0, False
+    for value, unit in RE_GO_DURATION.findall(text):
+        try:
+            total += float(value) * _GO_UNITS[unit]
+        except ValueError:
+            continue
+        seen = True
+    return total if seen else None
+
+
+def parse_mlx_timestamp(line):
+    """Epoch seconds from an Ollama structured-log line, or None.
+
+    Only ever used for differences between two lines of the same log, but the
+    UTC offset is honoured anyway so a machine that crosses a DST boundary
+    mid-session cannot produce a negative prefill.
+    """
+    m = RE_MLX_TS.search(line)
+    if not m:
+        return None
+    stamp, offset = m.group(1), m.group(2)
+    frac = 0.0
+    if "." in stamp:
+        stamp, digits = stamp.split(".", 1)
+        try:
+            frac = float("0." + digits)
+        except ValueError:
+            frac = 0.0
+    try:
+        parsed = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    seconds = calendar.timegm(parsed.timetuple()) + frac
+    if offset and offset != "Z":
+        sign = 1 if offset[0] == "+" else -1
+        seconds -= sign * (int(offset[1:3]) * 3600 + int(offset[4:6]) * 60)
+    return seconds
+
+
+def parse_mlx_line(line):
+    """MLX-runner counterpart to parse_line. Returns an Mlx* event or None."""
+    m = RE_MLX_PREFILL.search(line)
+    if m:
+        return MlxPrefillTick(int(m.group(1)), int(m.group(2)), parse_mlx_timestamp(line))
+
+    m = RE_MLX_CACHE.search(line)
+    if m:
+        total, matched = int(m.group(2)), int(m.group(3))
+        return MlxRequestStart(total, matched, m.group(1) == "miss", parse_mlx_timestamp(line))
+
+    m = RE_MLX_SPEC.search(line)
+    if m:
+        return MlxGenStats(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                           float(m.group(4)), float(m.group(5)), parse_mlx_timestamp(line))
+
+    m = RE_MLX_DONE.search(line)
+    if m:
+        seconds = parse_go_duration(m.group(1))
+        if seconds is not None:
+            return MlxRequestEnd(seconds, parse_mlx_timestamp(line))
+
+    m = RE_MLX_RUNNER_START.search(line)
+    if m:
+        return MlxRunnerStart(short_model_name(m.group(1)), parse_mlx_timestamp(line))
+
+    if RE_MLX_RUNNER_READY.search(line):
+        return MlxRunnerReady(parse_mlx_timestamp(line))
+
+    return None
 
 
 def parse_line(line):
@@ -208,13 +335,19 @@ def parse_line(line):
         # reach a terminal (see safe_text).
         return ModelLoaded(short_model_name(m.group(1)))
 
-    return None
+    # Last, and unconditionally: which engine is running is a property of the
+    # model, not of the install, and a single log can hold both across a restart
+    # (`gemma3:27b` then `gemma4:26b-mlx`). Sniffing the engine once and locking
+    # it in would go blind halfway through the file, so both dialects are simply
+    # always understood and no flag or setting selects between them.
+    return parse_mlx_line(line)
 
 
 def looks_like_timing(line):
     """Did this line look like something we should have parsed? Used by
     --debug-unparsed to surface format drift instead of hiding it."""
-    return "print_timing" in line or "new prompt" in line
+    return ("print_timing" in line or "new prompt" in line
+            or "Prompt processing progress" in line or "decode stats" in line)
 
 
 # --------------------------------------------------------------------------
@@ -282,9 +415,20 @@ class Tracker:
     """Consumes events, emits Outputs. No I/O, no terminal escapes: a caller
     decides whether 'live' means an animated line or a JSON record."""
 
+    # The MLX runner serves one request at a time and numbers nothing, so it
+    # gets a fixed synthetic slot and a counter standing in for llama.cpp's
+    # task id. Slot 0 is what a single-slot llama-server uses too, and the two
+    # engines never appear in the same request, so they cannot collide.
+    MLX_SLOT = 0
+
     def __init__(self):
         self.model = "?"
         self.requests = {}
+        self._mlx_task = 0
+        self._mlx_started = None    # ts of the current request's first line
+        self._mlx_prefilled = None  # ts prefill finished == generation began
+        self._mlx_loading = None    # ts the runner subprocess was spawned
+        self._mlx_ended = None      # (task, ts) awaiting a late stats line
 
     def _key(self, ev):
         return (ev.slot, ev.task)
@@ -306,6 +450,9 @@ class Tracker:
         """Returns a list of Output. Never raises on unexpected ordering."""
         if ev is None:
             return []
+
+        if isinstance(ev, MLX_EVENTS):
+            return self._feed_mlx(ev)
 
         if isinstance(ev, ModelLoaded):
             self.model = ev.model
@@ -421,6 +568,114 @@ class Tracker:
             return self._finish(ev)
 
         return []
+
+    def _feed_mlx(self, ev):
+        """Translate one MLX event into the llama.cpp events the rest of this
+        class already handles.
+
+        Everything downstream -- rendering, stats, history, compare -- then sees
+        one shape of request regardless of which engine produced it. The cost of
+        that is here: MLX splits a request across lines that share no id, and
+        prints progress without a rate, so both have to be reconstructed.
+        """
+        if isinstance(ev, MlxRunnerStart):
+            self._mlx_loading = ev.ts
+            return self.feed(ModelLoaded(ev.model))
+
+        if isinstance(ev, MlxRunnerReady):
+            # "Loading" here is the weight load, the same thing llama-server
+            # reports as `llama-server started in Ns` -- worth showing, because
+            # on a 26B model it is ~10s of the first request's apparent latency.
+            if self._mlx_loading is None or ev.ts is None:
+                return []
+            seconds = max(0.0, ev.ts - self._mlx_loading)
+            self._mlx_loading = None
+            return self.feed(ServerStarted(seconds))
+
+        if isinstance(ev, MlxRequestStart):
+            self._mlx_task += 1
+            self._mlx_started = ev.ts
+            self._mlx_prefilled = None
+            self._mlx_ended = None
+            task = self._mlx_task
+            # MLX gives no context size; None keeps the ctx field honestly empty
+            # rather than inventing a window the renderer would then draw.
+            outs = self.feed(RequestStart(self.MLX_SLOT, task, ev.prompt_tokens, None))
+            outs.extend(self.feed(CacheInfo(self.MLX_SLOT, task, ev.cached)))
+            if ev.miss:
+                outs.extend(self.feed(CacheMiss(self.MLX_SLOT, task)))
+            return outs
+
+        if isinstance(ev, MlxPrefillTick):
+            elapsed = self._mlx_elapsed_since(self._mlx_started, ev.ts)
+            self._mlx_prefilled = ev.ts
+            rate = (ev.processed / elapsed) if elapsed > 0 else 0.0
+            fraction = (ev.processed / float(ev.total)) if ev.total else 0.0
+            return self.feed(PrefillTick(self.MLX_SLOT, self._mlx_task, ev.processed,
+                                         fraction, elapsed, rate))
+
+        if isinstance(ev, MlxGenStats):
+            # MLX never prints a generation token count. With speculative
+            # decoding each iteration commits one token from the target model
+            # plus whichever drafted tokens were accepted, which reconstructs it
+            # exactly rather than approximately.
+            tokens = ev.iterations + ev.accepted
+            seconds = self._mlx_elapsed_since(self._mlx_prefilled, ev.ts)
+            rate = (tokens / seconds) if seconds > 0 else 0.0
+
+            # The runner writes this line and its ServeHTTP line from different
+            # places, so which one reaches the log first is a coin flip -- both
+            # orders occur within the same session. Arriving late must not
+            # recreate the request that just finished, or the next one starts by
+            # reporting a phantom abandoned request.
+            if self._mlx_ended is not None:
+                task, started = self._mlx_ended
+                self._mlx_ended = None
+                seconds = self._mlx_elapsed_since(started, ev.ts)
+                if not tokens or seconds <= 0:
+                    return []
+                return [Output("line", "", {
+                    "event": "generate_done", "task": task, "tokens": tokens,
+                    "seconds": seconds, "rate": tokens / seconds})]
+
+            outs = self.feed(DraftAcceptance(self.MLX_SLOT, self._mlx_task, ev.acceptance,
+                                             ev.accepted, ev.drafted, ev.avg_draft))
+            outs.extend(self.feed(GenDone(self.MLX_SLOT, self._mlx_task,
+                                          seconds * 1000.0, tokens, rate)))
+            return outs
+
+        if isinstance(ev, MlxRequestEnd):
+            req = self.requests.get((self.MLX_SLOT, self._mlx_task))
+            # The prefill summary llama-server prints as its own line has to be
+            # derived here, from where generation was seen to start.
+            if req is not None and req.prefill is None and req.last_live:
+                seconds = self._mlx_elapsed_since(self._mlx_started, self._mlx_prefilled)
+                processed = req.last_live.get("processed") or 0
+                if seconds > 0 and processed:
+                    req.prefill = (seconds * 1000.0, processed, processed / seconds)
+            tokens = (req.generation[1] if req and req.generation else 0)
+            # Remember what a late stats line would belong to. Cleared when the
+            # next request starts, because at that point the log no longer says
+            # which of the two the stats describe, and a rate on the wrong
+            # request is worse than no rate at all.
+            if req is not None and req.generation is None:
+                self._mlx_ended = (self._mlx_task, self._mlx_prefilled)
+            self._mlx_started = self._mlx_prefilled = None
+            return self.feed(RequestEnd(self.MLX_SLOT, self._mlx_task,
+                                        ev.seconds * 1000.0, tokens))
+
+        return []
+
+    @staticmethod
+    def _mlx_elapsed_since(start, now):
+        """Seconds between two log timestamps, or 0.0 if either is missing.
+
+        Never negative: a clock step backwards should cost the display a rate,
+        not turn it into a number that reads as real.
+        """
+        if start is None or now is None:
+            return 0.0
+        return max(0.0, now - start)
 
     def _finish(self, ev):
         req = self.requests.pop(self._key(ev), None)

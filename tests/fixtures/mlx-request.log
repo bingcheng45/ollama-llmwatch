@@ -1,0 +1,26 @@
+time=2026-08-18T13:16:56.626+08:00 level=INFO source=client.go:391 msg="starting mlx runner subprocess" model=gemma4:26b-mlx port=56223
+time=2026-08-18T13:16:56.628+08:00 level=INFO source=images.go:373 msg="template selection" model=registry.ollama.ai/library/gemma4:26b-mlx selected=renderer_parser renderer=gemma4 parser=gemma4 go_template=null chat_template=null harmony=null renderer_parser="[completion tools thinking]"
+time=2026-08-18T13:16:56.628+08:00 level=INFO source=sched.go:728 msg="loaded runners" count=1
+time=2026-08-18T13:16:56.684+08:00 level=INFO source=server.go:44 msg="MLX engine initialized" "MLX version"=0.32.0 device=gpu
+time=2026-08-18T13:17:06.751+08:00 level=INFO source=runner.go:252 msg="Starting HTTP server" host=127.0.0.1 port=56223
+time=2026-08-18T13:17:06.831+08:00 level=INFO source=server.go:225 msg=ServeHTTP method=GET path=/v1/status took=166.792µs status="200 OK"
+time=2026-08-18T13:17:06.831+08:00 level=INFO source=client.go:106 msg="mlx runner is ready" port=56223
+time=2026-08-18T13:17:06.834+08:00 level=INFO source=prefix_cache.go:124 msg="cache miss" total=337 matched=0 cached=0 left=337
+time=2026-08-18T13:17:07.785+08:00 level=INFO source=pipeline.go:200 msg="Prompt processing progress" processed=336 total=337
+[GIN] 2026/08/18 - 13:17:08 | 200 |   15.864041ms |       127.0.0.1 | HEAD     "/"
+time=2026-08-18T13:17:08.821+08:00 level=INFO source=server.go:225 msg=ServeHTTP method=GET path=/v1/status took=50.717208ms status="200 OK"
+[GIN] 2026/08/18 - 13:17:08 | 200 |   51.571917ms |       127.0.0.1 | GET      "/api/ps"
+time=2026-08-18T13:17:14.130+08:00 level=INFO source=speculate_stats.go:62 msg="speculative decode stats" iterations=117 drafted=115 accepted=84 acceptance=0.73 avg_draft=0.98 max_draft=4 avg_accepted=0.72 depth_over_time="0.4/1 0.7/2 0.1/1 0.1/1 0.0/0 2.3/3 2.9/4 1.3/3"
+time=2026-08-18T13:17:14.131+08:00 level=INFO source=server.go:225 msg=ServeHTTP method=POST path=/v1/completions took=7.298789917s status="200 OK"
+[GIN] 2026/08/18 - 13:17:14 | 200 | 17.630247208s |       127.0.0.1 | POST     "/api/chat"
+time=2026-08-18T13:19:06.388+08:00 level=INFO source=prefix_cache.go:124 msg="cache hit" total=633 matched=68 cached=68 left=565
+time=2026-08-18T13:19:07.714+08:00 level=INFO source=pipeline.go:200 msg="Prompt processing progress" processed=564 total=565
+[GIN] 2026/08/18 - 13:19:09 | 200 |     337.208µs |       127.0.0.1 | HEAD     "/"
+time=2026-08-18T13:19:09.768+08:00 level=INFO source=server.go:225 msg=ServeHTTP method=GET path=/v1/status took=51.335917ms status="200 OK"
+[GIN] 2026/08/18 - 13:19:09 | 200 |   54.306375ms |       127.0.0.1 | GET      "/api/ps"
+[GIN] 2026/08/18 - 13:19:25 | 200 |   78.934333ms |       127.0.0.1 | HEAD     "/"
+[GIN] 2026/08/18 - 13:19:26 | 200 |      318.06ms |       127.0.0.1 | GET      "/api/ps"
+time=2026-08-18T13:19:26.050+08:00 level=INFO source=server.go:225 msg=ServeHTTP method=GET path=/v1/status took=51.1995ms status="200 OK"
+time=2026-08-18T13:19:30.522+08:00 level=INFO source=server.go:225 msg=ServeHTTP method=POST path=/v1/completions took=24.143523833s status="200 OK"
+[GIN] 2026/08/18 - 13:19:30 | 200 |   24.4988505s |       127.0.0.1 | POST     "/api/chat"
+time=2026-08-18T13:19:30.576+08:00 level=INFO source=speculate_stats.go:62 msg="speculative decode stats" iterations=189 drafted=453 accepted=341 acceptance=0.75 avg_draft=2.40 max_draft=6 avg_accepted=1.80 depth_over_time="1.9/3 3.5/5 1.2/5 4.3/6 1.5/6 1.5/4 4.3/6 0.8/3"
