@@ -1,0 +1,23 @@
+llmwatch.py
+  s_ea1480c13f8bd5::t_cab2da417172e4 72-74
+  s_ea1480c13f8bd5::t_f14920b02b2039 69-71,75
+tests/test_pacing.py
+  s_ea1480c13f8bd5::t_16b539a8a6c7b7 58,68-72
+  s_ea1480c13f8bd5::t_2a04a99d5567a7 73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "bf66aa9b4f692b904d300439b6a2b22ee12e58dd",
+  "prompts": {},
+  "sessions": {
+    "s_ea1480c13f8bd5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "036e0e35-3e99-4231-9e3e-e9d9218fc145",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Bing Cheng <bing.toh@foodpanda.com>"
+    }
+  }
+}
