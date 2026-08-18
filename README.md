@@ -7,7 +7,7 @@ And when it finishes: how long that whole thing actually took, at what reasoning
 whether that was normal. See [How long does a turn take?](#how-long-does-a-turn-take)
 
 ```
-  ollama-llmwatch 0.9.0   qwen3.8:27b-mtp-128k   12 req - 18m04s
+  ollama-llmwatch 0.9.1   qwen3.8:27b-mtp-128k   12 req - 18m04s
   PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
            ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
   GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
@@ -243,15 +243,33 @@ Press **`h`** for in-app help explaining every number. **`q`** or **ctrl-c** qui
 ### Does this need an internet connection?
 
 No - and neither does your model. Local inference is entirely offline; the internet is only
-needed to *download* models in the first place.
+needed to *download* models in the first place. Everything llmwatch actually does works with the
+network unplugged: it reads a local log file.
 
-ollama-llmwatch itself makes **no network calls at all**. It reads a local log file. There's a
-test that fails if anyone adds a network client.
+There is exactly one network call, and it is not part of the job: **once a day it asks PyPI
+whether there is a newer version.** It runs on a background thread, times out after two seconds,
+and stays silent if anything at all goes wrong. Turn it off and nothing else changes:
+
+```bash
+export LLMWATCH_NO_UPDATE_CHECK=1
+```
+
+It is off automatically under `--json`, which is usually running unattended in a script.
+
+This used to say "no network calls at all", and that was true until 0.9.1. It changed because
+0.8.0 shipped to GitHub and never reached PyPI, and nobody running an older copy had any way to
+find out. Tests keep it to the one call: a single import, inside a single function, with no
+second network client allowed anywhere in the file.
 
 ### Does it read my prompts, or send anything anywhere?
 
 No. Ollama's log contains only timings and bookkeeping - no prompt text, no file names, no
-responses. Nothing leaves your machine.
+responses. **Nothing about you or your models ever leaves your machine.**
+
+The daily update check is the only thing that goes out, and it carries nothing: an empty GET to
+the same public URL every user of the package requests, `https://pypi.org/pypi/ollama-llmwatch/json`.
+No query string, no model names, no identifier, no usage data. PyPI learns that somebody asked,
+which it already knew when you installed. Disable it with `LLMWATCH_NO_UPDATE_CHECK=1`.
 
 One exception, and it's opt-in: `--codex` reads your Codex session file, which *does* contain
 commands and file paths. That's exactly why it's off by default. Of what it reads, only turn

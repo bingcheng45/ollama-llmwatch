@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.9.1
+
+**You will now hear about new versions.** 0.8.0 shipped to GitHub and never reached PyPI, and
+nobody running an older copy had any way to find out. Releases are automated now, and llmwatch
+tells you when it is behind.
+
+- A tag builds, tests and publishes to PyPI through Trusted Publishing, so there is no API token
+  stored anywhere. It refuses to publish when the tag, `__version__` and `pyproject.toml`
+  disagree: a version on PyPI can never be reused or corrected, so the number has to be right
+  before it goes out rather than after.
+- Bandit, a dependency audit and CodeQL run on every push and pull request, and weekly, because
+  advisories appear after the last commit does.
+- **One network call, and a note about a promise that changed.** This README used to say llmwatch
+  makes no network calls at all. It now makes exactly one: once a day it asks PyPI for the latest
+  version, on a background thread, with a two second timeout, silent on any failure. It sends
+  nothing about you - an empty GET to the same public URL every user requests, with no query
+  string, no model names and no identifier. It is off under `--json`, and
+  `LLMWATCH_NO_UPDATE_CHECK=1` turns it off everywhere.
+- The test that forbade a network client is narrowed rather than deleted, because it was doing
+  its job: one import, inside one function, and no second network client anywhere in the file.
+  Deleting it would have left nothing to stop the next one.
+- The version comparison is numeric, not lexicographic. `"0.10.0" < "0.9.0"` as strings, which
+  would have told everyone to downgrade the day 0.10 shipped. Pre-releases are refused outright
+  rather than ordered by guesswork.
+
 ## 0.9.0
 
 **MLX models are no longer invisible.** Ollama runs GGUF models through `llama-server` but any

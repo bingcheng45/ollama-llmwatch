@@ -58,7 +58,7 @@ try:
 except ImportError:  # pragma: no cover - py2 only, never hit
     queue = None
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 # Frame pacing. The loop wakes on new log data OR on these deadlines, whichever
 # comes first, so fresh data appears immediately while animation (spinner,
@@ -81,6 +81,18 @@ MIN_FRAME_GAP = 1 / 30.0   # hard ceiling so a log flood can't spin the CPU
 MIN_TOKENS_FOR_EXTREMES = 64
 
 RECENT_LIMIT = 20      # requests kept for the sparkline and the recent pane
+
+# The update check. This is the only thing in llmwatch that touches the network,
+# and it stays this small on purpose: one GET to PyPI's public JSON, at most
+# once a day, on a background thread, with every failure swallowed. It sends
+# nothing about you or your models -- the request body is empty and the URL is
+# the same one for every user of the package.
+#
+# It exists because the alternative was worse. 0.8.0 shipped to GitHub and never
+# reached PyPI, and nobody running an older copy had any way to find out.
+UPDATE_URL = "https://pypi.org/pypi/ollama-llmwatch/json"
+UPDATE_INTERVAL = 24 * 3600
+UPDATE_TIMEOUT = 2.0   # a slow network must never delay the first frame
 
 # "That took 12m20s" is a fact; "which is 2x your usual" is the useful part. Both
 # need enough history behind them not to be noise.
@@ -2071,6 +2083,151 @@ def current_model():
     return "?"
 
 
+# --------------------------------------------------------------------------
+# The update check
+#
+# Everything here fails silent. A tool that watches something else must never
+# be the thing that breaks, and least of all over its own version number.
+# --------------------------------------------------------------------------
+
+def version_tuple(text):
+    """Comparable form of a plain X.Y.Z version, or None for anything else.
+
+    Deliberately refuses suffixes (rc, dev, post). Guessing how a pre-release
+    orders against a release is how an update prompt ends up telling someone to
+    "upgrade" to something older than what they already have.
+    """
+    parts = (text or "").strip().split(".")
+    if not 1 <= len(parts) <= 4 or not all(part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def update_is_newer(current, latest):
+    """Is `latest` a release worth telling someone about? Unknown means no."""
+    here, there = version_tuple(current), version_tuple(latest)
+    if here is None or there is None:
+        return False
+    return there > here
+
+
+def update_cache_path():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "ollama-llmwatch", "update-check.json")
+
+
+def read_update_cache(now, path=None):
+    """(latest, fresh) from the cache. `fresh` decides whether to skip the call.
+
+    A failed check caches too, as an empty result: an unreachable network should
+    cost one attempt a day, not one on every launch.
+    """
+    try:
+        with open(path or update_cache_path()) as fh:
+            data = json.load(fh)
+        checked = float(data.get("checked") or 0)
+        return data.get("latest"), (now - checked) < UPDATE_INTERVAL
+    except (OSError, ValueError, AttributeError):
+        return None, False
+
+
+def write_update_cache(latest, now, path=None):
+    target = path or update_cache_path()
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w") as fh:
+            json.dump({"latest": latest, "checked": now}, fh)
+    except (OSError, ValueError):
+        pass          # a cache we cannot write just means we check again tomorrow
+
+
+def fetch_latest_version(url=UPDATE_URL, timeout=UPDATE_TIMEOUT):
+    """The newest version on PyPI, or None if anything at all goes wrong.
+
+    The single network call in this program. It is a GET of a public JSON
+    document, identical for every user, with no body and nothing appended to the
+    URL: PyPI learns that somebody asked, which it already knew from the install.
+    """
+    import urllib.request          # local: nothing imports a network client
+                                   # unless this function is actually called
+    # urlopen will happily follow file:, ftp: or a custom scheme, which turns a
+    # url that ever becomes caller-controlled into a file read. It is a constant
+    # today; this keeps that true no matter who calls it later.
+    if not (url or "").startswith("https://"):
+        return None
+    try:
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "ollama-llmwatch/%s" % __version__})
+        # B310 is silenced because the scheme is checked above, not ignored.
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+            if getattr(response, "status", 200) != 200:
+                return None
+            payload = json.loads(response.read(64 * 1024).decode("utf-8", "replace"))
+        return (payload.get("info") or {}).get("version")
+    except Exception:              # noqa: BLE001 - DNS, TLS, timeout, junk JSON
+        return None                # are all the same answer here: say nothing
+
+
+def update_check_disabled():
+    """Off by env var, and off for --json, which must stay machine-readable and
+    is the mode most likely to be running unattended in a script."""
+    value = (os.environ.get("LLMWATCH_NO_UPDATE_CHECK") or "").strip().lower()
+    return value not in ("", "0", "false", "no")
+
+
+def check_for_update(current=None, now=None, path=None, fetch=None):
+    """The whole check, start to finish. Returns a version string or None.
+
+    Pure enough to test: the clock, the cache location and the fetch are all
+    injectable, so no test needs a network or a real home directory.
+    """
+    current = current or __version__
+    now = time.time() if now is None else now
+    latest, fresh = read_update_cache(now, path)
+    if not fresh:
+        latest = (fetch or fetch_latest_version)()
+        write_update_cache(latest, now, path)
+    return latest if update_is_newer(current, latest) else None
+
+
+def start_update_check(box, current=None, path=None, fetch=None):
+    """Run the check on a daemon thread and leave the answer in `box`.
+
+    On a thread because a stalled DNS lookup must not delay the first frame by
+    even the timeout: the board is on screen before this has finished, and the
+    notice appears whenever it arrives.
+    """
+    if update_check_disabled():
+        return None
+
+    def run():
+        try:
+            found = check_for_update(current=current, path=path, fetch=fetch)
+            if found:
+                box["latest"] = found
+        except Exception:          # noqa: BLE001 - never take the tool down
+            pass
+
+    thread = threading.Thread(target=run)
+    thread.daemon = True           # never hold up exit waiting on the network
+    thread.start()
+    return thread
+
+
+def render_update(latest, style):
+    """One dim line. An update is worth mentioning, not worth interrupting for.
+
+    Re-checks that the version really is newer, even though check_for_update
+    already did. Handed a stale or lower version by a future caller, the honest
+    failure is to say nothing; the alternative is telling someone running 0.9.0
+    to "upgrade" to 0.7.0, which is worse than never mentioning it.
+    """
+    if not update_is_newer(__version__, latest):
+        return None
+    return style.dim("update available: %s (you have %s) - "
+                     "uv tool upgrade ollama-llmwatch" % (latest, __version__))
+
+
 class Screen:
     """Full-screen output on the alternate buffer, with guaranteed restore.
 
@@ -2151,7 +2308,7 @@ FRAME_MARGIN = 2       # columns of breathing room between the frame and the edg
 
 def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=False,
                   live_detail=None, codex=None, system=None,
-                  ui=None, picker=None, compare=None):
+                  ui=None, picker=None, compare=None, update=None):
     """Build the whole TUI frame, inset from the terminal edge.
 
     One margin applied here rather than an indent baked into each renderer:
@@ -2164,12 +2321,12 @@ def compose_frame(snap, live_text, style, cols, rows, hint=True, help_visible=Fa
             for line in frame_lines(snap, live_text, style,
                                     max(20, cols - FRAME_MARGIN), rows, hint,
                                     help_visible, live_detail, codex, system,
-                                    ui, picker, compare)]
+                                    ui, picker, compare, update)]
 
 
 def frame_lines(snap, live_text, style, cols, rows, hint=True, help_visible=False,
                 live_detail=None, codex=None, system=None,
-                ui=None, picker=None, compare=None):
+                ui=None, picker=None, compare=None, update=None):
     """The frame itself, written as if it started at column 0.
 
     Panes drop in priority order when the terminal is short -- sparklines first,
@@ -2242,6 +2399,9 @@ def frame_lines(snap, live_text, style, cols, rows, hint=True, help_visible=Fals
                   render_board(snap, style, cols, compact=compact, system=system),
                   codex_block,
                   recent_block,
+                  # Last of the optional blocks, so a short terminal drops the
+                  # version notice before it drops anything you are watching.
+                  ["", render_update(update, style)] if update else [],
                   ["", style.dim("h help   -   c compare   -   ctrl-c quit")] if hint else []):
         if block and len(head) + len(block) + len(live_block) <= budget:
             head.extend(block)
@@ -3230,6 +3390,13 @@ def follow(args):
         where = target if kind == "file" else "journalctl -u %s" % target
         sys.stderr.write("llmwatch %s  watching %s\n" % (__version__, where))
 
+    # Started before the log is even open, and never waited on. --json is
+    # excluded in update_check_disabled()'s caller below: that output is parsed
+    # by other programs and usually runs unattended.
+    update_box = {}
+    if not args.json:
+        start_update_check(update_box)
+
     proc = subprocess.Popen(tail_command(kind, target), stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, text=True, bufsize=1)
     q = queue.Queue()
@@ -3366,6 +3533,11 @@ def follow(args):
     def paint():
         if not interactive:
             return
+        # Plain mode scrolls, so the notice is committed once as a line of its
+        # own; the TUI redraws it every frame instead, from the same box.
+        if not tui and update_box.get("latest") and not update_box.get("announced"):
+            update_box["announced"] = True
+            commit(render_update(update_box["latest"], style))
         if probe:
             probe.poll()               # self-rate-limited: 5s cheap, 15s models
         if tui:
@@ -3381,7 +3553,8 @@ def follow(args):
                 ui=ui, picker=picker_models, compare=compare_lines,
                 live_detail=render_live_detail(live_data, snap, style, age,
                                               codex_state, system_state),
-                codex=codex_state, system=system_state), rows, cols)
+                codex=codex_state, system=system_state,
+                update=update_box.get("latest")), rows, cols)
         else:
             text = live_text()
             if text:
