@@ -2550,6 +2550,29 @@ def _proxy_server_class():
     import urllib.parse
     import urllib.request
 
+    class _NoRedirects(urllib.request.HTTPRedirectHandler):
+        """Relay a 3xx rather than following it.
+
+        urlopen follows redirects by default, and carries the request headers
+        across hosts while it does. An upstream answering 302 with a Location
+        elsewhere would therefore take the Authorization header there -- the
+        exact outcome safe_request_path and the origin check exist to prevent,
+        reached from the other side, and past both of them because the second
+        request is made inside urlopen where neither can see it.
+
+        Refusing to follow is also just what a proxy should do. The client
+        asked for this URL; if it moved, that is an answer, and the client is
+        entitled to see it and decide.
+        """
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    # Returning None above leaves the 3xx unhandled, so it surfaces as an
+    # HTTPError and takes the same path as any other upstream error response:
+    # relayed verbatim, Location header and all.
+    _opener = urllib.request.build_opener(_NoRedirects)
+
     class _ProxyHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -2621,8 +2644,9 @@ def _proxy_server_class():
             try:
                 # B310 is silenced because the scheme is checked, not ignored:
                 # _ProxyServer refuses to start on anything but http/https, so
-                # this URL cannot be a file: or a custom scheme.
-                upstream = urllib.request.urlopen(  # nosec B310
+                # this URL cannot be a file: or a custom scheme. _opener rather
+                # than urlopen so a redirect is relayed, not followed.
+                upstream = _opener.open(  # nosec B310
                     req, timeout=PROXY_TIMEOUT)
             except urllib.error.HTTPError as err:
                 # A real HTTP error is a real answer: pass it through verbatim so

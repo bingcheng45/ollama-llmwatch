@@ -504,6 +504,105 @@ class TestUpstreamScheme(unittest.TestCase):
             start_proxy(("127.0.0.1", 0), "file:///etc/passwd", lambda ev: None)
 
 
+class TestRedirectsAreRelayedNotFollowed(unittest.TestCase):
+    """The other direction of the same problem the target checks address.
+
+    Those stop the client choosing the host. This stops the upstream choosing
+    it: urlopen follows redirects by default and carries the request headers
+    across hosts while doing so, so a 302 pointing elsewhere would deliver the
+    Authorization header there -- past both target checks, because the second
+    request happens inside urlopen where neither can see it.
+    """
+
+    def start(self, location):
+        """Proxy in front of an upstream that answers 302 -> `location`."""
+        import http.server
+        import threading
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", location)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        up = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        self.addCleanup(up.server_close)
+        self.addCleanup(up.shutdown)
+        _, port = start_proxy(
+            ("127.0.0.1", 0), "http://127.0.0.1:%d" % up.server_address[1],
+            lambda ev: None)
+        return port
+
+    def post(self, port):
+        """The test client must not follow the redirect either, or it -- not
+        the proxy -- is what ends up at the target, and the assertion would be
+        measuring urllib rather than llmwatch."""
+        import urllib.error
+        import urllib.request
+
+        class NoFollow(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+
+        opener = urllib.request.build_opener(NoFollow)
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/chat/completions" % port,
+            data=b'{"model":"m"}',
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer SECRET"},
+            method="POST")
+        try:
+            with opener.open(req, timeout=10) as resp:
+                return resp.status, dict(resp.headers)
+        except urllib.error.HTTPError as err:
+            return err.code, dict(err.headers or {})
+
+    def test_the_client_is_told_it_moved_rather_than_being_followed(self):
+        target = "http://127.0.0.1:1/steal"
+        code, headers = self.post(self.start(target))
+        self.assertEqual(code, 302)
+        # Relayed intact, so the client can decide for itself.
+        self.assertEqual(headers.get("Location"), target)
+
+    def test_the_credential_does_not_reach_the_redirect_target(self):
+        """The failure this exists to prevent, asserted on the receiving end:
+        a host the operator never configured must see nothing at all."""
+        import http.server
+        import threading
+
+        seen = []
+
+        class Sink(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                seen.append(dict(self.headers))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        sink = http.server.HTTPServer(("127.0.0.1", 0), Sink)
+        threading.Thread(target=sink.serve_forever, daemon=True).start()
+        self.addCleanup(sink.server_close)
+        self.addCleanup(sink.shutdown)
+
+        port = self.start("http://127.0.0.1:%d/steal" % sink.server_address[1])
+        code, _ = self.post(port)
+        self.assertEqual(code, 302)
+        self.assertEqual(seen, [])
+
+
 class StubUpstream:
     """A minimal OpenAI-shaped server, so the proxy is tested against a socket
     rather than against a mock of one."""
