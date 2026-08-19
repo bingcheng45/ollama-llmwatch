@@ -2602,37 +2602,44 @@ def _proxy_server_class():
                 pass
 
         def _relay(self):
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except (TypeError, ValueError):
-                length = 0
-            raw = self.rfile.read(length) if length > 0 else b""
-
-            # Before anything else is done with it: the target decides which
-            # host this request goes to, and only a plain rooted path may.
+            # Before the body is read, let alone forwarded: the target decides
+            # which host this request goes to, and only a plain rooted path
+            # may. Reading first would mean doing attacker-sized work on behalf
+            # of a request already known to be refused.
             path = safe_request_path(self.path)
             if path is None:
                 self._send_bad_target()
                 return
-
-            measured = self.command == "POST" and path in INSTRUMENTED_PATHS
-            model, is_stream = None, False
-            if measured:
-                raw, model, is_stream = prepare_body(raw)
-
-            headers = {k: v for k, v in self.headers.items()
-                       if k.lower() not in HOP_BY_HOP}
 
             # safe_request_path rejects the spellings that are known to reach
             # past the first slash; this re-derives the origin from the joined
             # URL and refuses anything that did not land on the configured one
             # anyway. Two independent checks, because the cost of the blocklist
             # being incomplete is the whole request -- API key included -- going
-            # to a host the client picked.
+            # to a host the client picked. Both run before the body is read.
             target = self.server.upstream.rstrip("/") + path
             if urllib.parse.urlsplit(target)[:2] != self.server.upstream_origin:
                 self._send_bad_target()
                 return
+
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+
+            # The query string is part of self.path and is forwarded as-is, but
+            # it is not part of the route: matching it exactly meant a client
+            # appending one silently stopped the request being measured, while
+            # leaving it working, which is the hardest kind of gap to notice.
+            route = path.split("?", 1)[0]
+            measured = self.command == "POST" and route in INSTRUMENTED_PATHS
+            model, is_stream = None, False
+            if measured:
+                raw, model, is_stream = prepare_body(raw)
+
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in HOP_BY_HOP}
 
             req = urllib.request.Request(
                 target,
@@ -2664,14 +2671,22 @@ def _proxy_server_class():
 
         def _send_bad_target(self):
             """Refused before any connection is made, so a rejected target
-            cannot be distinguished from a rejected one by timing either."""
+            cannot be distinguished from a rejected one by timing either.
+
+            The connection is closed rather than kept alive: the body was
+            deliberately not read, so whatever the client already sent is still
+            in the socket, and on a kept-alive connection the next read would
+            parse it as a request line.
+            """
             body = json.dumps({"error": {
                 "message": "llmwatch: refusing to forward this request target",
                 "type": "invalid_request_error"}}).encode("utf-8")
+            self.close_connection = True
             try:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
             except (OSError, BrokenPipeError):
@@ -2782,7 +2797,9 @@ def _proxy_server_class():
                         if first_token is None:
                             first_token = now
                         last_token = now
-                    if measured and decoded and now - last_tick >= 0.25:
+                    # `measured` is already true here; anything else was
+                    # skipped by the continue above.
+                    if decoded and now - last_tick >= 0.25:
                         last_tick = now
                         self._emit(OaiGenTick(decoded, now))
                 self.wfile.write(b"0\r\n\r\n")
@@ -2878,6 +2895,13 @@ def _proxy_server_class():
             if not valid_upstream(upstream):
                 raise ValueError(
                     "upstream must be http:// or https://, got %r" % (upstream,))
+            # An IPv6 literal needs an IPv6 socket. The default family is IPv4,
+            # which would fail to bind ::1 with an error about the address
+            # rather than about the family, so parsing it correctly is only
+            # half the job. Set on the instance, before bind happens in
+            # __init__, so the class default is left alone.
+            if ":" in address[0]:
+                self.address_family = http.server.socket.AF_INET6
             http.server.ThreadingHTTPServer.__init__(self, address, _ProxyHandler)
             self.upstream = upstream
             # The origin every forwarded URL must still resolve to. Computed
@@ -2930,10 +2954,27 @@ def valid_upstream(url):
 
 
 def parse_listen(text, default_port=DEFAULT_PROXY_PORT):
-    """'8081' / '127.0.0.1:8081' / ':8081' -> (host, port)."""
+    """'8081' / '127.0.0.1:8081' / ':8081' / '[::1]:8081' -> (host, port)."""
     text = (text or "").strip()
     if not text:
         return ("127.0.0.1", default_port)
+
+    # An IPv6 address is mostly colons, so rpartition cannot be let near one
+    # unbracketed: '::1' would split into the host ':' on port 1, which then
+    # fails the loopback check and reads as a policy refusal rather than a
+    # parsing bug. Bracketed is the form that carries a port; bare is all host.
+    if text.startswith("["):
+        host, sep, rest = text[1:].partition("]")
+        if not sep:
+            return (text, default_port)
+        port = rest[1:] if rest.startswith(":") else ""
+        try:
+            return (host, int(port))
+        except ValueError:
+            return (host, default_port)
+    if text.count(":") > 1:
+        return (text, default_port)
+
     if ":" in text:
         host, _, port = text.rpartition(":")
         host = host or "127.0.0.1"

@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llmwatch import (  # noqa: E402
     DEFAULT_PROXY_PORT, OaiGenTick, OaiPrefillTick, OaiRequestAborted,
-    OaiRequestEnd, OaiRequestStart, Tracker, _sse_events, draft_counts,
+    LOOPBACK_HOSTS, OaiRequestEnd, OaiRequestStart, Tracker, _sse_events,
+    draft_counts,
     parse_line, parse_listen, prepare_body, read_stream_usage, start_proxy,
     safe_request_path, usage_counts, valid_upstream,
 )
@@ -381,6 +382,23 @@ class TestParseListen(unittest.TestCase):
     def test_a_junk_port_falls_back_rather_than_crashing(self):
         self.assertEqual(parse_listen("host:junk"), ("host", DEFAULT_PROXY_PORT))
 
+    def test_ipv6_literals(self):
+        """rpartition(':') cannot split an address that is mostly colons. It
+        used to turn '::1' into the host ':' on port 1, which then failed the
+        loopback check and refused to start -- reading as a policy decision
+        rather than the parsing bug it was."""
+        self.assertEqual(parse_listen("[::1]:9000"), ("::1", 9000))
+        self.assertEqual(parse_listen("[::1]"), ("::1", DEFAULT_PROXY_PORT))
+        self.assertEqual(parse_listen("::1"), ("::1", DEFAULT_PROXY_PORT))
+        self.assertEqual(parse_listen("::"), ("::", DEFAULT_PROXY_PORT))
+        self.assertEqual(parse_listen("[::]:9000"), ("::", 9000))
+
+    def test_an_ipv6_loopback_is_recognised_as_loopback(self):
+        """The point of parsing it correctly: ::1 is loopback, so it must not
+        need --proxy-allow-remote."""
+        self.assertIn(parse_listen("[::1]:9000")[0], LOOPBACK_HOSTS)
+        self.assertIn(parse_listen("::1")[0], LOOPBACK_HOSTS)
+
 
 class TestRequestTargetCannotChooseTheHost(unittest.TestCase):
     """The upstream URL is the configured base joined to the request target,
@@ -504,6 +522,36 @@ class TestUpstreamScheme(unittest.TestCase):
             start_proxy(("127.0.0.1", 0), "file:///etc/passwd", lambda ev: None)
 
 
+def _has_ipv6_loopback():
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    except OSError:
+        return False
+    try:
+        s.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+class TestIpv6Listen(unittest.TestCase):
+    """Parsing '[::1]:9000' correctly is only half of it: the default socket
+    family is IPv4, so the bind would still fail, and the error would talk
+    about the address rather than the family."""
+
+    @unittest.skipUnless(_has_ipv6_loopback(), "no IPv6 loopback on this host")
+    def test_the_proxy_actually_binds_an_ipv6_loopback(self):
+        host, port = parse_listen("[::1]:0")
+        self.assertEqual(host, "::1")
+        bound_host, bound_port = start_proxy(
+            (host, port), "http://127.0.0.1:1", lambda ev: None)
+        self.assertEqual(bound_host, "::1")
+        self.assertTrue(bound_port > 0)
+
+
 class TestRedirectsAreRelayedNotFollowed(unittest.TestCase):
     """The other direction of the same problem the target checks address.
 
@@ -611,6 +659,7 @@ class StubUpstream:
         import http.server
 
         self.requests = []
+        self.paths = []
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -621,6 +670,7 @@ class StubUpstream:
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
+                outer.paths.append(self.path)
                 outer.requests.append(self.rfile.read(length))
                 self.send_response(status)
                 if stream:
@@ -756,6 +806,53 @@ class TestProxyEndToEnd(unittest.TestCase):
         end = seen[-1]
         self.assertEqual(end.completion_tokens, 200)
         self.assertIsNone(end.draft)
+
+    def test_a_query_string_does_not_disable_measurement(self):
+        """self.path carries the query, so an exact match against
+        INSTRUMENTED_PATHS silently stopped measuring the moment a client
+        appended one. The request still worked, which is what made it easy to
+        miss: the numbers just quietly stopped arriving."""
+        upstream = StubUpstream([delta("a"), delta("b"), USAGE_CHUNK,
+                                 b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True},
+                  path="/v1/chat/completions?foo=bar")
+        self.assertTrue(finished.wait(10))
+        end = seen[-1]
+        self.assertEqual(type(end).__name__, "OaiRequestEnd")
+        self.assertEqual(end.completion_tokens, 200)
+        # and the query reached the upstream untouched
+        self.assertTrue(upstream.paths[-1].endswith("?foo=bar"),
+                        upstream.paths[-1])
+
+    def test_a_refused_target_does_not_read_the_body_first(self):
+        """The body is attacker-sized and the target is already known to be
+        bad, so reading it is work done on behalf of a request that will not
+        be forwarded. Refuse first, and close rather than leaving an unread
+        body to be parsed as the next request on a kept-alive connection."""
+        import socket
+        upstream = StubUpstream(b'{"ok": true}', stream=False)
+        self.addCleanup(upstream.close)
+        seen, port, _ = self.run_proxy(upstream.url)
+
+        conn = socket.create_connection(("127.0.0.1", port), timeout=10)
+        self.addCleanup(conn.close)
+        # Declares a body far larger than it sends. If the handler reads before
+        # validating, it blocks here until the timeout instead of answering.
+        conn.sendall(b"POST @evil.com/ HTTP/1.1\r\nHost: x\r\n"
+                     b"Content-Length: 100000000\r\n\r\nshort")
+        conn.settimeout(10)
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            head += chunk
+        self.assertIn(b"400", head.split(b"\r\n")[0])
+        self.assertIn(b"close", head.lower())
+        self.assertEqual(upstream.requests, [])
+        self.assertEqual(seen, [])
 
     def test_a_tool_call_only_turn_is_still_measured(self):
         """Through the proxy, end to end: opencode's tool-calling turns must
