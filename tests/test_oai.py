@@ -18,7 +18,7 @@ from llmwatch import (  # noqa: E402
     DEFAULT_PROXY_PORT, OaiGenTick, OaiPrefillTick, OaiRequestAborted,
     OaiRequestEnd, OaiRequestStart, Tracker, _sse_events, draft_counts,
     parse_line, parse_listen, prepare_body, read_stream_usage, start_proxy,
-    usage_counts,
+    usage_counts, valid_upstream,
 )
 
 
@@ -380,6 +380,28 @@ class TestParseListen(unittest.TestCase):
 
     def test_a_junk_port_falls_back_rather_than_crashing(self):
         self.assertEqual(parse_listen("host:junk"), ("host", DEFAULT_PROXY_PORT))
+
+
+class TestUpstreamScheme(unittest.TestCase):
+    """--upstream is the one piece of the proxy's configuration that comes from
+    outside, and urlopen will open far more than http."""
+
+    def test_http_and_https_are_allowed(self):
+        self.assertTrue(valid_upstream("http://127.0.0.1:8080"))
+        self.assertTrue(valid_upstream("https://example.com"))
+
+    def test_everything_else_is_refused(self):
+        """A file: upstream would turn every request the client makes into a
+        local file read, with the contents relayed straight back to it."""
+        for url in ("file:///etc/passwd", "ftp://host/x", "gopher://host",
+                    "127.0.0.1:8080", "", None):
+            self.assertFalse(valid_upstream(url), url)
+
+    def test_the_server_refuses_to_start_on_one(self):
+        """Enforced at the choke point every request passes through, not only
+        in the argument parser, so no other caller can slip past it."""
+        with self.assertRaises(ValueError):
+            start_proxy(("127.0.0.1", 0), "file:///etc/passwd", lambda ev: None)
 
 
 class StubUpstream:

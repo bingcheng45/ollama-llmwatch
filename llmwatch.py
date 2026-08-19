@@ -2360,6 +2360,10 @@ def current_model():
 # --------------------------------------------------------------------------
 
 DEFAULT_UPSTREAM = "http://127.0.0.1:8080"
+# urlopen will happily open file:, ftp: or a custom scheme, and --upstream is
+# the one part of the proxy's configuration that comes from outside. Checked
+# where it is accepted rather than trusted at the call site.
+UPSTREAM_SCHEMES = ("http://", "https://")
 DEFAULT_PROXY_PORT = 8081
 LOOPBACK_HOSTS = frozenset(["127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1"])
 
@@ -2595,7 +2599,11 @@ def _proxy_server_class():
             if measured:
                 self._emit(OaiRequestStart(model, started))
             try:
-                upstream = urllib.request.urlopen(req, timeout=PROXY_TIMEOUT)
+                # B310 is silenced because the scheme is checked, not ignored:
+                # _ProxyServer refuses to start on anything but http/https, so
+                # this URL cannot be a file: or a custom scheme.
+                upstream = urllib.request.urlopen(  # nosec B310
+                    req, timeout=PROXY_TIMEOUT)
             except urllib.error.HTTPError as err:
                 # A real HTTP error is a real answer: pass it through verbatim so
                 # the client sees the server's own message, not llmwatch's.
@@ -2806,6 +2814,11 @@ def _proxy_server_class():
         allow_reuse_address = True
 
         def __init__(self, address, upstream, emit):
+            # Checked here, the one place every request must pass through, so
+            # no future caller can introduce a file: upstream by another route.
+            if not valid_upstream(upstream):
+                raise ValueError(
+                    "upstream must be http:// or https://, got %r" % (upstream,))
             http.server.ThreadingHTTPServer.__init__(self, address, _ProxyHandler)
             self.upstream = upstream
             self.emit = emit
@@ -2816,6 +2829,15 @@ def _proxy_server_class():
 
     _PROXY_SERVER_CLASS = _ProxyServer
     return _PROXY_SERVER_CLASS
+
+
+def valid_upstream(url):
+    """Is this something the proxy may forward to?
+
+    Only http and https. A `file:` upstream would turn every request the client
+    makes into a local file read, and the reply would be relayed back to it.
+    """
+    return bool(url) and str(url).startswith(UPSTREAM_SCHEMES)
 
 
 def parse_listen(text, default_port=DEFAULT_PROXY_PORT):
@@ -4351,6 +4373,11 @@ def follow(args):
         listen = parse_listen(args.proxy or os.environ.get("LLMWATCH_PROXY"))
         upstream = (args.upstream or os.environ.get("LLMWATCH_UPSTREAM")
                     or DEFAULT_UPSTREAM)
+        if not valid_upstream(upstream):
+            sys.stderr.write(
+                "llmwatch: --upstream must be http:// or https://, got %r\n"
+                % (upstream,))
+            return 2
         if listen[0] not in LOOPBACK_HOSTS and not args.proxy_allow_remote:
             sys.stderr.write(
                 "llmwatch: refusing to listen on %s.\n"
