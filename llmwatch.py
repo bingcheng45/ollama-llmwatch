@@ -1097,15 +1097,21 @@ class ProgressFloor:
 
     Held outside render_live so that function stays deterministic for its inputs;
     pass None and no clamping happens.
+
+    Keyed by phase as well as request. Prefill and generate count different
+    things -- tokens read versus tokens written -- and share one task id, so a
+    floor keyed on the task alone carries the prompt size into the generate
+    line: a 47k prompt made GENERATE open at "47,000 tok" and stay there,
+    because every real count was smaller and got clamped up.
     """
 
     def __init__(self):
-        self.task = None
+        self.key = None
         self.value = 0
 
-    def clamp(self, task, value):
-        if task != self.task:            # new request: start again from scratch
-            self.task, self.value = task, value
+    def clamp(self, key, value):
+        if key != self.key:              # new request, or new phase of one
+            self.key, self.value = key, value
         self.value = max(self.value, value)
         return self.value
 
@@ -1122,7 +1128,7 @@ def render_live(data, age, style, now=None, floor=None):
         seen = project(data["processed"], data.get("rate", 0), age, total or None,
                        cap_ahead=PREFILL_BATCH)
         if floor is not None:
-            seen = floor.clamp(data.get("task"), seen)
+            seen = floor.clamp((data.get("task"), event), seen)
         fraction = (seen / float(total)) if total else data.get("fraction", 0.0)
         elapsed = data.get("elapsed", 0) + age
         eta = data.get("eta_seconds")
@@ -1154,7 +1160,7 @@ def render_live(data, age, style, now=None, floor=None):
         decoded = int(project(data["decoded"], data.get("rate", 0), age, None,
                               cap_ahead=GEN_TICK_TOKENS))
         if floor is not None:
-            decoded = int(floor.clamp(data.get("task"), decoded))
+            decoded = int(floor.clamp((data.get("task"), event), decoded))
         elapsed = data.get("elapsed", 0) + age
         return "%s %s %s  %s  %s" % (
             spin,
@@ -1747,7 +1753,11 @@ def handle_key(state, key, models, update=None):
         if key in ("DOWN", "j"):
             state.cursor = min(max(0, len(names) - 1), state.cursor + 1)
             return True
-        if key and key.isdigit() and key != "0":
+        # isdecimal, not isdigit: isdigit admits superscripts and other Unicode
+        # digits that int() then rejects, and superscript two is a dedicated key
+        # on French AZERTY. The reader hands us raw decoded bytes, so that
+        # ValueError escapes follow() as a traceback, in raw mode, mid-render.
+        if key and key.isdecimal() and key != "0":
             index = int(key) - 1
             if index < len(names):
                 state.cursor = index

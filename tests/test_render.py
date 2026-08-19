@@ -436,6 +436,38 @@ class TestProgressNeverRewinds(unittest.TestCase):
         fresh = dict(self.data(10, 100.0), task=2)
         self.assertLess(self.percent(render_live(fresh, 0.0, PLAIN, now=0, floor=floor)), 10)
 
+    def test_generate_does_not_inherit_the_prompt_size(self):
+        """Reported as "GENERATE 47,000 tok" on the first token of the answer.
+
+        Both phases of one request carry the same task id, so a floor keyed on
+        the task alone treated the tokens just read as a floor for the tokens
+        about to be written, and every real count got clamped up to the prompt
+        size for the rest of the answer.
+        """
+        from llmwatch import ProgressFloor
+        floor = ProgressFloor()
+        render_live(self.data(47000, 100.0), 0.0, PLAIN, now=0, floor=floor)
+        generate = {"event": "generate_tick", "task": 1, "model": "m",
+                    "decoded": 12, "rate": 20.0, "rate_3s": 20.0, "elapsed": 0.6}
+        line = strip_ansi(render_live(generate, 0.0, PLAIN, now=0, floor=floor))
+        self.assertIn("12 tok", line)
+        self.assertNotIn("47,000", line)
+
+    def test_generate_still_never_rewinds_within_one_answer(self):
+        """The floor must survive the phase split, not be removed by it."""
+        from llmwatch import ProgressFloor
+        floor = ProgressFloor()
+
+        def generate(decoded, rate, age):
+            data = {"event": "generate_tick", "task": 1, "model": "m",
+                    "decoded": decoded, "rate": rate, "rate_3s": rate, "elapsed": 5.0}
+            line = strip_ansi(render_live(data, age, PLAIN, now=0, floor=floor))
+            return int(line.split(" tok")[0].split()[-1].replace(",", ""))
+
+        seen = [generate(400, 100.0, 0.0), generate(400, 100.0, 2.0),
+                generate(420, 10.0, 0.0), generate(420, 10.0, 1.0)]
+        self.assertEqual(seen, sorted(seen), "generated tokens went backwards: %s" % seen)
+
     def test_projection_cannot_run_more_than_one_batch_ahead(self):
         """Otherwise the bar races ahead, then stalls waiting for reality."""
         from llmwatch import PREFILL_BATCH, project
