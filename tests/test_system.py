@@ -142,6 +142,61 @@ class TestContentionReporting(unittest.TestCase):
         self.assertIn("2 models loaded", findings)
 
 
+class TestExpensiveProbesAreRateLimited(unittest.TestCase):
+    """`ps -Ao pcpu,comm -r` costs ~46ms, and its caller is the render loop.
+
+    diagnose() runs from paint() at ~10 fps, so an unthrottled read forked `ps`
+    ten times a second for as long as the slowdown lasted -- roughly 460ms of
+    forking per second, spent precisely when the machine is already struggling
+    and the user is watching to find out why.
+    """
+
+    def test_repeated_asks_within_the_interval_probe_once(self):
+        now = [1000.0]
+        calls = []
+        probe = SystemProbe(clock=lambda: now[0])
+        import llmwatch
+        original = llmwatch.busiest_process
+        llmwatch.busiest_process = lambda: (calls.append(1), "python 98%")[1]
+        try:
+            for _ in range(10):                 # one second of frames
+                self.assertEqual(probe.busiest(), "python 98%")
+                now[0] += 0.1
+        finally:
+            llmwatch.busiest_process = original
+        self.assertEqual(len(calls), 1, "forked ps %d times in one second" % len(calls))
+
+    def test_it_does_refresh_once_the_interval_passes(self):
+        """Throttling must not freeze the answer: the busiest process changes."""
+        now = [1000.0]
+        calls = []
+        probe = SystemProbe(clock=lambda: now[0])
+        import llmwatch
+        original = llmwatch.busiest_process
+        llmwatch.busiest_process = lambda: (calls.append(1), "p%d" % len(calls))[1]
+        try:
+            first = probe.busiest()
+            now[0] += SystemProbe.BUSIEST_INTERVAL + 0.1
+            second = probe.busiest()
+        finally:
+            llmwatch.busiest_process = original
+        self.assertEqual((first, second), ("p1", "p2"))
+
+    def test_diagnose_uses_the_injected_reader_not_the_raw_one(self):
+        """The wiring, not just the throttle: if diagnose ignored the callable
+        the throttle would exist and never be reached."""
+        stats = Stats(clock=lambda: 0.0)
+        for _ in range(4):
+            stats.record("m", {"tokens": 1000, "cached": 0, "seconds": 10.0, "rate": 100.0},
+                         {"tokens": 100, "seconds": 10.0, "rate": 10.0},
+                         {"task": 1, "seconds": 20.0, "prefill_share_pct": 50.0})
+        data = {"event": "prefill_tick", "rate": 40.0, "to_process": 1000}
+        findings = " ".join(strip_ansi(f) for f in
+                            diagnose(data, stats.snapshot("m"), PLAIN, None,
+                                     {"contention": []}, lambda: "ffmpeg 190%"))
+        self.assertIn("ffmpeg 190%", findings)
+
+
 class TestSystemLine(unittest.TestCase):
 
     def test_no_cpu_or_gpu_percentages_anywhere(self):
