@@ -336,6 +336,37 @@ class TestUpgradeKeyRequiresConfirmation(unittest.TestCase):
         self.assertFalse(state.upgrade_requested)
         self.assertEqual(state.view, "live")
 
+    def test_opening_the_pane_does_not_itself_touch_the_disk(self):
+        """The transition stays pure: no subprocess, no PATH scan, no checkout.
+
+        Resolution is the loop's job, so every transition in UIState remains
+        testable without a terminal or a git repository underneath it.
+        """
+        state = UIState()
+        handle_key(state, "u", [], update="999.0.0")
+        self.assertIsNone(state.upgrade_plan)
+
+    def test_the_plan_is_dropped_when_the_pane_closes(self):
+        """Otherwise a pane reopened an hour later would show a plan worked out
+        against a tree that has since changed underneath it."""
+        for key in ("ESC", "n", "u"):
+            state = UIState()
+            handle_key(state, "u", [], update="999.0.0")
+            state.upgrade_plan = (["git", "pull"], None)
+            handle_key(state, key, [], update="999.0.0")
+            self.assertIsNone(state.upgrade_plan, key)
+
+    def test_the_pane_renders_from_the_cached_plan(self):
+        """The render must not go and work it out again: render_upgrade_confirm
+        falls back to upgrade_plan() when handed None, and that fallback is
+        what was running on every frame."""
+        state = UIState()
+        state.view = "upgrade"
+        state.upgrade_plan = (None, "this checkout has uncommitted changes")
+        blob = "\n".join(compose_frame(
+            {}, "", PLAIN, 80, 24, ui=state, update="999.0.0"))
+        self.assertIn("uncommitted changes", blob)
+
     def test_y_confirms(self):
         state = UIState()
         handle_key(state, "u", [], update="999.0.0")

@@ -1239,12 +1239,16 @@ def detect_slowdown(data, snap):
     return current, typical
 
 
-def diagnose(data, snap, style, codex=None, system=None):
+def diagnose(data, snap, style, codex=None, system=None, busiest=None):
     """Short, plain-English reads on what's happening, worth acting on.
 
     Deliberately terse: this line exists to help someone decide "keep waiting or
     kill it?" in about a second. Raw telemetry belongs on the board, not here.
     Returns at most two findings, most important first.
+
+    `busiest` is the callable that names the biggest CPU consumer. The live loop
+    passes SystemProbe.busiest, which rate-limits it; the default is the raw
+    read, which is fine for one-shot callers but must not be used per frame.
     """
     if not data:
         return []
@@ -1270,10 +1274,10 @@ def diagnose(data, snap, style, codex=None, system=None):
         if not causes:
             # Nothing obvious in memory or model state: name whatever is eating
             # the machine instead. Costs ~46ms, so only once we already know
-            # something is slow.
-            busiest = busiest_process()
-            if busiest:
-                causes = [busiest]
+            # something is slow, and rate-limited by the caller on top of that.
+            worst = (busiest or busiest_process)()
+            if worst:
+                causes = [worst]
         why = (" - " + ", ".join(causes[:2])) if causes else ""
         out.append(style.yellow("! slow: %.0f vs %.0f tok/s usual%s"
                                 % (current, typical, why)))
@@ -1318,12 +1322,13 @@ def diagnose(data, snap, style, codex=None, system=None):
     return out[:2]
 
 
-def render_live_detail(data, snap, style, age=0.0, codex=None, system=None):
+def render_live_detail(data, snap, style, age=0.0, codex=None, system=None,
+                       busiest=None):
     """Second live line: why this is slow, and when the answer will be ready."""
     # One finding per LINE, not joined with spaces. Concatenated, two findings
     # plus a projection ran past 120 columns -- a run-on that both wrapped (and
     # corrupted the frame) and read as a wall of text.
-    lines = list(diagnose(data, snap, style, codex, system))
+    lines = list(diagnose(data, snap, style, codex, system, busiest))
     finish = project_completion(snap or {}, data, age)
     if finish is not None:
         lines.append(style.dim("answer ready ~%s" % fmt_duration(finish)))
@@ -1695,6 +1700,13 @@ class UIState:
         # Set only by an explicit confirmation in the upgrade view. The loop
         # watches it; nothing else in here runs a command.
         self.upgrade_requested = False
+        # Filled in by the loop on the first frame the pane is visible, and
+        # cleared when it closes. Working the plan out shells out to `git
+        # status` and scans PATH, which is not something the render loop can
+        # afford to redo ten times a second. Resolution lives in the loop, not
+        # here: every transition in this class stays testable without a
+        # terminal, a checkout, or a subprocess.
+        self.upgrade_plan = None
 
     def reset_selection(self):
         self.cursor = 0
@@ -1717,6 +1729,7 @@ def handle_key(state, key, models, update=None):
             return True
         if key in ("ESC", "n", "N", "u", "U"):
             state.view = "live"
+            state.upgrade_plan = None   # do not answer tomorrow with today's tree
             return True
         return False
 
@@ -2537,7 +2550,8 @@ def frame_lines(snap, live_text, style, cols, rows, hint=True, help_visible=Fals
 
     if ui is not None and ui.view == "upgrade":
         return with_live([divider("upgrade")]
-                         + render_upgrade_confirm(update, style, cols), "live")
+                         + render_upgrade_confirm(update, style, cols,
+                                                  plan=ui.upgrade_plan), "live")
 
     if help_visible:
         # Help replaces the board but keeps the live line: you should never lose
@@ -2994,6 +3008,7 @@ class SystemProbe:
 
     CHEAP_INTERVAL = 5.0     # swap / memory / load
     MODELS_INTERVAL = 15.0   # `ollama ps` costs ~27ms, so poll it rarely
+    BUSIEST_INTERVAL = 10.0  # `ps -Ao pcpu,comm -r` costs ~46ms
 
     def __init__(self, clock=time.monotonic):
         self._clock = clock
@@ -3003,6 +3018,8 @@ class SystemProbe:
         # staring at the screen wondering why nothing is happening.
         self._cheap_at = float("-inf")
         self._models_at = float("-inf")
+        self._busiest_at = float("-inf")
+        self._busiest = None
         self.swap_used_gb = None
         self.swap_total_gb = None
         self.memory_free_pct = None
@@ -3084,6 +3101,24 @@ class SystemProbe:
                                   timeout=5).stdout
         except (OSError, subprocess.SubprocessError):
             return None
+
+    def busiest(self):
+        """The biggest CPU consumer, at most once every BUSIEST_INTERVAL.
+
+        Deliberately not part of poll(): this is asked for only once a slowdown
+        has already been detected and nothing cheaper explained it, so paying
+        for it on the ordinary path would be pure waste.
+
+        The throttle matters because the caller is the render loop. diagnose()
+        runs from paint() at ~10 fps, so an unthrottled read forked `ps` ten
+        times a second for as long as the slowdown lasted, which is exactly
+        when the machine could least afford it.
+        """
+        now = self._clock()
+        if now - self._busiest_at >= self.BUSIEST_INTERVAL:
+            self._busiest_at = now
+            self._busiest = busiest_process()
+        return self._busiest
 
     def contention(self):
         """Short phrases naming what is competing, most impactful first."""
@@ -3724,6 +3759,12 @@ def follow(args):
         if probe:
             probe.poll()               # self-rate-limited: 5s cheap, 15s models
         if tui:
+            if ui.view == "upgrade" and ui.upgrade_plan is None:
+                # Once per opening of the pane, not once per frame. Deciding
+                # how this copy upgrades runs `git status` in a checkout and
+                # scans PATH otherwise; at 10 fps that stalled the render loop
+                # and backed up keyboard input.
+                ui.upgrade_plan = upgrade_plan()
             cols, rows = screen.size()
             snap = stats.snapshot(tracker.model)
             age = time.time() - live_at
@@ -3735,7 +3776,8 @@ def follow(args):
                 help_visible=(ui.view == "help"),
                 ui=ui, picker=picker_models, compare=compare_lines,
                 live_detail=render_live_detail(live_data, snap, style, age,
-                                              codex_state, system_state),
+                                              codex_state, system_state,
+                                              probe.busiest if probe else None),
                 codex=codex_state, system=system_state,
                 update=update_box.get("latest")), rows, cols)
         else:
