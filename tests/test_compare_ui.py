@@ -113,6 +113,17 @@ class TestTransitions(unittest.TestCase):
         self.press("c", "9")
         self.assertEqual(self.state.cursor, 0)
 
+    def test_a_unicode_digit_that_is_not_a_number_does_not_crash(self):
+        """str.isdigit() is True for superscript two, but int() rejects it.
+
+        It is a dedicated key on French AZERTY, and the reader passes raw
+        decoded bytes straight through, so the ValueError escaped follow() as
+        a traceback with the terminal still in raw mode.
+        """
+        self.press("c")
+        self.assertFalse(handle_key(self.state, "\N{SUPERSCRIPT TWO}", MODELS))
+        self.assertEqual(self.state.cursor, 0)
+
     def test_two_enters_select_a_pair_and_show_the_comparison(self):
         self.press("c", "\r", "DOWN", "\r")
         self.assertEqual(self.state.model_a, MODELS[0]["model"])
