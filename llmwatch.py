@@ -2584,7 +2584,14 @@ def _proxy_server_class():
                 length = 0
             raw = self.rfile.read(length) if length > 0 else b""
 
-            measured = self.command == "POST" and self.path in INSTRUMENTED_PATHS
+            # Before anything else is done with it: the target decides which
+            # host this request goes to, and only a plain rooted path may.
+            path = safe_request_path(self.path)
+            if path is None:
+                self._send_bad_target()
+                return
+
+            measured = self.command == "POST" and path in INSTRUMENTED_PATHS
             model, is_stream = None, False
             if measured:
                 raw, model, is_stream = prepare_body(raw)
@@ -2592,7 +2599,7 @@ def _proxy_server_class():
             headers = {k: v for k, v in self.headers.items()
                        if k.lower() not in HOP_BY_HOP}
             req = urllib.request.Request(
-                self.server.upstream.rstrip("/") + self.path,
+                self.server.upstream.rstrip("/") + path,
                 data=raw if raw else None, headers=headers, method=self.command)
 
             started = time.time()
@@ -2617,6 +2624,21 @@ def _proxy_server_class():
 
             with upstream:
                 self._pump(upstream, measured, is_stream, started)
+
+        def _send_bad_target(self):
+            """Refused before any connection is made, so a rejected target
+            cannot be distinguished from a rejected one by timing either."""
+            body = json.dumps({"error": {
+                "message": "llmwatch: refusing to forward this request target",
+                "type": "invalid_request_error"}}).encode("utf-8")
+            try:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (OSError, BrokenPipeError):
+                pass
 
         def _send_error_response(self, err, measured):
             try:
@@ -2829,6 +2851,31 @@ def _proxy_server_class():
 
     _PROXY_SERVER_CLASS = _ProxyServer
     return _PROXY_SERVER_CLASS
+
+
+def safe_request_path(path):
+    """The request target to forward, or None if it must be refused.
+
+    The upstream URL is built by joining this onto the configured base, so a
+    target that can reach past the first `/` chooses the host instead of the
+    path. `@evil.com/` is the one that matters: joined on, it turns the
+    configured `http://127.0.0.1:8080` into userinfo and sends the request,
+    headers and all, to evil.com. `//evil.com/x` is the protocol-relative
+    spelling of the same trick.
+
+    Refused rather than rewritten. There is no legitimate OpenAI endpoint that
+    needs any of these spellings, so a client sending one is not a client this
+    should be trying to satisfy.
+    """
+    if not path or not path.startswith("/"):
+        return None
+    if path.startswith("//") or path.startswith("/\\"):
+        return None
+    # A backslash is a path separator to enough HTTP stacks that it is not
+    # worth reasoning about which one is on the other end.
+    if "\\" in path:
+        return None
+    return path
 
 
 def valid_upstream(url):

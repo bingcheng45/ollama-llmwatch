@@ -18,7 +18,7 @@ from llmwatch import (  # noqa: E402
     DEFAULT_PROXY_PORT, OaiGenTick, OaiPrefillTick, OaiRequestAborted,
     OaiRequestEnd, OaiRequestStart, Tracker, _sse_events, draft_counts,
     parse_line, parse_listen, prepare_body, read_stream_usage, start_proxy,
-    usage_counts, valid_upstream,
+    safe_request_path, usage_counts, valid_upstream,
 )
 
 
@@ -380,6 +380,51 @@ class TestParseListen(unittest.TestCase):
 
     def test_a_junk_port_falls_back_rather_than_crashing(self):
         self.assertEqual(parse_listen("host:junk"), ("host", DEFAULT_PROXY_PORT))
+
+
+class TestRequestTargetCannotChooseTheHost(unittest.TestCase):
+    """The upstream URL is the configured base joined to the request target,
+    so the target must not be able to reach past the first slash. Caught by
+    CodeQL as py/partial-ssrf before this shipped.
+    """
+
+    def test_ordinary_paths_are_forwarded(self):
+        for path in ("/v1/chat/completions", "/v1/models?limit=1",
+                     "/v1/files/abc@example.com", "/"):
+            self.assertEqual(safe_request_path(path), path)
+
+    def test_userinfo_smuggling_is_refused(self):
+        """`@evil.com/` joined onto `http://127.0.0.1:8080` makes the configured
+        host into userinfo and sends the request to evil.com instead."""
+        self.assertIsNone(safe_request_path("@evil.com/"))
+
+    def test_protocol_relative_and_absolute_targets_are_refused(self):
+        for path in ("//evil.com/x", "http://evil.com/x", "https://evil.com/x",
+                     "/\\evil.com/x", "/v1\\..\\x", "", None):
+            self.assertIsNone(safe_request_path(path), path)
+
+    def test_the_proxy_refuses_it_on_the_wire(self):
+        """End to end: the smuggled target must never reach the upstream, and
+        the client must be told rather than quietly served something else."""
+        import urllib.error
+        import urllib.request
+        upstream = StubUpstream(b'{"ok": true}', stream=False)
+        self.addCleanup(upstream.close)
+        seen = []
+        _, port = start_proxy(("127.0.0.1", 0), upstream.url, seen.append)
+
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/chat/completions" % port,
+            data=b"{}", headers={"Content-Type": "application/json"},
+            method="POST")
+        # Rewrite the request line to the smuggled target, which urllib would
+        # otherwise normalise away before it ever reached the proxy.
+        req.selector = "@evil.com/"
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(upstream.requests, [])
+        self.assertEqual(seen, [])
 
 
 class TestUpstreamScheme(unittest.TestCase):
