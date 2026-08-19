@@ -86,6 +86,23 @@ class TestNoShadowedDefinitions(unittest.TestCase):
         duplicates = [name for name, count in collections.Counter(names).items() if count > 1]
         self.assertEqual(duplicates, [], "shadowed definitions: %s" % duplicates)
 
+    def test_every_top_level_constant_is_assigned_once(self):
+        """The same bug, one node type over, and this guard used to miss it.
+
+        Walking only FunctionDef and ClassDef let a duplicated ARROW_KEYS and
+        ESC_TIMEOUT block sit in the file, byte-identical to the first pair.
+        Harmless only for as long as the two copies agree: edit one and the
+        later assignment silently wins, which is precisely the failure the
+        test above was written to prevent.
+        """
+        import ast
+        import collections
+        tree = ast.parse(read("llmwatch.py"))
+        names = [target.id for node in tree.body if isinstance(node, ast.Assign)
+                 for target in node.targets if isinstance(target, ast.Name)]
+        duplicates = [name for name, count in collections.Counter(names).items() if count > 1]
+        self.assertEqual(duplicates, [], "reassigned constants: %s" % duplicates)
+
     def test_no_unreachable_dead_helpers(self):
         """Anything defined but never referenced is either dead or a bug."""
         import ast

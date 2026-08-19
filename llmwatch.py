@@ -4373,19 +4373,6 @@ def _key_reader(q, stop):
             return
 
 
-
-
-
-
-ARROW_KEYS = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
-# How long to wait for the rest of an escape sequence before deciding a bare Esc
-# was pressed. 50ms proved too tight in practice: the reader thread competes with
-# the render loop for the GIL, so the follow-up bytes of an arrow key could miss
-# the window and arrive as three separate keys - pressing Down closed the menu.
-# 150ms is still imperceptible when actually pressing Esc.
-ESC_TIMEOUT = 0.15
-
-
 def follow(args):
     # `--proxy` with no value yields "", which is still a request to proxy.
     proxying = args.proxy is not None or bool(os.environ.get("LLMWATCH_PROXY"))
