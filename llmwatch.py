@@ -98,6 +98,11 @@ UPDATE_TIMEOUT = 2.0   # a slow network must never delay the first frame
 # need enough history behind them not to be noise.
 TURN_TYPICAL_DAYS = 30
 MIN_TURNS_FOR_TYPICAL = 3
+# Below this, a phase was not measured so much as glimpsed. Rates are divisions
+# by this number, so a window of a millisecond turns a handful of tokens into a
+# five-figure tok/s that then outranks every real sample on the board. A sanity
+# floor, not a claim about how fast a model can be.
+MIN_MEASURABLE_SECONDS = 0.02
 
 # --------------------------------------------------------------------------
 # Events
@@ -143,6 +148,37 @@ MlxPeakMemory = namedtuple("MlxPeakMemory", "ts")
 
 MLX_EVENTS = (MlxRunnerStart, MlxRunnerReady, MlxRequestStart, MlxPrefillTick,
               MlxGenStats, MlxRequestEnd, MlxPeakMemory)
+
+# A server speaking the OpenAI API (mlx_lm.server, LM Studio, llama-server, vLLM)
+# is watched from the outside, by proxying it, because the numbers simply are not
+# in its log: mlx_lm.server prints prefill progress and nothing else -- no
+# generation token count, no rate. `usage` in the response body is the only place
+# a completion size exists, and it arrives last, so every rate here is computed
+# from timestamps the proxy took itself.
+#
+# The exception is OaiPrefillTick, which does come from a log. Prefill on a 28k
+# prompt is minutes of silence on the wire (the first byte is only sent once it
+# finishes), so the progress bar has to come from somewhere else or not exist.
+OaiRequestStart = namedtuple("OaiRequestStart", "model ts")
+OaiPrefillTick = namedtuple("OaiPrefillTick", "processed total ts")
+OaiGenTick = namedtuple("OaiGenTick", "decoded ts")
+# `draft` is (rate, accepted, generated, mean_len) or None, matching what the
+# log backend puts on a Request -- so history, the comparison pane and the
+# drafts-often-rejected hint read one shape whichever backend filled it in.
+# It defaults to None because every other OpenAI server sends no timings block
+# at all, and most llama-server runs have no drafter loaded.
+OaiRequestEnd = namedtuple(
+    "OaiRequestEnd",
+    "prompt_tokens cached_tokens completion_tokens started first_token last_token "
+    "ts draft")
+OaiRequestEnd.__new__.__defaults__ = (None,)
+# The client hung up, or the upstream died, before the response completed. No
+# usage block was ever sent, so there is nothing to time -- but the request has
+# to leave the board rather than sit there open forever.
+OaiRequestAborted = namedtuple("OaiRequestAborted", "ts")
+
+OAI_EVENTS = (OaiRequestStart, OaiPrefillTick, OaiGenTick, OaiRequestEnd,
+              OaiRequestAborted)
 
 # --------------------------------------------------------------------------
 # Layer 1: parsing
@@ -289,6 +325,51 @@ def parse_mlx_line(line):
     return None
 
 
+# ---- standalone mlx_lm.server ---------------------------------------------
+# Ollama's MLX runner (above) and the mlx_lm.server you run yourself share a
+# name and nothing else: this one is plain Python `logging` output, so none of
+# the RE_MLX_* patterns above match it. They are deliberately not loosened to
+# try -- widening a pattern until it catches both dialects is how a parser
+# starts reporting one engine's numbers under the other's name.
+#
+# Only the prefill line is useful. Everything else it prints is either cache
+# bookkeeping or a BaseHTTPServer access line with one-second resolution, which
+# is too coarse to time anything a person is waiting on.
+RE_MLXS_PREFILL = re.compile(r"Prompt processing progress: (\d+)/(\d+)")
+RE_MLXS_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) - ")
+
+
+def parse_mlx_server_timestamp(line):
+    """Epoch seconds from a Python logging prefix, or None.
+
+    Unlike Ollama's UTC line this one is local time with no offset printed, so
+    it is resolved as local -- which is what makes it comparable with the
+    time.time() the proxy stamps its own events with.
+    """
+    m = RE_MLXS_TS.match(line)
+    if not m:
+        return None
+    try:
+        return datetime.datetime.strptime(
+            m.group(1), "%Y-%m-%d %H:%M:%S,%f").timestamp()
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def parse_mlx_server_line(line):
+    """Prefill progress from a standalone mlx_lm.server log, or None.
+
+    Returns an Oai* event, not an Mlx* one: the request it belongs to is owned
+    by the proxy, and routing it to the MLX adapter would attach it to a
+    different slot's request.
+    """
+    m = RE_MLXS_PREFILL.search(line)
+    if m:
+        return OaiPrefillTick(int(m.group(1)), int(m.group(2)),
+                              parse_mlx_server_timestamp(line))
+    return None
+
+
 def parse_line(line):
     """Turn one log line into an Event, or None if it isn't one we care about.
 
@@ -366,15 +447,20 @@ def parse_line(line):
     # model, not of the install, and a single log can hold both across a restart
     # (`gemma3:27b` then `gemma4:26b-mlx`). Sniffing the engine once and locking
     # it in would go blind halfway through the file, so both dialects are simply
-    # always understood and no flag or setting selects between them.
-    return parse_mlx_line(line)
+    # always understood and no flag or setting selects between them. The
+    # standalone mlx_lm.server dialect joins on the same terms.
+    ev = parse_mlx_line(line)
+    if ev is not None:
+        return ev
+    return parse_mlx_server_line(line)
 
 
 def looks_like_timing(line):
     """Did this line look like something we should have parsed? Used by
     --debug-unparsed to surface format drift instead of hiding it."""
     return ("print_timing" in line or "new prompt" in line
-            or "Prompt processing progress" in line or "decode stats" in line)
+            or "Prompt processing progress" in line or "decode stats" in line
+            or "Prompt Cache:" in line)
 
 
 # --------------------------------------------------------------------------
@@ -447,6 +533,10 @@ class Tracker:
     # task id. Slot 0 is what a single-slot llama-server uses too, and the two
     # engines never appear in the same request, so they cannot collide.
     MLX_SLOT = 0
+    # The proxied OpenAI backend gets its own slot. The two adapters cannot run
+    # against the same server, but a stale key from one must never be able to
+    # collide with a live request from the other.
+    OAI_SLOT = 1
 
     def __init__(self):
         self.model = "?"
@@ -456,6 +546,10 @@ class Tracker:
         self._mlx_prefilled = None  # ts prefill finished == generation began
         self._mlx_loading = None     # ts the runner subprocess was spawned
         self._mlx_pending_end = None  # request duration, held until it can close
+        self._oai_task = 0
+        self._oai_started = None    # wall clock the proxy sent the request
+        self._oai_first = None      # wall clock the first token came back
+        self._oai_open = False      # is there a request the log ticks belong to?
 
     def _key(self, ev):
         return (ev.slot, ev.task)
@@ -480,6 +574,9 @@ class Tracker:
 
         if isinstance(ev, MLX_EVENTS):
             return self._feed_mlx(ev)
+
+        if isinstance(ev, OAI_EVENTS):
+            return self._feed_oai(ev)
 
         if isinstance(ev, ModelLoaded):
             self.model = ev.model
@@ -715,6 +812,119 @@ class Tracker:
         if start is None or now is None:
             return 0.0
         return max(0.0, now - start)
+
+    def _feed_oai(self, ev):
+        """Translate one proxied-request event into the llama.cpp events the
+        rest of this class already handles.
+
+        Same contract as _feed_mlx, but the numbers come from a different place:
+        nothing here was printed by the server, so a request that never sent a
+        `usage` block closes with no rate at all rather than an estimate.
+        """
+        if isinstance(ev, OaiRequestStart):
+            outs = []
+            if ev.model and ev.model != self.model:
+                outs.extend(self.feed(ModelLoaded(ev.model)))
+            self._oai_task += 1
+            self._oai_started = ev.ts
+            self._oai_first = None
+            self._oai_open = True
+            outs.extend(self.feed(
+                # The prompt size is in the usage block, which arrives last, so
+                # it is genuinely unknown here. None leaves the field empty
+                # rather than seeding it with a number the ticks would contradict.
+                RequestStart(self.OAI_SLOT, self._oai_task, None, None)))
+            return outs
+
+        if isinstance(ev, OaiPrefillTick):
+            # The log keeps producing these between requests -- another client,
+            # or a warm-up. With no request open they belong to nothing.
+            if not self._oai_open:
+                return []
+            elapsed = self._mlx_elapsed_since(self._oai_started, ev.ts)
+            if elapsed <= 0:
+                return []
+            fraction = (ev.processed / float(ev.total)) if ev.total else 0.0
+            return self.feed(PrefillTick(self.OAI_SLOT, self._oai_task, ev.processed,
+                                         fraction, elapsed, ev.processed / elapsed))
+
+        if isinstance(ev, OaiGenTick):
+            if not self._oai_open:
+                return []
+            if self._oai_first is None:
+                self._oai_first = ev.ts
+            elapsed = self._mlx_elapsed_since(self._oai_first, ev.ts)
+            if elapsed <= 0:
+                return []
+            rate = ev.decoded / elapsed
+            # No 3s window is tracked here; the same rate in both slots keeps the
+            # renderer honest rather than inventing a second series.
+            return self.feed(GenTick(self.OAI_SLOT, self._oai_task, ev.decoded, rate, rate))
+
+        if isinstance(ev, OaiRequestAborted):
+            return self._oai_abandon()
+
+        if isinstance(ev, OaiRequestEnd):
+            if not self._oai_open:
+                return []
+            self._oai_open = False
+            outs = []
+            cached = ev.cached_tokens or 0
+            if cached:
+                outs.extend(self.feed(CacheInfo(self.OAI_SLOT, self._oai_task, cached)))
+
+            prefill_s = self._mlx_elapsed_since(ev.started, ev.first_token)
+            # First token to last, not to the end of the response: the trailing
+            # usage and [DONE] frames are protocol, not generation.
+            gen_s = self._mlx_elapsed_since(ev.first_token, ev.last_token)
+            total_s = self._mlx_elapsed_since(ev.started, ev.ts)
+
+            # usage counts the whole prompt including whatever the cache served.
+            # Only the remainder was actually computed, and dividing by the full
+            # figure would report a prefill rate the machine never achieved.
+            fresh = max(0, (ev.prompt_tokens or 0) - cached)
+            if prefill_s >= MIN_MEASURABLE_SECONDS and fresh > 0:
+                outs.extend(self.feed(PrefillDone(self.OAI_SLOT, self._oai_task,
+                                                  prefill_s * 1000.0, fresh,
+                                                  fresh / prefill_s)))
+            # Same guard as the MLX path: a phase with no duration or no tokens
+            # contributes no rate, because a zero would pass the noise filter and
+            # then drag down `low`, the weighted average and the slowdown median.
+            gen_tokens = ev.completion_tokens or 0
+            if gen_s >= MIN_MEASURABLE_SECONDS and gen_tokens > 0:
+                outs.extend(self.feed(GenDone(self.OAI_SLOT, self._oai_task,
+                                              gen_s * 1000.0, gen_tokens,
+                                              gen_tokens / gen_s)))
+            # Set on the Request rather than passed through RequestEnd, because
+            # that is where the log backend puts it and where _finish reads it
+            # from -- so history and the hints stay backend-agnostic.
+            if ev.draft is not None:
+                req = self.requests.get((self.OAI_SLOT, self._oai_task))
+                if req is not None:
+                    req.draft = ev.draft
+            outs.extend(self.feed(RequestEnd(self.OAI_SLOT, self._oai_task,
+                                             total_s * 1000.0, gen_tokens)))
+            self._oai_started = self._oai_first = None
+            return outs
+
+        return []
+
+    def _oai_abandon(self):
+        """Drop the open proxied request without recording anything.
+
+        A cancelled request has real timings but a truncated token count, and
+        agents cancel constantly -- opencode abandons a stream the moment a tool
+        result makes it stale. Banking those as completed requests would fill the
+        history with short, fast-looking rows that never happened.
+        """
+        self._oai_open = False
+        self._oai_started = self._oai_first = None
+        req = self.requests.pop((self.OAI_SLOT, self._oai_task), None)
+        if req is None:
+            return []
+        return [Output("line", "", {
+            "event": "request_abandoned", "task": req.task,
+            "model": req.model, "prompt_tokens": req.prompt_tokens})]
 
     def _finish(self, ev):
         req = self.requests.pop(self._key(ev), None)
@@ -2128,6 +2338,519 @@ def current_model():
     except (OSError, subprocess.SubprocessError):
         pass
     return "?"
+
+
+# --------------------------------------------------------------------------
+# Layer 4b: the proxy
+#
+# For a server speaking the OpenAI API there is no log worth tailing -- see the
+# Oai* events for why -- so llmwatch stands between the client and the server
+# and reads the numbers off the wire instead.
+#
+# This sits in the middle of somebody's coding loop, which sets the rules:
+#
+#   * bytes are relayed the moment they arrive and never accumulated, because
+#     any buffering here is felt as lag on every token
+#   * every failure path still proxies. A monitor that takes the model down
+#     with it is worse than one that misses a request, so an unreadable chunk
+#     costs a measurement and nothing else
+#   * message content is never read, kept or written. Only `usage`, the model
+#     name and arrival times leave this class -- the same property History
+#     documents about itself
+# --------------------------------------------------------------------------
+
+DEFAULT_UPSTREAM = "http://127.0.0.1:8080"
+DEFAULT_PROXY_PORT = 8081
+LOOPBACK_HOSTS = frozenset(["127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1"])
+
+INSTRUMENTED_PATHS = ("/v1/chat/completions", "/v1/completions")
+
+# Connection-level headers describe one hop and must not be copied onto the
+# next: forwarding an upstream `Transfer-Encoding: chunked` while writing the
+# decoded body back is how a proxy corrupts a response.
+HOP_BY_HOP = frozenset([
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+])
+
+# A prefill on a long prompt is minutes of silence before the first byte, so
+# this cannot be tight. It exists only so a vanished upstream cannot pin a
+# thread forever.
+PROXY_TIMEOUT = 900.0
+# Cap on a non-streaming body held in memory to read its usage block. Past this
+# the response is relayed unmeasured rather than buffered.
+MAX_BUFFERED_BODY = 32 * 1024 * 1024
+
+
+def _sse_events(buffer, chunk):
+    """Split streamed bytes into complete `data:` payloads.
+
+    Returns (leftover, payloads). Incremental by construction: a chunk that
+    ends mid-line leaves the remainder in `leftover` for the next call, so
+    nothing waits on the whole response.
+    """
+    buffer += chunk
+    payloads = []
+    while b"\n" in buffer:
+        line, buffer = buffer.split(b"\n", 1)
+        line = line.strip()
+        if line.startswith(b"data:"):
+            payloads.append(line[5:].strip())
+    return buffer, payloads
+
+
+def draft_counts(timings):
+    """(accepted, generated) drafted tokens from a `timings` block, or None.
+
+    llama-server reports speculative decoding here; every other OpenAI server
+    omits the block entirely. Ordered accepted-first to match what the log
+    backend already hands DraftAcceptance, so there is one convention rather
+    than one per source.
+
+    None means "no measurement", which is not the same as zero: a server with
+    no drafter, a run that drafted nothing, and a garbled block all have no
+    acceptance rate to show, and printing 0% for them would read as a drafter
+    performing terribly rather than as a drafter that was never there.
+    """
+    if not isinstance(timings, dict):
+        return None
+    if "draft_n" not in timings or "draft_n_accepted" not in timings:
+        return None
+    try:
+        generated = int(timings["draft_n"])
+        accepted = int(timings["draft_n_accepted"])
+    except (TypeError, ValueError):
+        return None
+    if generated <= 0 or accepted < 0:
+        return None
+    # Above 1.0 would print as "140% accepted". Whatever produced it, it is not
+    # a measurement.
+    if accepted > generated:
+        return None
+    return (accepted, generated)
+
+
+def read_stream_usage(payload):
+    """Pull what is measurable out of one SSE payload.
+
+    Returns (produced_content, usage_or_None, timings_or_None). Deliberately
+    narrow: the delta is tested for emptiness and thrown away without being
+    stored or returned, so no caller can accidentally end up holding message
+    text.
+    """
+    if not payload or payload == b"[DONE]":
+        return False, None, None
+    try:
+        obj = json.loads(payload)
+    except (ValueError, TypeError):
+        return False, None, None
+    if not isinstance(obj, dict):
+        return False, None, None
+    produced = False
+    choices = obj.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        delta = first.get("delta")
+        if not isinstance(delta, dict):
+            delta = {}
+        # `text` is the /v1/completions spelling of content. tool_calls count
+        # too, and must: a coding agent's turn is frequently nothing but a tool
+        # call, and treating those as producing no output leaves the busiest
+        # half of an agent session invisible.
+        produced = (bool(delta.get("content")) or bool(first.get("text"))
+                    or bool(delta.get("tool_calls")))
+    usage = obj.get("usage")
+    timings = obj.get("timings")
+    return (produced, usage if isinstance(usage, dict) else None,
+            timings if isinstance(timings, dict) else None)
+
+
+def usage_counts(usage):
+    """(prompt, cached, completion) from a usage block, missing fields as 0."""
+    if not isinstance(usage, dict):
+        return (0, 0, 0)
+    details = usage.get("prompt_tokens_details")
+    cached = 0
+    if isinstance(details, dict):
+        try:
+            cached = int(details.get("cached_tokens") or 0)
+        except (TypeError, ValueError):
+            cached = 0
+    def _int(value):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+    return (_int(usage.get("prompt_tokens")), cached,
+            _int(usage.get("completion_tokens")))
+
+
+def prepare_body(raw):
+    """(body_to_forward, model, is_stream) for an instrumented request.
+
+    Streaming responses only carry a usage block when the client asked for one,
+    so llmwatch asks on the client's behalf. mlx_lm.server reads
+    stream_options["include_usage"] with a bare subscript, so a client that
+    sends stream_options without that key crashes the upstream -- normalising
+    the dict here fixes that for free rather than passing the crash through.
+
+    On anything unparseable the body is returned untouched: a request that
+    cannot be measured must still be a request that works.
+    """
+    try:
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return raw, None, False
+    except (ValueError, TypeError):
+        return raw, None, False
+
+    model = short_model_name(obj.get("model"))
+    is_stream = bool(obj.get("stream"))
+    if not is_stream:
+        return raw, model, False
+
+    options = obj.get("stream_options")
+    if not isinstance(options, dict):
+        options = {}
+    if options.get("include_usage") is True:
+        return raw, model, True
+    options = dict(options)
+    options["include_usage"] = True
+    obj = dict(obj)
+    obj["stream_options"] = options
+    try:
+        return json.dumps(obj).encode("utf-8"), model, True
+    except (TypeError, ValueError):
+        return raw, model, True
+
+
+_PROXY_SERVER_CLASS = None
+
+
+def _proxy_server_class():
+    """Build the proxy's server class, importing an HTTP stack only now.
+
+    llmwatch watches a local model and deliberately does not load an HTTP stack
+    to start up -- see TestNoNetworkDependency, and the update check, which
+    imports urllib inside the one function that needs it for the same reason.
+    A proxy cannot avoid the dependency, but it can avoid paying for it in
+    every run that never proxies anything, so the classes are built here, on
+    first use, rather than at import.
+    """
+    global _PROXY_SERVER_CLASS
+    if _PROXY_SERVER_CLASS is not None:
+        return _PROXY_SERVER_CLASS
+
+    import http.server
+    import urllib.error
+    import urllib.request
+
+    class _ProxyHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            """Silence. The base class writes to stderr, which is the terminal the
+            TUI is drawing on."""
+
+        # All verbs go through one path; only POSTs to a completions endpoint are
+        # measured, everything else is a plain relay so `GET /v1/models` and any
+        # endpoint added upstream keep working without llmwatch knowing about them.
+        def do_GET(self):
+            self._relay()
+
+        def do_POST(self):
+            self._relay()
+
+        def do_DELETE(self):
+            self._relay()
+
+        def do_OPTIONS(self):
+            self._relay()
+
+        def _emit(self, ev):
+            try:
+                self.server.emit(ev)
+            except Exception:
+                pass
+
+        def _relay(self):
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+
+            measured = self.command == "POST" and self.path in INSTRUMENTED_PATHS
+            model, is_stream = None, False
+            if measured:
+                raw, model, is_stream = prepare_body(raw)
+
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in HOP_BY_HOP}
+            req = urllib.request.Request(
+                self.server.upstream.rstrip("/") + self.path,
+                data=raw if raw else None, headers=headers, method=self.command)
+
+            started = time.time()
+            if measured:
+                self._emit(OaiRequestStart(model, started))
+            try:
+                upstream = urllib.request.urlopen(req, timeout=PROXY_TIMEOUT)
+            except urllib.error.HTTPError as err:
+                # A real HTTP error is a real answer: pass it through verbatim so
+                # the client sees the server's own message, not llmwatch's.
+                self._send_error_response(err, measured)
+                return
+            except (urllib.error.URLError, OSError, ValueError) as err:
+                if measured:
+                    self._emit(OaiRequestAborted(time.time()))
+                self._send_gateway_error(err)
+                return
+
+            with upstream:
+                self._pump(upstream, measured, is_stream, started)
+
+        def _send_error_response(self, err, measured):
+            try:
+                body = err.read()
+            except Exception:
+                body = b""
+            if measured:
+                self._emit(OaiRequestAborted(time.time()))
+            try:
+                self.send_response(err.code)
+                for key, value in (err.headers or {}).items():
+                    if key.lower() not in HOP_BY_HOP:
+                        self.send_header(key, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (OSError, BrokenPipeError):
+                pass
+
+        def _send_gateway_error(self, err):
+            """The upstream is unreachable. The client gets a clean, immediate
+            error in the shape it already parses, rather than a hang."""
+            body = json.dumps({"error": {
+                "message": "llmwatch: upstream %s unreachable (%s)" % (
+                    self.server.upstream, safe_text(str(err), limit=120)),
+                "type": "upstream_unavailable"}}).encode("utf-8")
+            try:
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (OSError, BrokenPipeError):
+                pass
+
+        def _pump(self, upstream, measured, is_stream, started):
+            """Relay the response, measuring it on the way past if asked."""
+            status = getattr(upstream, "status", None) or upstream.getcode()
+            out_headers = [(k, v) for k, v in upstream.headers.items()
+                           if k.lower() not in HOP_BY_HOP]
+            length = upstream.headers.get("Content-Length")
+
+            # A response with a known length is not a stream; buffering it adds no
+            # latency because the client cannot act on a partial body anyway.
+            if length is not None or not is_stream:
+                self._pump_whole(upstream, status, out_headers, length,
+                                 measured, started)
+                return
+
+            try:
+                self.send_response(status)
+                for key, value in out_headers:
+                    self.send_header(key, value)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+            except (OSError, BrokenPipeError):
+                if measured:
+                    self._emit(OaiRequestAborted(time.time()))
+                return
+
+            buffer = b""
+            decoded, first_token, usage, timings = 0, None, None, None
+            # A rate needs an interval, and an interval needs two arrivals. A
+            # short answer often lands in a single TCP read, where every token
+            # appears to arrive at the same instant -- which divides out to tens
+            # of thousands of tokens per second and, once banked, permanently
+            # poisons `peak` and the token-weighted average.
+            last_token, arrivals = None, 0
+            last_tick = 0.0
+            try:
+                while True:
+                    chunk = upstream.read(4096)
+                    if not chunk:
+                        break
+                    # Relayed before it is inspected: measurement must never be in
+                    # front of the bytes the client is waiting for.
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                    self.wfile.flush()
+                    if not measured:
+                        continue
+                    produced_here = False
+                    try:
+                        buffer, payloads = _sse_events(buffer, chunk)
+                        for payload in payloads:
+                            produced, found, found_timings = read_stream_usage(payload)
+                            if produced:
+                                decoded += 1
+                                produced_here = True
+                            if found:
+                                usage = found
+                            # llama-server fills timings on the final chunk, the
+                            # same one that carries usage. Kept separately so a
+                            # server that sends one without the other still
+                            # yields whichever it did send.
+                            if found_timings:
+                                timings = found_timings
+                    except Exception:
+                        # Format drift costs the numbers for this request, not the
+                        # request itself.
+                        buffer = b""
+                    now = time.time()
+                    if produced_here:
+                        arrivals += 1
+                        if first_token is None:
+                            first_token = now
+                        last_token = now
+                    if measured and decoded and now - last_tick >= 0.25:
+                        last_tick = now
+                        self._emit(OaiGenTick(decoded, now))
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (OSError, BrokenPipeError):
+                # The client hung up or the upstream died mid-stream. Either way the
+                # token count is truncated, so nothing is banked.
+                if measured:
+                    self._emit(OaiRequestAborted(time.time()))
+                return
+
+            if measured:
+                # One arrival is not a measurement of anything, so the window is
+                # withheld and the request is recorded without a generation rate.
+                self._finish_measure(usage, timings, first_token,
+                                     last_token if arrivals >= 2 else None, started)
+
+        def _pump_whole(self, upstream, status, out_headers, length, measured, started):
+            try:
+                declared = int(length) if length is not None else -1
+            except (TypeError, ValueError):
+                declared = -1
+            if declared > MAX_BUFFERED_BODY:
+                measured = False
+
+            try:
+                body = upstream.read()
+            except OSError:
+                if measured:
+                    self._emit(OaiRequestAborted(time.time()))
+                return
+            try:
+                self.send_response(status)
+                for key, value in out_headers:
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+            except (OSError, BrokenPipeError):
+                if measured:
+                    self._emit(OaiRequestAborted(time.time()))
+                return
+
+            if not measured:
+                return
+            usage, timings = None, None
+            try:
+                obj = json.loads(body)
+                if isinstance(obj, dict):
+                    if isinstance(obj.get("usage"), dict):
+                        usage = obj["usage"]
+                    if isinstance(obj.get("timings"), dict):
+                        timings = obj["timings"]
+            except (ValueError, TypeError):
+                usage, timings = None, None
+            # No first-token mark exists for a non-streamed response, so the split
+            # between prefill and generation is genuinely unknown. The request is
+            # still recorded with its duration and token counts; the adapter simply
+            # publishes no rate for it, which beats splitting it on a guess.
+            self._finish_measure(usage, timings, None, None, started)
+
+        def _finish_measure(self, usage, timings, first_token, last_token, started):
+            prompt_tokens, cached, completion = usage_counts(usage)
+            if usage is None:
+                # Without a usage block there is no honest token count. Streamed
+                # deltas were counted, but a delta is not reliably one token, so
+                # they animate the live pane and are not banked as a measurement.
+                self._emit(OaiRequestAborted(time.time()))
+                return
+            # Acceptance is a ratio, not a rate, so it needs no timing window and
+            # survives even the requests whose generation window was withheld.
+            counts = draft_counts(timings)
+            draft = None
+            if counts is not None:
+                accepted, generated = counts
+                # mean accepted-run length is not in the JSON (it needs the
+                # verification-step count, which only the log reports), so the
+                # slot is left empty rather than filled with a derived guess.
+                draft = (accepted / float(generated), accepted, generated, None)
+            self._emit(OaiRequestEnd(prompt_tokens, cached, completion,
+                                     started, first_token, last_token, time.time(),
+                                     draft))
+
+
+    class _ProxyServer(http.server.ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+        def __init__(self, address, upstream, emit):
+            http.server.ThreadingHTTPServer.__init__(self, address, _ProxyHandler)
+            self.upstream = upstream
+            self.emit = emit
+
+        def handle_error(self, request, client_address):
+            """A broken client connection is routine here, not something to dump a
+            traceback about onto the screen the TUI owns."""
+
+    _PROXY_SERVER_CLASS = _ProxyServer
+    return _PROXY_SERVER_CLASS
+
+
+def parse_listen(text, default_port=DEFAULT_PROXY_PORT):
+    """'8081' / '127.0.0.1:8081' / ':8081' -> (host, port)."""
+    text = (text or "").strip()
+    if not text:
+        return ("127.0.0.1", default_port)
+    if ":" in text:
+        host, _, port = text.rpartition(":")
+        host = host or "127.0.0.1"
+    else:
+        # A bare number is a port; a bare word is a host.
+        if text.isdigit():
+            return ("127.0.0.1", int(text))
+        return (text, default_port)
+    try:
+        return (host, int(port))
+    except ValueError:
+        return (host, default_port)
+
+
+def start_proxy(listen, upstream, emit):
+    """Serve until the process exits. Returns the bound (host, port).
+
+    Raises OSError if the port is taken -- which must be fatal rather than
+    silent: a proxy that failed to bind means the client is still talking
+    straight to the server, and llmwatch would sit there showing an idle
+    screen that looks like nothing is happening.
+    """
+    host, port = listen
+    server = _proxy_server_class()((host, port), upstream, emit)
+    thread = threading.Thread(target=server.serve_forever, name="llmwatch-proxy")
+    thread.daemon = True
+    thread.start()
+    return server.server_address[:2]
 
 
 # --------------------------------------------------------------------------
@@ -3595,17 +4318,24 @@ ESC_TIMEOUT = 0.15
 
 
 def follow(args):
+    # `--proxy` with no value yields "", which is still a request to proxy.
+    proxying = args.proxy is not None or bool(os.environ.get("LLMWATCH_PROXY"))
     kind, target = find_log()
-    if not kind:
+    if not kind and not proxying:
         sys.stderr.write(
             "llmwatch: could not find an Ollama log. Tried:\n  " +
             "\n  ".join(candidate_paths()) +
             "\n\nPass one explicitly with --log PATH or set LLMWATCH_LOG.\n"
+            "Watching an OpenAI-compatible server (mlx_lm.server, LM Studio) instead?\n"
+            "Use --proxy, which reads the numbers off the wire rather than from a log.\n"
             "Note: llmwatch needs LOCAL log access; a remote Ollama server won't work.\n")
         return 2
 
     tracker = Tracker()
-    tracker.model = current_model()
+    # `ollama ps` is the wrong question when the server is not Ollama; in proxy
+    # mode the model names itself on the first request instead.
+    if not proxying:
+        tracker.model = current_model()
     style = Style.detect(no_color=args.no_color)
     interactive = sys.stdout.isatty() and not args.json
     # Below ~10 rows the panes cannot be laid out usefully, so fall back to the
@@ -3613,9 +4343,42 @@ def follow(args):
     tui = (interactive and not args.plain
            and shutil.get_terminal_size((80, 24)).lines >= 10)
 
+    q = queue.Queue()
+    stop = threading.Event()
+
+    proxy_at, upstream = None, None
+    if proxying:
+        listen = parse_listen(args.proxy or os.environ.get("LLMWATCH_PROXY"))
+        upstream = (args.upstream or os.environ.get("LLMWATCH_UPSTREAM")
+                    or DEFAULT_UPSTREAM)
+        if listen[0] not in LOOPBACK_HOSTS and not args.proxy_allow_remote:
+            sys.stderr.write(
+                "llmwatch: refusing to listen on %s.\n"
+                "A proxy on a non-loopback address relays whatever it is sent, "
+                "and this one authenticates nobody.\n"
+                "Pass --proxy-allow-remote if that is genuinely what you want.\n"
+                % listen[0])
+            return 2
+        try:
+            proxy_at = start_proxy(listen, upstream, lambda ev: q.put(("event", ev)))
+        except OSError as err:
+            # Fatal on purpose: if the bind failed the client is still talking
+            # straight to the server, and llmwatch would show an idle screen
+            # that reads as "nothing is happening" rather than "not connected".
+            sys.stderr.write(
+                "llmwatch: cannot listen on %s:%s (%s)\n" % (listen[0], listen[1], err))
+            return 2
+
     if not args.json:
-        where = target if kind == "file" else "journalctl -u %s" % target
-        sys.stderr.write("llmwatch %s  watching %s\n" % (__version__, where))
+        if proxy_at:
+            sys.stderr.write("llmwatch %s  proxying http://%s:%d -> %s\n"
+                             % (__version__, proxy_at[0], proxy_at[1], upstream))
+            if kind:
+                where = target if kind == "file" else "journalctl -u %s" % target
+                sys.stderr.write("             prefill progress from %s\n" % where)
+        else:
+            where = target if kind == "file" else "journalctl -u %s" % target
+            sys.stderr.write("llmwatch %s  watching %s\n" % (__version__, where))
 
     # Started before the log is even open, and never waited on. --json is
     # excluded in update_check_disabled()'s caller below: that output is parsed
@@ -3625,13 +4388,16 @@ def follow(args):
     if not args.json:
         start_update_check(update_box)
 
-    proc = subprocess.Popen(tail_command(kind, target), stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True, bufsize=1)
-    q = queue.Queue()
-    stop = threading.Event()
-    thread = threading.Thread(target=_reader, args=(proc, q, stop))
-    thread.daemon = True
-    thread.start()
+    # In proxy mode the log is an optional extra: it supplies the prefill
+    # progress bar and nothing else, so its absence costs an animation rather
+    # than a measurement.
+    proc = None
+    if kind:
+        proc = subprocess.Popen(tail_command(kind, target), stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        thread = threading.Thread(target=_reader, args=(proc, q, stop))
+        thread.daemon = True
+        thread.start()
 
     stats = Stats()
     screen = Screen() if tui else None
@@ -3664,12 +4430,21 @@ def follow(args):
 
     def handle(line):
         """Returns True if this line changed anything worth repainting."""
-        nonlocal live_data, live_at, idle_since
         ev = parse_line(line)
         if ev is None:
             if args.debug_unparsed and looks_like_timing(line):
                 sys.stderr.write("UNPARSED: %s" % line)
             return False
+        return dispatch(ev)
+
+    def dispatch(ev):
+        """Feed one event to the tracker and act on what comes back.
+
+        Split out from handle() because the proxy produces events directly --
+        it never has a log line to parse -- and both sources have to land in
+        exactly the same place or the two backends drift apart.
+        """
+        nonlocal live_data, live_at, idle_since
         changed = False
         for out in tracker.feed(ev):
             data = out.data
@@ -3840,6 +4615,10 @@ def follow(args):
                     if ui.view == "compare" and was != "compare":
                         compare_lines = build_compare(history, ui.model_a, ui.model_b, style)
                     continue
+                if kind_ == "event":
+                    if dispatch(payload):
+                        got_data = True
+                    continue
                 if payload is None:
                     raise KeyboardInterrupt
                 if handle(payload):
@@ -3864,7 +4643,8 @@ def follow(args):
         pass
     finally:
         stop.set()
-        proc.terminate()
+        if proc:
+            proc.terminate()
         if history:
             history.close()
         if keyboard:
@@ -4036,7 +4816,18 @@ def main(argv=None):
                         help="summarise the most recent completed request and exit")
     parser.add_argument("--json", action="store_true",
                         help="emit one JSON object per event (for status bars/scripts)")
-    parser.add_argument("--log", metavar="PATH", help="path to the Ollama log")
+    parser.add_argument("--log", metavar="PATH",
+                        help="path to the Ollama log (or an mlx_lm.server log, "
+                             "which adds prefill progress under --proxy)")
+    parser.add_argument("--proxy", nargs="?", const="", metavar="[HOST:]PORT",
+                        help="watch an OpenAI-compatible server (mlx_lm.server, "
+                             "LM Studio, llama-server, vLLM) by proxying it. "
+                             "Point your client at this address instead. "
+                             "Default 127.0.0.1:%d" % DEFAULT_PROXY_PORT)
+    parser.add_argument("--upstream", metavar="URL",
+                        help="server --proxy forwards to (default %s)" % DEFAULT_UPSTREAM)
+    parser.add_argument("--proxy-allow-remote", action="store_true",
+                        help="permit --proxy to bind a non-loopback address")
     parser.add_argument("--history", action="store_true",
                         help="per-model summary from your recorded history")
     parser.add_argument("--compare", nargs=2, metavar=("MODEL_A", "MODEL_B"),

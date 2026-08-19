@@ -388,9 +388,31 @@ Codex-specific part is the optional `--codex` pane.
 
 ### Does it work with LM Studio, llama.cpp directly, or vLLM?
 
-Not yet - the parser targets the two engines Ollama bundles, `llama-server` and the MLX runner.
-llama.cpp's own server uses a similar format to the first, so support is plausible. Open an
-issue if you'd use it.
+Yes, via `--proxy`. llmwatch stands between your client and the server and reads the numbers
+off the wire, so any server speaking the OpenAI API is watchable without a log to tail:
+
+```bash
+llmwatch --proxy                      # listens on 127.0.0.1:8081
+llmwatch --proxy 9000 --upstream http://127.0.0.1:1234
+```
+
+Then point your client at the proxy instead of the server. The default upstream is
+`http://127.0.0.1:8080`, which is already where `llama-server` listens.
+
+A standalone `llama-server` can also be watched the older way, by pointing `--log` at its
+output, which adds the per-slot detail the wire does not carry.
+
+### Does it show speculative decoding (MTP, EAGLE, DFlash)?
+
+Yes, on both paths, and it is the number worth watching: a drafter whose tokens are mostly
+rejected makes generation *slower* than the base build, and acceptance is the only way to see
+that. `--log` reads llama.cpp's `draft acceptance` line; `--proxy` reads `draft_n` and
+`draft_n_accepted` from the `timings` block llama-server sends beside `usage`. Either way it
+lands in the same place: the `drafts` figure on the board, the `draft_rate` column in your
+history, and a warning when acceptance drops far enough that the drafter is costing you time.
+
+Acceptance appears only while a drafter is loaded. Servers running without one, and every
+OpenAI server that is not llama.cpp, simply show no draft figure rather than a zero.
 
 ### Linux? Windows?
 

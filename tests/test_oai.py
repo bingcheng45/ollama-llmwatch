@@ -1,0 +1,657 @@
+"""Tests for the OpenAI-compatible backend (--proxy).
+
+Three things here are easy to get wrong and expensive to ship wrong: a proxy
+that breaks the request it is measuring, a rate computed from a token count
+that was never actually reported, and message content leaking out of a class
+that promises to only ever read `usage`.
+"""
+
+import json
+import os
+import sys
+import threading
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from llmwatch import (  # noqa: E402
+    DEFAULT_PROXY_PORT, OaiGenTick, OaiPrefillTick, OaiRequestAborted,
+    OaiRequestEnd, OaiRequestStart, Tracker, _sse_events, draft_counts,
+    parse_line, parse_listen, prepare_body, read_stream_usage, start_proxy,
+    usage_counts,
+)
+
+
+def chunk(**payload):
+    return b"data: " + json.dumps(payload).encode() + b"\n\n"
+
+
+def delta(text):
+    return chunk(choices=[{"delta": {"content": text}}])
+
+
+USAGE_CHUNK = chunk(choices=[], usage={
+    "prompt_tokens": 1000, "completion_tokens": 200,
+    "prompt_tokens_details": {"cached_tokens": 400}})
+
+# llama-server adds its own `timings` block beside `usage`, and populates
+# draft_n/draft_n_accepted only while a speculative drafter (DFlash, EAGLE,
+# MTP) is loaded. Same shape whichever drafter produced it.
+SPEC_USAGE_CHUNK = chunk(choices=[], usage={
+    "prompt_tokens": 1000, "completion_tokens": 200,
+    "prompt_tokens_details": {"cached_tokens": 400}},
+    timings={"predicted_per_second": 41.5, "draft_n": 350,
+             "draft_n_accepted": 260})
+
+
+class TestPrepareBody(unittest.TestCase):
+    """The request is rewritten on its way past, so this is the one place that
+    can break somebody's coding session outright."""
+
+    def test_streaming_request_asks_for_usage(self):
+        raw, _, is_stream = prepare_body(json.dumps(
+            {"model": "m", "stream": True}).encode())
+        self.assertTrue(is_stream)
+        self.assertTrue(json.loads(raw)["stream_options"]["include_usage"])
+
+    def test_stream_options_without_include_usage_is_normalised(self):
+        """mlx_lm.server reads stream_options["include_usage"] with a bare
+        subscript, so forwarding this verbatim takes the upstream down."""
+        raw, _, _ = prepare_body(json.dumps(
+            {"model": "m", "stream": True,
+             "stream_options": {"something_else": 1}}).encode())
+        options = json.loads(raw)["stream_options"]
+        self.assertTrue(options["include_usage"])
+        self.assertEqual(options["something_else"], 1)
+
+    def test_a_client_that_already_asked_is_left_alone(self):
+        original = json.dumps({"model": "m", "stream": True,
+                               "stream_options": {"include_usage": True}}).encode()
+        raw, _, _ = prepare_body(original)
+        self.assertEqual(raw, original)
+
+    def test_non_streaming_body_is_untouched(self):
+        original = json.dumps({"model": "m"}).encode()
+        raw, model, is_stream = prepare_body(original)
+        self.assertEqual(raw, original)
+        self.assertFalse(is_stream)
+        self.assertEqual(model, "m")
+
+    def test_model_name_is_shortened_like_every_other_source(self):
+        _, model, _ = prepare_body(json.dumps(
+            {"model": "/Users/me/models/mlx/qwen3.8-27b-4bit"}).encode())
+        self.assertEqual(model, "qwen3.8-27b-4bit")
+
+    def test_unparseable_body_is_forwarded_verbatim(self):
+        """A request llmwatch cannot read is still a request that must work."""
+        raw, model, is_stream = prepare_body(b"not json at all")
+        self.assertEqual(raw, b"not json at all")
+        self.assertIsNone(model)
+        self.assertFalse(is_stream)
+
+    def test_a_json_array_body_is_not_treated_as_a_request(self):
+        raw, model, _ = prepare_body(b"[1,2,3]")
+        self.assertEqual(raw, b"[1,2,3]")
+        self.assertIsNone(model)
+
+
+class TestStreamReading(unittest.TestCase):
+
+    def test_events_split_across_a_chunk_boundary(self):
+        """Nothing may wait for a whole response, so a payload cut in half by
+        the network has to survive being reassembled."""
+        buffer, payloads = _sse_events(b"", b'data: {"a":')
+        self.assertEqual(payloads, [])
+        buffer, payloads = _sse_events(buffer, b'1}\n')
+        self.assertEqual(payloads, [b'{"a":1}'])
+
+    def test_content_delta_counts_but_is_not_returned(self):
+        produced, usage, _ = read_stream_usage(
+            json.dumps({"choices": [{"delta": {"content": "hello"}}]}).encode())
+        self.assertTrue(produced)
+        self.assertIsNone(usage)
+
+    def test_completions_style_text_also_counts(self):
+        produced, _, _ = read_stream_usage(
+            json.dumps({"choices": [{"text": "hi"}]}).encode())
+        self.assertTrue(produced)
+
+    def test_a_tool_call_delta_counts_as_output(self):
+        """A coding agent's turn is often nothing but a tool call. Treating
+        those as producing no output left half of a real opencode session
+        recorded with no tokens and no rates at all."""
+        produced, _, _ = read_stream_usage(json.dumps({"choices": [{"delta": {
+            "tool_calls": [{"index": 0, "function": {"name": "write"}}]}}]}).encode())
+        self.assertTrue(produced)
+
+    def test_empty_delta_does_not_count_as_a_token(self):
+        """The role-only opening chunk carries no content and must not be timed
+        as the first token."""
+        produced, _, _ = read_stream_usage(
+            json.dumps({"choices": [{"delta": {"role": "assistant"}}]}).encode())
+        self.assertFalse(produced)
+
+    def test_done_and_malformed_payloads_are_ignored(self):
+        for payload in (b"[DONE]", b"", b"{oh dear", b"null", b"[]"):
+            produced, usage, _ = read_stream_usage(payload)
+            self.assertFalse(produced, payload)
+            self.assertIsNone(usage, payload)
+
+    def test_usage_is_picked_up(self):
+        _, usage, _ = read_stream_usage(USAGE_CHUNK[6:].strip())
+        self.assertEqual(usage_counts(usage), (1000, 400, 200))
+
+    def test_usage_counts_survive_missing_and_junk_fields(self):
+        self.assertEqual(usage_counts(None), (0, 0, 0))
+        self.assertEqual(usage_counts({}), (0, 0, 0))
+        self.assertEqual(usage_counts({"prompt_tokens": "x"}), (0, 0, 0))
+        self.assertEqual(
+            usage_counts({"prompt_tokens": 5, "prompt_tokens_details": "junk"}),
+            (5, 0, 0))
+
+
+class TestSpeculativeDraftStats(unittest.TestCase):
+    """Acceptance rate is the number that decides whether a drafter is worth
+    running at all: below roughly half, verification costs more than the
+    accepted tokens save, and the base build is faster. The log backend has
+    reported it since the -mtp builds; over the wire it arrives in
+    llama-server's `timings` block instead.
+    """
+
+    def test_counts_come_back_accepted_first(self):
+        """Ordered like the log backend's (accepted, generated), not like the
+        JSON's (draft_n, draft_n_accepted) -- one caller, one convention."""
+        self.assertEqual(
+            draft_counts({"draft_n": 350, "draft_n_accepted": 260}), (260, 350))
+
+    def test_absent_when_nothing_was_drafted(self):
+        """A server with no drafter omits both keys, and a run that drafted
+        nothing has no ratio to report. Neither is a zero-percent acceptance."""
+        self.assertIsNone(draft_counts({"predicted_per_second": 12.0}))
+        self.assertIsNone(draft_counts({"draft_n": 0, "draft_n_accepted": 0}))
+
+    def test_survives_missing_and_junk_fields(self):
+        for timings in (None, "junk", {}, {"draft_n": "x", "draft_n_accepted": 1},
+                        {"draft_n": 10}):
+            self.assertIsNone(draft_counts(timings), timings)
+
+    def test_more_accepted_than_drafted_is_rejected(self):
+        """A ratio above 1.0 would print as '140% accepted'. Whatever produced
+        it, it is not a measurement."""
+        self.assertIsNone(draft_counts({"draft_n": 10, "draft_n_accepted": 14}))
+
+    def test_timings_are_read_off_a_stream_payload(self):
+        _, _, timings = read_stream_usage(SPEC_USAGE_CHUNK[6:].strip())
+        self.assertEqual(draft_counts(timings), (260, 350))
+
+    def test_a_response_without_timings_reports_no_draft(self):
+        _, _, timings = read_stream_usage(USAGE_CHUNK[6:].strip())
+        self.assertIsNone(timings)
+
+    def test_the_tracker_publishes_acceptance_on_request_end(self):
+        """Downstream (history's draft_rate column, the drafts-often-rejected
+        hint) reads `draft` off request_end and does not care which backend
+        filled it in."""
+        t = Tracker()
+        t.feed(OaiRequestStart("qwen3.8-27b", 100.0))
+        outs = t.feed(OaiRequestEnd(1000, 0, 200, 100.0, 110.0, 120.0, 121.0,
+                                    (260 / 350.0, 260, 350, None)))
+        end = {o.data.get("event"): o.data for o in outs}["request_end"]
+        rate, accepted, generated, _mean = end["draft"]
+        self.assertEqual((accepted, generated), (260, 350))
+        self.assertAlmostEqual(rate, 260 / 350.0)
+
+    def test_draft_defaults_to_none_for_servers_that_send_no_timings(self):
+        """Every other OpenAI server (mlx_lm.server, LM Studio, vLLM) sends no
+        timings at all, and must keep working with the field absent."""
+        t = Tracker()
+        t.feed(OaiRequestStart("some-model", 100.0))
+        outs = t.feed(OaiRequestEnd(1000, 0, 200, 100.0, 110.0, 120.0, 121.0))
+        end = {o.data.get("event"): o.data for o in outs}["request_end"]
+        self.assertIsNone(end["draft"])
+
+
+class TestTrackerAdapter(unittest.TestCase):
+    """The adapter turns proxy events into the same shape every other backend
+    produces, so the rest of the program never learns a second dialect."""
+
+    def events(self, outs):
+        return [o.data.get("event") for o in outs]
+
+    def by_event(self, outs):
+        return {o.data.get("event"): o.data for o in outs}
+
+    def test_a_whole_request(self):
+        t = Tracker()
+        t.feed(OaiRequestStart("qwen3.8-27b-4bit", 100.0))
+        outs = t.feed(OaiRequestEnd(1000, 0, 200, 100.0, 110.0, 120.0, 121.0))
+        data = self.by_event(outs)
+        self.assertEqual(data["prefill_done"]["tokens"], 1000)
+        self.assertAlmostEqual(data["prefill_done"]["rate"], 100.0)
+        self.assertEqual(data["generate_done"]["tokens"], 200)
+        # 200 tokens over first-token..last-token, not over the whole request:
+        # the trailing usage and [DONE] frames are protocol, not generation.
+        self.assertAlmostEqual(data["generate_done"]["rate"], 20.0)
+        self.assertAlmostEqual(data["generate_done"]["seconds"], 10.0)
+        self.assertAlmostEqual(data["request_end"]["seconds"], 21.0)
+
+    def test_cached_tokens_do_not_inflate_the_prefill_rate(self):
+        """usage counts the whole prompt, cache included. Dividing by that
+        would report a speed the machine never reached."""
+        t = Tracker()
+        t.feed(OaiRequestStart("m", 0.0))
+        outs = t.feed(OaiRequestEnd(1000, 900, 10, 0.0, 1.0, 2.0, 2.0))
+        data = self.by_event(outs)
+        self.assertEqual(data["prefill_done"]["tokens"], 100)
+        self.assertAlmostEqual(data["prefill_done"]["rate"], 100.0)
+        self.assertEqual(data["prefill_done"]["cached"], 900)
+
+    def test_a_fully_cached_prompt_reports_no_prefill_rate(self):
+        t = Tracker()
+        t.feed(OaiRequestStart("m", 0.0))
+        outs = t.feed(OaiRequestEnd(500, 500, 10, 0.0, 1.0, 2.0, 2.0))
+        self.assertNotIn("prefill_done", self.events(outs))
+        self.assertIn("request_end", self.events(outs))
+
+    def test_a_phase_with_no_duration_contributes_no_rate(self):
+        """A zero would pass the small-request noise guard and then drag down
+        `low`, the weighted average, and the median slowdown reads."""
+        t = Tracker()
+        t.feed(OaiRequestStart("m", 5.0))
+        outs = t.feed(OaiRequestEnd(100, 0, 10, 5.0, 5.0, 5.0, 5.0))
+        self.assertEqual(self.events(outs), ["request_end"])
+
+    def test_a_generation_too_short_to_time_reports_no_rate(self):
+        """Observed for real: 8 tokens arriving in one TCP read produced a
+        window of 0.0002s and a rate of 38,260 tok/s, which would have outranked
+        every genuine sample on the board for as long as the history survived."""
+        t = Tracker()
+        t.feed(OaiRequestStart("m", 0.0))
+        outs = t.feed(OaiRequestEnd(100, 0, 8, 0.0, 5.0, 5.0002, 5.001))
+        self.assertNotIn("generate_done", self.events(outs))
+        self.assertIn("request_end", self.events(outs))
+
+    def test_a_single_arrival_is_not_a_measurement(self):
+        """The proxy withholds last_token when it only ever saw one arrival,
+        because a rate needs an interval and one instant is not one."""
+        t = Tracker()
+        t.feed(OaiRequestStart("m", 0.0))
+        outs = t.feed(OaiRequestEnd(100, 0, 8, 0.0, 5.0, None, 6.0))
+        self.assertNotIn("generate_done", self.events(outs))
+
+    def test_a_non_streamed_response_records_no_rates(self):
+        """With no first-token mark the prefill/generation split is unknown,
+        and a guess would be indistinguishable on screen from a measurement."""
+        t = Tracker()
+        t.feed(OaiRequestStart("m", 0.0))
+        outs = t.feed(OaiRequestEnd(100, 0, 50, 0.0, None, None, 10.0))
+        self.assertEqual(self.events(outs), ["request_end"])
+        self.assertAlmostEqual(self.by_event(outs)["request_end"]["seconds"], 10.0)
+
+    def test_prefill_ticks_animate_the_live_pane(self):
+        t = Tracker()
+        t.feed(OaiRequestStart("m", 0.0))
+        outs = t.feed(OaiPrefillTick(5000, 28192, 10.0))
+        self.assertEqual(outs[0].kind, "live")
+        self.assertAlmostEqual(outs[0].data["rate"], 500.0)
+        self.assertEqual(outs[0].data["to_process"], 28192)
+
+    def test_log_ticks_with_no_open_request_belong_to_nothing(self):
+        """The log keeps producing these between requests -- another client, or
+        a warm-up -- and they must not open a phantom request."""
+        t = Tracker()
+        self.assertEqual(t.feed(OaiPrefillTick(10, 100, 1.0)), [])
+        self.assertEqual(t.feed(OaiGenTick(5, 1.0)), [])
+
+    def test_generate_ticks_report_a_live_rate(self):
+        t = Tracker()
+        t.feed(OaiRequestStart("m", 0.0))
+        t.feed(OaiGenTick(1, 10.0))
+        outs = t.feed(OaiGenTick(21, 12.0))
+        self.assertAlmostEqual(outs[0].data["rate"], 10.5)
+
+    def test_an_aborted_request_banks_nothing(self):
+        """Agents cancel constantly. Recording a truncated stream as a finished
+        request would fill the history with fast-looking rows that never were."""
+        t = Tracker()
+        t.feed(OaiRequestStart("m", 0.0))
+        outs = t.feed(OaiRequestAborted(5.0))
+        self.assertEqual(self.events(outs), ["request_abandoned"])
+        self.assertEqual(t.feed(OaiRequestEnd(1, 0, 1, 0.0, 1.0, 2.0, 2.0)), [])
+
+    def test_a_new_request_closes_a_stale_one(self):
+        t = Tracker()
+        t.feed(OaiRequestStart("m", 0.0))
+        outs = t.feed(OaiRequestStart("m", 10.0))
+        self.assertIn("request_abandoned", self.events(outs))
+        self.assertIn("request_start", self.events(outs))
+
+    def test_the_model_names_itself_on_the_first_request(self):
+        t = Tracker()
+        outs = t.feed(OaiRequestStart("qwen3.8-27b-4bit", 0.0))
+        self.assertIn("model_loaded", self.events(outs))
+        self.assertEqual(t.model, "qwen3.8-27b-4bit")
+
+    def test_the_two_backends_cannot_collide(self):
+        self.assertNotEqual(Tracker.MLX_SLOT, Tracker.OAI_SLOT)
+
+
+class TestStandaloneMlxServerLog(unittest.TestCase):
+    """mlx_lm.server's log is plain Python logging, sharing nothing with the
+    Ollama MLX-runner dialect but the words in one message."""
+
+    def test_prefill_progress_is_parsed(self):
+        ev = parse_line(
+            "2026-08-19 14:46:31,875 - INFO - Prompt processing progress: 5000/28192")
+        self.assertIsInstance(ev, OaiPrefillTick)
+        self.assertEqual((ev.processed, ev.total), (5000, 28192))
+        self.assertIsNotNone(ev.ts)
+
+    def test_the_ollama_dialect_still_wins_its_own_lines(self):
+        """Both dialects are always understood, and neither may swallow the
+        other's lines."""
+        ev = parse_line(
+            'time=2026-08-19T14:46:31.875Z level=INFO '
+            'msg="Prompt processing progress" processed=100 total=200')
+        self.assertEqual(type(ev).__name__, "MlxPrefillTick")
+
+    def test_other_lines_are_not_events(self):
+        for line in ("2026-08-19 14:46:48,894 - INFO - Prompt Cache: 3 sequences, 0.48 GB",
+                     ('127.0.0.1 - - [19/Aug/2026 14:46:48] '
+                      '"POST /v1/chat/completions HTTP/1.1" 200 -'),
+                     "2026-08-19 14:46:25,881 - INFO - Starting httpd at 127.0.0.1 on port 8080..."):
+            self.assertIsNone(parse_line(line), line)
+
+    def test_a_timestamp_that_will_not_parse_costs_the_tick_not_the_run(self):
+        ev = parse_line("garbled - INFO - Prompt processing progress: 1/2")
+        self.assertIsInstance(ev, OaiPrefillTick)
+        self.assertIsNone(ev.ts)
+
+
+class TestParseListen(unittest.TestCase):
+
+    def test_forms(self):
+        self.assertEqual(parse_listen(""), ("127.0.0.1", DEFAULT_PROXY_PORT))
+        self.assertEqual(parse_listen(None), ("127.0.0.1", DEFAULT_PROXY_PORT))
+        self.assertEqual(parse_listen("9000"), ("127.0.0.1", 9000))
+        self.assertEqual(parse_listen(":9000"), ("127.0.0.1", 9000))
+        self.assertEqual(parse_listen("0.0.0.0:9000"), ("0.0.0.0", 9000))
+        self.assertEqual(parse_listen("example"), ("example", DEFAULT_PROXY_PORT))
+
+    def test_a_junk_port_falls_back_rather_than_crashing(self):
+        self.assertEqual(parse_listen("host:junk"), ("host", DEFAULT_PROXY_PORT))
+
+
+class StubUpstream:
+    """A minimal OpenAI-shaped server, so the proxy is tested against a socket
+    rather than against a mock of one."""
+
+    def __init__(self, body, stream=True, status=200):
+        import http.server
+
+        self.requests = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                outer.requests.append(self.rfile.read(length))
+                self.send_response(status)
+                if stream:
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    for part in body:
+                        self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
+                        self.wfile.flush()
+                    self.wfile.write(b"0\r\n\r\n")
+                else:
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+
+    @property
+    def url(self):
+        return "http://127.0.0.1:%d" % self.server.server_address[1]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestProxyEndToEnd(unittest.TestCase):
+    """Through a real socket, because the failure this feature cannot have is
+    'llmwatch broke the model', and that only shows up on the wire."""
+
+    def post(self, port, payload, path="/v1/chat/completions"):
+        import urllib.request
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (port, path),
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.read()
+
+    def run_proxy(self, upstream_url):
+        """Returns (seen, port, finished).
+
+        `finished` matters: the proxy relays the last byte before it records
+        anything, precisely so measurement never delays the client -- which
+        means a test that reads `seen` the instant its request returns is
+        racing the thread that fills it.
+        """
+        seen = []
+        finished = threading.Event()
+        terminal = ("OaiRequestEnd", "OaiRequestAborted")
+
+        def emit(ev):
+            seen.append(ev)
+            if type(ev).__name__ in terminal:
+                finished.set()
+
+        _, port = start_proxy(("127.0.0.1", 0), upstream_url, emit)
+        return seen, port, finished
+
+    def test_a_streamed_response_is_relayed_and_measured(self):
+        upstream = StubUpstream([delta("a"), delta("b"), USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+
+        status, body = self.post(port, {"model": "m", "stream": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(finished.wait(10))
+        # The client must receive every byte the upstream sent.
+        self.assertIn(b"[DONE]", body)
+        self.assertIn(b'"content": "a"', body)
+
+        kinds = [type(e).__name__ for e in seen]
+        self.assertEqual(kinds[0], "OaiRequestStart")
+        self.assertEqual(kinds[-1], "OaiRequestEnd")
+        end = seen[-1]
+        self.assertEqual(end.prompt_tokens, 1000)
+        self.assertEqual(end.cached_tokens, 400)
+        self.assertEqual(end.completion_tokens, 200)
+        self.assertIsNotNone(end.first_token)
+
+    def test_the_upstream_is_asked_for_usage_on_the_clients_behalf(self):
+        upstream = StubUpstream([USAGE_CHUNK])
+        self.addCleanup(upstream.close)
+        _, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        self.assertTrue(json.loads(upstream.requests[0])
+                        ["stream_options"]["include_usage"])
+
+    def test_draft_acceptance_survives_the_round_trip(self):
+        """End to end against a socket: a llama-server running DFlash/MTP puts
+        draft counts in `timings`, and they have to reach the event that the
+        history and the hints read."""
+        upstream = StubUpstream(
+            [delta("a"), delta("b"), SPEC_USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        end = seen[-1]
+        self.assertEqual(type(end).__name__, "OaiRequestEnd")
+        rate, accepted, generated, _mean = end.draft
+        self.assertEqual((accepted, generated), (260, 350))
+        self.assertAlmostEqual(rate, 260 / 350.0)
+
+    def test_a_non_streamed_response_also_carries_draft_counts(self):
+        """The whole-body path parses its own JSON and would otherwise be the
+        one place acceptance silently vanished."""
+        body = json.dumps({
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            "timings": {"draft_n": 20, "draft_n_accepted": 15}}).encode()
+        upstream = StubUpstream(body, stream=False)
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m"})
+        self.assertTrue(finished.wait(10))
+        end = seen[-1]
+        self.assertEqual(type(end).__name__, "OaiRequestEnd")
+        self.assertEqual(end.draft[1:3], (15, 20))
+
+    def test_a_server_without_timings_still_measures_cleanly(self):
+        """The regression that matters for everyone not running a drafter."""
+        upstream = StubUpstream([delta("a"), USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        end = seen[-1]
+        self.assertEqual(end.completion_tokens, 200)
+        self.assertIsNone(end.draft)
+
+    def test_a_tool_call_only_turn_is_still_measured(self):
+        """Through the proxy, end to end: opencode's tool-calling turns must
+        arrive with a first-token mark and real token counts."""
+        tool = chunk(choices=[{"delta": {
+            "tool_calls": [{"index": 0, "function": {"name": "write"}}]}}])
+        upstream = StubUpstream([tool, tool, USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        end = seen[-1]
+        self.assertEqual(type(end).__name__, "OaiRequestEnd")
+        self.assertIsNotNone(end.first_token)
+        self.assertEqual(end.completion_tokens, 200)
+
+    def test_a_response_with_no_usage_is_not_banked(self):
+        """Streamed deltas were counted, but a delta is not reliably one token,
+        so they animate the screen and never become a measurement."""
+        upstream = StubUpstream([delta("a"), b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        self.assertEqual(type(seen[-1]).__name__, "OaiRequestAborted")
+
+    def test_a_non_streamed_response_is_relayed_and_measured(self):
+        payload = json.dumps({"choices": [{"message": {"content": "hi"}}],
+                              "usage": {"prompt_tokens": 7, "completion_tokens": 3}})
+        upstream = StubUpstream(payload.encode(), stream=False)
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        status, body = self.post(port, {"model": "m"})
+        self.assertEqual(status, 200)
+        self.assertTrue(finished.wait(10))
+        self.assertEqual(json.loads(body)["usage"]["prompt_tokens"], 7)
+        self.assertEqual(seen[-1].completion_tokens, 3)
+        self.assertIsNone(seen[-1].first_token)
+
+    def test_an_uninstrumented_path_is_relayed_without_events(self):
+        upstream = StubUpstream(b'{"data": []}', stream=False)
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        status, body = self.post(port, {}, path="/v1/embeddings")
+        # Nothing terminal should ever arrive for a path that is not measured.
+        self.assertFalse(finished.wait(0.5))
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"data": []}')
+        self.assertEqual(seen, [])
+
+    def test_a_dead_upstream_answers_immediately_instead_of_hanging(self):
+        """The client is in somebody's editor. It gets an error it can parse,
+        not a socket that never closes."""
+        import urllib.error
+        seen, port, finished = self.run_proxy("http://127.0.0.1:1")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        self.assertEqual(caught.exception.code, 502)
+        body = json.loads(caught.exception.read())
+        self.assertEqual(body["error"]["type"], "upstream_unavailable")
+        self.assertEqual(type(seen[-1]).__name__, "OaiRequestAborted")
+
+    def test_an_upstream_error_reaches_the_client_unchanged(self):
+        upstream = StubUpstream(b'{"error": "model not found"}', stream=False,
+                                status=404)
+        self.addCleanup(upstream.close)
+        import urllib.error
+        seen, port, finished = self.run_proxy(upstream.url)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.post(port, {"model": "m"})
+        self.assertTrue(finished.wait(10))
+        self.assertEqual(caught.exception.code, 404)
+        self.assertEqual(json.loads(caught.exception.read())["error"],
+                         "model not found")
+        # A rejected request produced no tokens, so it is dropped rather than
+        # banked as a very fast one.
+        self.assertEqual(type(seen[-1]).__name__, "OaiRequestAborted")
+
+
+class TestProxyKeepsNoContent(unittest.TestCase):
+    """History documents that no column could hold prompt content. The proxy
+    sees all of it, so that property has to be defended here too."""
+
+    def test_no_event_carries_message_text(self):
+        secret = "the launch code is 1234"
+        upstream = StubUpstream([delta(secret), USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen = []
+        finished = threading.Event()
+
+        def emit(ev):
+            seen.append(ev)
+            if type(ev).__name__ in ("OaiRequestEnd", "OaiRequestAborted"):
+                finished.set()
+
+        _, port = start_proxy(("127.0.0.1", 0), upstream.url, emit)
+
+        import urllib.request
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/chat/completions" % port,
+            data=json.dumps({"model": "m", "stream": True,
+                             "messages": [{"role": "user", "content": secret}]}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+        self.assertTrue(finished.wait(10))
+
+        for event in seen:
+            self.assertNotIn(secret, repr(event))
+
+    def test_the_reader_never_hands_back_the_delta(self):
+        produced, usage, _ = read_stream_usage(
+            json.dumps({"choices": [{"delta": {"content": "secret"}}]}).encode())
+        self.assertNotIn("secret", repr(produced))
+        self.assertNotIn("secret", repr(usage))
+
+
+if __name__ == "__main__":
+    unittest.main()
