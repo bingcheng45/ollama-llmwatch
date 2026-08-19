@@ -1562,14 +1562,26 @@ def render_idle(age, style, system=None):
     pointlessly."""
     spin = spinner_frame(time.time(), style)
     system = system or {}
+    # An OpenAI server was found while the Ollama side had nothing to show.
+    # Appended rather than substituted: whatever is wrong with Ollama is still
+    # the more specific thing to say, and this is the likelier explanation of
+    # why the screen is empty.
+    port = system.get("oai_port")
+    hint = ""
+    if port:
+        hint = ("  |  OpenAI server on :%d - watch it with --proxy %d, and "
+                "point your client at :%d"
+                % (port, DEFAULT_PROXY_PORT, DEFAULT_PROXY_PORT))
     if system.get("server_ok") is False:
         problem = system.get("server_problem") or "Ollama is not running"
-        return style.yellow("%s %s - start it and this will pick up automatically"
-                            % (spin, problem))
+        return style.yellow("%s %s - start it and this will pick up automatically%s"
+                            % (spin, problem, hint))
     if system.get("models_loaded") == 0:
         return style.dim("%s no model loaded - the first request pays a load "
-                         "(~10s for a 27B)  (idle %s)" % (spin, fmt_duration(age)))
-    return style.dim("%s waiting for a request  (idle %s)" % (spin, fmt_duration(age)))
+                         "(~10s for a 27B)  (idle %s)%s"
+                         % (spin, fmt_duration(age), hint))
+    return style.dim("%s waiting for a request  (idle %s)%s"
+                     % (spin, fmt_duration(age), hint))
 
 
 def render_header(data, style, show_time=True):
@@ -2944,6 +2956,48 @@ def safe_request_path(path):
     return path
 
 
+# Where an OpenAI-compatible server is likely to be if one is running: 8080 is
+# llama-server's and mlx_lm.server's default, 1234 LM Studio's, 8000 vLLM's.
+# Only consulted when the Ollama side has nothing to show, and only to name the
+# flag that would watch it.
+OAI_PROBE_PORTS = (8080, 1234, 8000)
+OAI_PROBE_TIMEOUT = 0.3
+
+
+def detect_openai_server(ports=OAI_PROBE_PORTS, timeout=OAI_PROBE_TIMEOUT):
+    """The first loopback port answering /v1/models like an OpenAI server.
+
+    Exists for one message. mlx_lm.server on :8080 with llmwatch started on the
+    Ollama backend shows `no model loaded`, which is true and useless: there is
+    no Ollama model, and the thing the user is watching is not visible from
+    that backend at all. The numbers for an OpenAI server are not in its log to
+    be found -- mlx_lm.server logs prompt progress and nothing else -- so
+    --proxy cannot be inferred away, only suggested.
+
+    A listener is not enough to suggest it. The response has to look like the
+    endpoint, because pointing --proxy at some unrelated local service would
+    route the user's traffic through it.
+    """
+    import urllib.error
+    import urllib.request
+
+    for port in ports:
+        url = "http://127.0.0.1:%d/v1/models" % port
+        try:
+            # nosec B310 -- literal http:// on loopback, port from a constant.
+            with urllib.request.urlopen(url, timeout=timeout) as resp:  # nosec B310
+                body = resp.read(4096)
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
+        try:
+            obj = json.loads(body)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict) and ("data" in obj or obj.get("object") == "list"):
+            return port
+    return None
+
+
 def valid_upstream(url):
     """Is this something the proxy may forward to?
 
@@ -3894,8 +3948,12 @@ class SystemProbe:
     CHEAP_INTERVAL = 5.0     # swap / memory / load
     MODELS_INTERVAL = 15.0   # `ollama ps` costs ~27ms, so poll it rarely
     BUSIEST_INTERVAL = 10.0  # `ps -Ao pcpu,comm -r` costs ~46ms
+    # Rare on purpose. It only feeds an idle-screen hint, and it is the one
+    # probe that opens a socket, so it must not become a thing llmwatch does
+    # continuously to somebody else's server.
+    OAI_INTERVAL = 30.0
 
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, look_for_oai=False):
         self._clock = clock
         # -inf, not 0: time.monotonic() can start near zero, in which case
         # `now - 0 < INTERVAL` and the very first poll probes nothing. That would
@@ -3913,6 +3971,9 @@ class SystemProbe:
         self.models_gb = None
         self.server_ok = None          # None = not checked yet
         self.server_problem = None
+        self._look_for_oai = look_for_oai
+        self._oai_at = float("-inf")
+        self.oai_port = None
 
     def poll(self):
         now = self._clock()
@@ -3924,6 +3985,14 @@ class SystemProbe:
         if now - self._models_at >= self.MODELS_INTERVAL:
             self._models_at = now
             self._read_models()
+        # Only when the Ollama side has nothing to show. A working Ollama setup
+        # never probes anything, so this cannot cost or surprise the people it
+        # has nothing to tell.
+        if (self._look_for_oai
+                and (self.server_ok is False or self.models_loaded == 0)
+                and now - self._oai_at >= self.OAI_INTERVAL):
+            self._oai_at = now
+            self.oai_port = detect_openai_server()
 
     def _read_load(self):
         try:
@@ -4025,6 +4094,7 @@ class SystemProbe:
                 "swap_used_gb": self.swap_used_gb, "swap_total_gb": self.swap_total_gb,
                 "memory_free_pct": self.memory_free_pct, "load1": self.load1,
                 "models_loaded": self.models_loaded, "models_gb": self.models_gb,
+                "oai_port": self.oai_port,
                 "contention": self.contention()}
 
 
@@ -4549,7 +4619,9 @@ def follow(args):
     # Not gated on `tui`: turn timings are worth recording in --plain and --json
     # runs too, and they are the one thing here that outlives the session.
     codex_tail = CodexTail() if args.codex else None
-    probe = SystemProbe()          # cheap and rate-limited; useful in both modes
+    # The OpenAI probe is only useful when not already proxying: if --proxy is
+    # set, the server is already being watched and there is nothing to suggest.
+    probe = SystemProbe(look_for_oai=not proxying)  # cheap and rate-limited
     history = None if args.no_history else History()
     progress_floor = ProgressFloor()   # displayed progress must never rewind
     ui = UIState()

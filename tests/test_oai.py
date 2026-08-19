@@ -16,8 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llmwatch import (  # noqa: E402
     DEFAULT_PROXY_PORT, OaiGenTick, OaiPrefillTick, OaiRequestAborted,
-    LOOPBACK_HOSTS, OaiRequestEnd, OaiRequestStart, Tracker, _sse_events,
-    draft_counts,
+    LOOPBACK_HOSTS, OaiRequestEnd, OaiRequestStart, Style, Tracker,
+    _sse_events, detect_openai_server, draft_counts, render_idle,
     parse_line, parse_listen, prepare_body, read_stream_usage, start_proxy,
     safe_request_path, usage_counts, valid_upstream,
 )
@@ -973,3 +973,78 @@ class TestProxyKeepsNoContent(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOpenAiServerHint(unittest.TestCase):
+    """The gap this closes, from a real session: mlx_lm.server was serving
+    Qwen on :8080 and llmwatch, started with no arguments, sat on `no model
+    loaded`. Both statements were true -- there was no Ollama model -- and
+    together they read as a detection failure rather than the mode mismatch it
+    was. The numbers for an OpenAI server are not in its log to be found
+    (mlx_lm.server logs prompt progress and nothing else), so --proxy is not a
+    shortcut that could be automated away. Saying so is.
+    """
+
+    def serve(self, body, path_ok="/v1/models"):
+        """A stub that answers `path_ok` the way an OpenAI server would."""
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                if self.path != path_ok:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def test_an_openai_server_is_recognised(self):
+        port = self.serve(json.dumps(
+            {"object": "list", "data": [{"id": "qwen3.8-27b-4bit"}]}).encode())
+        self.assertEqual(detect_openai_server([port]), port)
+
+    def test_a_closed_port_is_not(self):
+        self.assertIsNone(detect_openai_server([1]))
+
+    def test_something_that_is_not_an_openai_server_is_not(self):
+        """A listener is not an endorsement. Suggesting --proxy at some
+        unrelated service would send the user's traffic through it."""
+        port = self.serve(b"<html>hello</html>", path_ok="/")
+        self.assertIsNone(detect_openai_server([port]))
+
+    def test_the_first_match_wins_and_the_rest_are_left_alone(self):
+        port = self.serve(json.dumps({"object": "list", "data": []}).encode())
+        self.assertEqual(detect_openai_server([1, port, 2]), port)
+
+    def test_the_idle_pane_names_the_port_and_the_flag(self):
+        line = render_idle(3.0, Style(color=False, unicode_ok=False, width=100),
+                           {"models_loaded": 0, "oai_port": 8080})
+        self.assertIn("8080", line)
+        self.assertIn("--proxy", line)
+
+    def test_without_a_detection_the_old_wording_is_unchanged(self):
+        line = render_idle(3.0, Style(color=False, unicode_ok=False, width=100), {"models_loaded": 0})
+        self.assertIn("no model loaded", line)
+        self.assertNotIn("--proxy", line)
+
+    def test_a_stopped_ollama_still_leads_with_that(self):
+        """server_ok False is the more specific problem and keeps priority;
+        the hint is appended rather than replacing it."""
+        line = render_idle(3.0, Style(color=False, unicode_ok=False, width=100),
+                           {"server_ok": False, "oai_port": 8080})
+        self.assertIn("Ollama", line)
+        self.assertIn("8080", line)

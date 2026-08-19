@@ -34,18 +34,26 @@ def strip_ansi(text):
 
 class TestNoNetworkDependency(unittest.TestCase):
     """This started as "no network client, at all", and the shape of the rule
-    has survived even though the list has grown to two.
+    has survived even though the list has grown to three.
 
-    The exceptions are the update check and --proxy. A proxy cannot avoid an
-    HTTP stack -- being one is the entire feature -- but it can avoid making
-    every other run pay for it. So the rule is no longer "one import" but
-    "nothing at module scope, and only in the functions that cannot work
-    without it": starting llmwatch to watch a local model still loads no HTTP
-    stack at all.
+    The exceptions are the update check, --proxy, and the OpenAI-server probe.
+    A proxy cannot avoid an HTTP stack -- being one is the entire feature --
+    but it can avoid making every other run pay for it. So the rule is no
+    longer "one import" but "nothing at module scope, and only in the functions
+    that cannot work without it": starting llmwatch to watch a local model
+    still loads no HTTP stack at all.
+
+    The probe is the one that deserves an argument, since it is the only entry
+    here that opens a socket llmwatch was not asked to open. It is bounded on
+    every axis that matters: loopback only, three constant ports, a 0.3s
+    timeout, at most once every 30s, and only while the Ollama backend has
+    nothing to show. A working Ollama setup never reaches it. Growing this list
+    should keep costing an argument like this one.
     """
 
-    # Both are lazy, and both are checked below for being lazy.
-    HTTP_HOLDERS = ["fetch_latest_version", "_proxy_server_class"]
+    # All lazy, and all checked below for being lazy.
+    HTTP_HOLDERS = ["fetch_latest_version", "_proxy_server_class",
+                    "detect_openai_server"]
 
     def source(self):
         path = os.path.join(os.path.dirname(os.path.dirname(
