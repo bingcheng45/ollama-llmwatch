@@ -426,6 +426,61 @@ class TestRequestTargetCannotChooseTheHost(unittest.TestCase):
         self.assertEqual(upstream.requests, [])
         self.assertEqual(seen, [])
 
+    def refuse(self, selector, upstream_url):
+        """POST `selector` as the raw request target. Returns (code, reached)."""
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(
+            upstream_url, data=b"{}",
+            headers={"Content-Type": "application/json"}, method="POST")
+        req.selector = selector
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, True
+        except urllib.error.HTTPError as err:
+            return err.code, False
+
+    def test_the_origin_is_rechecked_after_the_url_is_built(self):
+        """Defence in depth, and the reason it is not redundant: the blocklist
+        enumerates spellings, and this does not. Whatever a target is spelled
+        like, if the joined URL does not still point at the configured origin
+        it is refused before a connection is opened.
+        """
+        upstream = StubUpstream(b'{"ok": true}', stream=False)
+        self.addCleanup(upstream.close)
+        seen = []
+        _, port = start_proxy(("127.0.0.1", 0), upstream.url, seen.append)
+        mine = "http://127.0.0.1:%d/v1/chat/completions" % port
+
+        # "//evil.com/x" is deliberately absent: http.server collapses the
+        # doubled leading slash before self.path is set, so it arrives as the
+        # ordinary path /evil.com/x on the configured host and is forwarded,
+        # which is correct. safe_request_path still refuses that spelling for
+        # the stacks that do not collapse it.
+        for selector in ("@evil.com/", "https://evil.com/v1/chat/completions",
+                         "/\\evil.com", "http://evil.com/"):
+            code, reached = self.refuse(selector, mine)
+            self.assertEqual(code, 400, selector)
+            self.assertFalse(reached, selector)
+
+        # Nothing got through to the upstream, and nothing was recorded as a
+        # request that happened.
+        self.assertEqual(upstream.requests, [])
+        self.assertEqual(seen, [])
+
+    def test_an_ordinary_target_still_reaches_the_upstream(self):
+        """The guard has to refuse the smuggled spellings without breaking the
+        ordinary ones, which is the failure that would be noticed last."""
+        upstream = StubUpstream(b'{"ok": true}', stream=False)
+        self.addCleanup(upstream.close)
+        _, port = start_proxy(("127.0.0.1", 0), upstream.url, lambda ev: None)
+        code, reached = self.refuse(
+            "/v1/models?limit=2",
+            "http://127.0.0.1:%d/v1/models" % port)
+        self.assertEqual(code, 200)
+        self.assertTrue(reached)
+        self.assertEqual(len(upstream.requests), 1)
+
 
 class TestUpstreamScheme(unittest.TestCase):
     """--upstream is the one piece of the proxy's configuration that comes from

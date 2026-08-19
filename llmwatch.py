@@ -2547,6 +2547,7 @@ def _proxy_server_class():
 
     import http.server
     import urllib.error
+    import urllib.parse
     import urllib.request
 
     class _ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -2598,8 +2599,20 @@ def _proxy_server_class():
 
             headers = {k: v for k, v in self.headers.items()
                        if k.lower() not in HOP_BY_HOP}
+
+            # safe_request_path rejects the spellings that are known to reach
+            # past the first slash; this re-derives the origin from the joined
+            # URL and refuses anything that did not land on the configured one
+            # anyway. Two independent checks, because the cost of the blocklist
+            # being incomplete is the whole request -- API key included -- going
+            # to a host the client picked.
+            target = self.server.upstream.rstrip("/") + path
+            if urllib.parse.urlsplit(target)[:2] != self.server.upstream_origin:
+                self._send_bad_target()
+                return
+
             req = urllib.request.Request(
-                self.server.upstream.rstrip("/") + path,
+                target,
                 data=raw if raw else None, headers=headers, method=self.command)
 
             started = time.time()
@@ -2843,6 +2856,11 @@ def _proxy_server_class():
                     "upstream must be http:// or https://, got %r" % (upstream,))
             http.server.ThreadingHTTPServer.__init__(self, address, _ProxyHandler)
             self.upstream = upstream
+            # The origin every forwarded URL must still resolve to. Computed
+            # once from the operator's own configuration, so the per-request
+            # check below compares against something no client can influence.
+            self.upstream_origin = urllib.parse.urlsplit(
+                upstream.rstrip("/"))[:2]
             self.emit = emit
 
         def handle_error(self, request, client_address):
