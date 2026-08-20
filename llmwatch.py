@@ -1992,6 +1992,10 @@ class UIState:
         # Set by the pane, cleared by the loop, which is the only thing here
         # allowed to open sockets and read files.
         self.settings_discover = False
+        # "clients" to list them, "point" to repoint the selected one. Same
+        # reason as the scan: this reads and writes files, which the key
+        # handler must not.
+        self.settings_clients = None
         self.model_a = None
         self.model_b = None
         # Set only by an explicit confirmation in the upgrade view. The loop
@@ -2049,6 +2053,8 @@ def handle_key(state, key, models, update=None):
             state.settings_saved = settings_config(state.settings)
         elif action == "discover":
             state.settings_discover = True
+        elif action in ("clients", "point"):
+            state.settings_clients = action
         return True
 
     if key in ("s", "S"):
@@ -2420,7 +2426,8 @@ SETTINGS_PRESETS = (
 # Two levels: pick the thing to change, then change it. One flat list of every
 # setting is how a settings screen becomes a wall.
 SETTINGS_TOP = (("watch", "What you are running"),
-                ("where", "Where to find it"))
+                ("where", "Where to find it"),
+                ("clients", "Point my apps at llmwatch"))
 
 # First, because it is the answer for anyone who would otherwise be stuck:
 # the other three rows all assume you know a port or a path.
@@ -2682,6 +2689,9 @@ def _settings_rows(state):
     if state["level"] == "found":
         return [(str(i), describe_backend(row))
                 for i, row in enumerate(state.get("found") or [])] or [("none", "")]
+    if state["level"] == "clients":
+        return [(str(i), row["name"])
+                for i, row in enumerate(state.get("clients") or [])] or [("none", "")]
     return SETTINGS_WHERE
 
 
@@ -2740,7 +2750,16 @@ def settings_key(state, key):
         name = rows[state["cursor"]][0]
         if state["level"] == "top":
             state["level"], state["cursor"] = name, 0
+            # The list is read off disk, so the loop fetches it.
+            if name == "clients":
+                return state, "clients"
             return state, None
+        if state["level"] == "clients":
+            if state.get("clients"):
+                state["point_index"] = state["cursor"]
+                return state, "point"
+            return state, None
+
         if state["level"] == "found":
             rows_found = state.get("found") or []
             if rows_found:
@@ -2800,6 +2819,7 @@ def render_settings(state, style, detected=None, width=100):
         "watch": "up down move    enter choose    esc back",
         "where": "up down move    enter edit    esc back",
         "found": "up down move    enter use    esc back",
+        "clients": "up down move    enter point it here    esc back",
     }[state["level"]]
     if state["editing"]:
         keys = "type it in    enter keep    esc cancel"
@@ -2807,7 +2827,8 @@ def render_settings(state, style, detected=None, width=100):
     title = {"top": "SETTINGS",
              "watch": "WHAT YOU ARE RUNNING",
              "where": "WHERE TO FIND IT",
-             "found": "WHAT I FOUND"}[state["level"]]
+             "found": "WHAT I FOUND",
+             "clients": "YOUR APPS"}[state["level"]]
     lines = [style.bold("  " + title) + style.dim("      " + keys), ""]
 
     if state["level"] == "top":
@@ -2822,6 +2843,22 @@ def render_settings(state, style, detected=None, width=100):
             chosen = "*" if name == state["preset"] else " "
             row = "  %s %s %-18s %s" % (mark, chosen, label, why)
             lines.append(style.bold(row) if mark == ">" else style.dim(row))
+
+    elif state["level"] == "clients":
+        here = state.get("listen_url") or ""
+        rows_c = state.get("clients") or []
+        if not rows_c:
+            lines.append(style.dim("  no apps found that llmwatch knows how "
+                                   "to configure"))
+        for index, row in enumerate(rows_c):
+            mark = ">" if index == state["cursor"] else " "
+            pointed = "* here" if row["url"] == here else "      "
+            text = "  %s %s %-12s %s" % (mark, pointed, row["name"],
+                                         safe_text(row["url"], limit=60))
+            lines.append(style.bold(text) if mark == ">" else style.dim(text))
+        if rows_c:
+            lines.append("")
+            lines.append(style.dim("  a backup is kept beside each file"))
 
     elif state["level"] == "found":
         rows_found = state.get("found") or []
@@ -2863,6 +2900,113 @@ def render_settings(state, style, detected=None, width=100):
         lines.append("")
         lines.append(style.yellow("  " + state["message"]))
     return lines
+
+
+# --------------------------------------------------------------------------
+# Pointing other people's apps at llmwatch
+#
+# The proxy only sees what is routed through it, and a client left pointing at
+# the model server bypasses it silently: everything works, nothing is measured,
+# and the board sits empty looking like llmwatch is broken. That has to be
+# fixable without knowing what a base URL is.
+#
+# Their files, so: never automatic, one at a time, backed up first, and edited
+# by replacing the one string rather than rewriting the file, which would
+# reformat it and drop comments.
+# --------------------------------------------------------------------------
+
+KNOWN_CLIENTS = (
+    ("opencode", "~/.config/opencode/opencode.json", "baseURL"),
+    ("Codex", "~/.codex/config.toml", "openai_base_url"),
+    ("Continue", "~/.continue/config.json", "apiBase"),
+    ("Aider", "~/.aider.conf.yml", "openai-api-base"),
+)
+
+BACKUP_SUFFIX = ".llmwatch-backup"
+
+
+def _url_pattern(key):
+    """Matches `key: "url"` and `key = "url"`, quoted key or not.
+
+    One pattern for JSON, TOML and YAML because all three spell this the same
+    way once the value is a quoted string, and the alternative is three parsers
+    and three writers that each reformat somebody's file.
+    """
+    return re.compile(r'("?%s"?\s*[:=]\s*")([^"]*)(")' % re.escape(key))
+
+
+def read_client_url(path, key):
+    """What this client currently points at, or None."""
+    try:
+        with open(os.path.expanduser(path)) as fh:
+            text = fh.read()
+    except (OSError, ValueError):
+        return None
+    match = _url_pattern(key).search(text)
+    return match.group(2) if match else None
+
+
+def find_clients(clients=KNOWN_CLIENTS):
+    """Installed clients and where each is currently pointed.
+
+    Only ones that exist and that a URL could actually be read from: a config
+    llmwatch cannot understand is one it must not offer to edit.
+    """
+    found = []
+    for name, path, key in clients:
+        full = os.path.expanduser(path)
+        if not os.path.isfile(full):
+            continue
+        url = read_client_url(full, key)
+        if url is None:
+            continue
+        found.append({"name": name, "path": full, "key": key, "url": url})
+    return found
+
+
+def point_client_at(entry, url):
+    """Repoint one client. Returns (ok, message).
+
+    Backed up first, and the backup is what `undo` restores. Only the URL is
+    replaced, so comments, key order and formatting survive: this is somebody's
+    editor config, not ours to tidy.
+    """
+    path = entry["path"]
+    try:
+        with open(path) as fh:
+            text = fh.read()
+    except (OSError, ValueError) as err:
+        return False, "could not read %s (%s)" % (path, err)
+
+    pattern = _url_pattern(entry["key"])
+    if not pattern.search(text):
+        return False, "no %s found in %s" % (entry["key"], path)
+    updated = pattern.sub(lambda m: m.group(1) + url + m.group(3), text, count=1)
+    if updated == text:
+        return True, "%s already points at %s" % (entry["name"], url)
+
+    try:
+        with open(path + BACKUP_SUFFIX, "w") as fh:
+            fh.write(text)
+        with open(path, "w") as fh:
+            fh.write(updated)
+    except (OSError, ValueError) as err:
+        return False, "could not write %s (%s)" % (path, err)
+    return True, "%s now points at %s (restart it)" % (entry["name"], url)
+
+
+def undo_client(entry):
+    """Put back what was there before. Returns (ok, message)."""
+    backup = entry["path"] + BACKUP_SUFFIX
+    try:
+        with open(backup) as fh:
+            text = fh.read()
+        with open(entry["path"], "w") as fh:
+            fh.write(text)
+        os.remove(backup)
+    except (OSError, ValueError) as err:
+        return False, "nothing to undo for %s (%s)" % (entry["name"], err)
+    return True, "%s restored" % entry["name"]
 
 
 # --------------------------------------------------------------------------
@@ -5720,6 +5864,25 @@ def follow(args):
                 # which means the flags, the environment and the file.
                 ui.settings = settings_open(settings)
                 ui.settings["suggestion"] = (system_state or {}).get("suggestion")
+            if ui.settings_clients:
+                what, ui.settings_clients = ui.settings_clients, None
+                here = "http://127.0.0.1:%d/v1" % (
+                    proxy_at[1] if proxy_at else settings["proxy_port"][0])
+                ui.settings["listen_url"] = here
+                if what == "point":
+                    rows_c = ui.settings.get("clients") or []
+                    index = ui.settings.get("point_index", 0)
+                    if 0 <= index < len(rows_c):
+                        entry = rows_c[index]
+                        if entry["url"] == here:
+                            ok, msg = undo_client(entry)
+                        else:
+                            ok, msg = point_client_at(entry, here)
+                        ui.settings["message"] = msg
+                ui.settings["clients"] = find_clients()
+                ui.settings["cursor"] = min(
+                    ui.settings.get("cursor", 0),
+                    max(0, len(ui.settings["clients"]) - 1))
             if ui.settings_discover:
                 ui.settings_discover = False
                 # Skip our own listening port: the proxy answers, and relays
