@@ -22,6 +22,7 @@ build stops instead of emitting a file that fails at import time.
 import argparse
 import ast
 import os
+import stat
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -218,13 +219,22 @@ def main(argv=None):
     if current == text:
         print("llmwatch.py already up to date")
         return 0
+    # The generated file needs its executable bit: it carries a shebang, and the
+    # documented install is `curl -O ... && ./llmwatch.py`. Regenerating it must
+    # not drop that.
+    #
+    # Adding the owner bit to whatever mode is already there, rather than
+    # writing a fixed 0o755, is both narrower and more correct. git records
+    # executability from exactly that one bit, so it is all that is needed, and
+    # a rebuild then cannot widen the permissions of a file somebody chose to
+    # restrict. Rewriting through an existing path keeps the old mode, so this
+    # only does real work the first time the file is created.
+    mode = os.stat(TARGET).st_mode if os.path.exists(TARGET) else None
     with open(TARGET, "w") as fh:
         fh.write(text)
-    # 755 because this file has a shebang and the documented install is
-    # `curl -O ... && chmod +x llmwatch.py && ./llmwatch.py`. Regenerating it
-    # as 644 would silently break that on the next release. It is a public
-    # source file either way: there is nothing in it to keep from anyone.
-    os.chmod(TARGET, 0o755)  # nosec B103
+    if mode is None:
+        mode = os.stat(TARGET).st_mode
+    os.chmod(TARGET, mode | stat.S_IXUSR)
     print("wrote llmwatch.py (%d lines, %d modules)"
           % (len(text.splitlines()), len(module_files())))
     return 0
