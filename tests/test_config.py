@@ -480,7 +480,7 @@ class TestFindingItForYou(unittest.TestCase):
             "x I slot print_timing: id  1 | task 1 | draft acceptance = 0.5"
             " (  1 accepted /   2 generated), mean len =  1.00\n")
         old = os.path.getmtime(path) + LOG_SEARCH_MAX_AGE + 60
-        found = discover_backends(dirs=(d,), ports=(), now=old)
+        found = discover_backends(dirs=(d,), ports=(), now=old, known=())
         self.assertEqual(found, [])
 
     def test_the_freshest_log_comes_first(self):
@@ -492,7 +492,7 @@ class TestFindingItForYou(unittest.TestCase):
             with open(path, "w") as fh:
                 fh.write(line)
             os.utime(path, (time.time() - when, time.time() - when))
-        found = discover_backends(dirs=(d,), ports=())
+        found = discover_backends(dirs=(d,), ports=(), known=())
         self.assertTrue(found[0]["path"].endswith("new.log"))
 
     def test_each_result_carries_what_to_do_about_it(self):
@@ -500,7 +500,8 @@ class TestFindingItForYou(unittest.TestCase):
         _d, path = self.write("a.log",
             "x I slot print_timing: id  1 | task 1 | draft acceptance = 0.5"
             " (  1 accepted /   2 generated), mean len =  1.00\n")
-        row = discover_backends(dirs=(os.path.dirname(path),), ports=())[0]
+        row = discover_backends(dirs=(os.path.dirname(path),), ports=(),
+                                known=())[0]
         self.assertEqual(row["apply"], {"watch": "log", "log": path})
         self.assertIn("llama.cpp", describe_backend(row))
 
@@ -534,9 +535,10 @@ class TestTheScanDoesNotFindItself(unittest.TestCase):
         self.addCleanup(srv.shutdown)
         port = srv.server_address[1]
 
-        self.assertTrue(discover_backends(dirs=(), ports=(port,)))
+        self.assertTrue(discover_backends(dirs=(), ports=(port,), known=()))
         self.assertEqual(
-            discover_backends(dirs=(), ports=(port,), skip_ports=(port,)), [])
+            discover_backends(dirs=(), ports=(port,), skip_ports=(port,),
+                              known=()), [])
 
 
 class TestFindingItFromThePane(unittest.TestCase):

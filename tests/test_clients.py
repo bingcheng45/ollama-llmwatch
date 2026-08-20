@@ -174,5 +174,69 @@ class TestRepointing(unittest.TestCase):
         self.assertFalse(os.path.exists(entry["path"] + BACKUP_SUFFIX))
 
 
+
+from llmwatch import Style, clients_elsewhere, render_idle  # noqa: E402
+
+PLAIN = Style(color=False, unicode_ok=False, width=120)
+
+
+class TestNoticingAClientPointedSomewhereElse(unittest.TestCase):
+    """llmwatch cannot see traffic that does not pass through it: a client
+    talking to another port is a conversation between two other processes.
+
+    What it can see is the configuration, which is better anyway. A warning
+    before the request is worth more than a detection afterwards.
+    """
+
+    def rows(self, *pairs):
+        return [{"name": n, "url": u, "path": "/p", "key": "k"}
+                for n, u in pairs]
+
+    def test_a_client_pointed_elsewhere_is_named(self):
+        got = clients_elsewhere(
+            self.rows(("opencode", "http://127.0.0.1:8081/v1"),
+                      ("Codex", "http://127.0.0.1:10100/v1")),
+            "http://127.0.0.1:8081/v1")
+        self.assertEqual([row["name"] for row in got], ["Codex"])
+
+    def test_nothing_to_say_when_everything_points_here(self):
+        self.assertEqual(clients_elsewhere(
+            self.rows(("opencode", "http://127.0.0.1:8081/v1")),
+            "http://127.0.0.1:8081/v1"), [])
+
+    def test_a_trailing_slash_is_not_a_difference(self):
+        """Someone typing the URL by hand should not get warned forever about
+        a slash."""
+        self.assertEqual(clients_elsewhere(
+            self.rows(("opencode", "http://127.0.0.1:8081/v1/")),
+            "http://127.0.0.1:8081/v1"), [])
+
+    def test_no_listen_url_means_no_opinion(self):
+        """Not proxying: there is nowhere for anything to point."""
+        self.assertEqual(clients_elsewhere(
+            self.rows(("Codex", "http://x/v1")), None), [])
+
+    def test_the_idle_line_says_which_client_and_that_it_is_unmeasured(self):
+        line = render_idle(30.0, PLAIN, {
+            "proxying": True, "upstream": "http://127.0.0.1:8080",
+            "clients_elsewhere": [{"name": "Codex",
+                                   "url": "http://127.0.0.1:10100/v1"}]})
+        self.assertIn("Codex", line)
+        self.assertIn("not measured", line)
+
+    def test_several_are_summarised_rather_than_listed_forever(self):
+        line = render_idle(30.0, PLAIN, {
+            "proxying": True, "upstream": "http://127.0.0.1:8080",
+            "clients_elsewhere": [{"name": n, "url": "u"}
+                                  for n in ("Codex", "Continue", "Aider")]})
+        self.assertIn("Codex", line)
+        self.assertIn("+2", line)
+
+    def test_a_hostile_name_cannot_drive_the_terminal(self):
+        line = render_idle(30.0, PLAIN, {
+            "proxying": True, "upstream": "http://127.0.0.1:8080",
+            "clients_elsewhere": [{"name": "ev\x1b[2Jil", "url": "u"}]})
+        self.assertNotIn("\x1b", line)
+
 if __name__ == "__main__":
     unittest.main()

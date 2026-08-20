@@ -1616,6 +1616,14 @@ def render_idle(age, style, system=None):
             line += "  |  the server reports no models"
         if system.get("suggestion"):
             line += "  |  %s - press s" % system["suggestion"]["why"]
+        # The likeliest reason a board is empty while a model is plainly busy.
+        astray = system.get("clients_elsewhere") or []
+        if astray:
+            names = safe_text(astray[0]["name"], limit=30)
+            if len(astray) > 1:
+                names += " +%d" % (len(astray) - 1)
+            line += ("  |  %s not measured: pointed elsewhere, press s"
+                     % names)
         return style.dim(line)
 
     # An OpenAI server was found while the Ollama side had nothing to show.
@@ -2499,10 +2507,18 @@ def identify_log(path, tail=LOG_SEARCH_TAIL):
     return "MLX" if saw_mlx else None
 
 
-def _discover_logs(dirs=LOG_SEARCH_DIRS, now=None):
+def _discover_logs(dirs=LOG_SEARCH_DIRS, now=None, known=None):
+    """`known` is the list of paths to check regardless of `dirs`, which is
+    where Ollama's own log lives. Passed in rather than always consulted, so
+    restricting `dirs` actually restricts the search: it did not, which made
+    this depend on whether the machine running it happened to have a fresh
+    Ollama log.
+    """
     now = time.time() if now is None else now
     found, seen = [], set()
-    paths = [os.path.expanduser(p) for p in candidate_paths()]
+    if known is None:
+        known = candidate_paths()
+    paths = [os.path.expanduser(p) for p in known]
     for directory in dirs:
         directory = os.path.expanduser(directory)
         try:
@@ -2558,13 +2574,13 @@ def _discover_servers(ports=DISCOVER_PORTS, timeout=None, skip_ports=()):
 
 
 def discover_backends(dirs=LOG_SEARCH_DIRS, ports=DISCOVER_PORTS, now=None,
-                      skip_ports=()):
+                      skip_ports=(), known=None):
     """Everything locally that looks watchable, best first.
 
     Logs come before servers for the same engine, because a log carries the
     server's own rates and its prefill progress where the wire carries neither.
     """
-    logs = _discover_logs(dirs, now=now)
+    logs = _discover_logs(dirs, now=now, known=known)
     servers = _discover_servers(ports, skip_ports=skip_ports)
     logged_engines = {row["engine"] for row in logs}
     ranked = list(logs)
@@ -2993,6 +3009,22 @@ def point_client_at(entry, url):
     except (OSError, ValueError) as err:
         return False, "could not write %s (%s)" % (path, err)
     return True, "%s now points at %s (restart it)" % (entry["name"], url)
+
+
+def clients_elsewhere(clients, listen_url):
+    """Known clients configured to talk to something other than llmwatch.
+
+    llmwatch cannot see traffic that does not pass through it: a client talking
+    to another port is a conversation between two other processes, and nothing
+    short of packet capture would show it. The configuration is visible though,
+    and it is the better signal anyway, because it can be said before the
+    request rather than discovered after it.
+    """
+    if not listen_url:
+        return []
+    here = listen_url.rstrip("/")
+    return [row for row in (clients or [])
+            if (row.get("url") or "").rstrip("/") != here]
 
 
 def undo_client(entry):
@@ -4981,6 +5013,9 @@ class SystemProbe:
     # Long enough that a slow first request is not mistaken for a wrong
     # backend: a 27B pays about ten seconds just to load.
     QUIET_BEFORE_LOOKING = 60.0
+    # Reading a handful of small config files. Rare because there is no hurry:
+    # a misrouted client stays misrouted until somebody changes it.
+    CLIENTS_INTERVAL = 30.0
 
     def __init__(self, clock=time.monotonic, look_for_oai=False,
                  upstream=None):
@@ -5011,6 +5046,9 @@ class SystemProbe:
         # How long the watched backend has shown nothing. Set by the loop,
         # which is the only thing that knows.
         self.idle_seconds = None
+        self.listen_url = None
+        self._clients_at = float("-inf")
+        self.clients_elsewhere = []
         self._upstream_at = float("-inf")
         self.upstream_ok = None
         self.upstream_models = None
@@ -5040,6 +5078,10 @@ class SystemProbe:
             self.oai_port = detect_openai_server()
         # Same rate limit and the same reason: this opens a socket, so it is
         # not something to do on every frame.
+        if self.listen_url and now - self._clients_at >= self.CLIENTS_INTERVAL:
+            self._clients_at = now
+            self.clients_elsewhere = clients_elsewhere(find_clients(),
+                                                       self.listen_url)
         if self.upstream and now - self._upstream_at >= self.OAI_INTERVAL:
             self._upstream_at = now
             models = list_upstream_models(self.upstream)
@@ -5154,6 +5196,7 @@ class SystemProbe:
                 "proxying": bool(self.upstream), "upstream": self.upstream,
                 "upstream_ok": self.upstream_ok,
                 "upstream_models": self.upstream_models,
+                "clients_elsewhere": self.clients_elsewhere,
                 "contention": self.contention()}
 
 
@@ -5836,6 +5879,8 @@ def follow(args):
             commit(render_update(update_box["latest"], style))
         if probe:
             probe.idle_seconds = time.time() - idle_since
+            if proxy_at:
+                probe.listen_url = "http://127.0.0.1:%d/v1" % proxy_at[1]
             probe.poll()               # self-rate-limited: 5s cheap, 15s models
         if tui:
             if ui.view == "upgrade" and ui.upgrade_plan is None:
