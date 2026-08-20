@@ -836,6 +836,48 @@ else is, which is why `turns` has no column that could hold text either.
 
 ## How it works
 
+The whole system in one picture:
+
+```
+   1. prompt                2. serves it
+  your agent  ──────────►  Ollama  ──────────►  engine
+  Codex, opencode          ◄───────────────────  llama-server (GGUF)
+       ▲                    3. answer, streamed   MLX runner (-mlx)
+       │                                                │
+       │                                                │  4. writes timings
+       │                                                ▼
+       │                                           ollama.log
+       │                                                │  tail -F, read-only
+       │                                                ▼
+       │    ┌── 5. llmwatch ── passive, adds no overhead ───────────────────────┐
+       │    │                                                                   │
+       │    │   parse   which model, which request, which phase                 │
+       │    │     │                                                             │
+       │    │     ▼                                                             │
+       │    │   track   reading ─► first token ─► writing ─► done               │
+       │    │     │                                                             │
+       │    │     ├── repaint ~10/s ──►  live board: progress, ETA, hints       │
+       │    │     │                                                             │
+       │    │     └── on finish ─────►  SQLite history                          │
+       │    │                                 │                                 │
+       │    └─────────────────────────────────│─────────────────────────────────┘
+       │                                      │  ask later
+       │                                      ▼
+       │                        --history  --compare  --turns  --export
+       │                                      ▲
+       │                                      │  turn boundaries
+       │                          Codex session file (--codex, opt-in)
+       │
+       └── or: point your agent at llmwatch's proxy, and it forwards to any
+           OpenAI-compatible server (mlx-lm, LM Studio, vLLM). The usage and
+           timings ride back in the HTTP response, into the same parse step.
+```
+
+The path through the log is the default and needs nothing. The last branch is `--proxy` mode, for
+servers that never write the numbers anywhere: llmwatch sits between your agent and the server and
+reads them off the wire. Either way it only reads what the engine already produced - it never
+touches the request path.
+
 It never talks to Ollama's API. It tails the log that Ollama's inference engine already writes:
 
 ```
