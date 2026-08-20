@@ -177,8 +177,12 @@ OaiRequestEnd.__new__.__defaults__ = (None,)
 # to leave the board rather than sit there open forever.
 OaiRequestAborted = namedtuple("OaiRequestAborted", "ts")
 
+# Emitted once, the first time the upstream identifies itself. The engine is a
+# property of the server, not of a request, so it is not carried on every event.
+OaiEngine = namedtuple("OaiEngine", "engine ts")
+
 OAI_EVENTS = (OaiRequestStart, OaiPrefillTick, OaiGenTick, OaiRequestEnd,
-              OaiRequestAborted)
+              OaiRequestAborted, OaiEngine)
 
 # --------------------------------------------------------------------------
 # Layer 1: parsing
@@ -540,6 +544,9 @@ class Tracker:
 
     def __init__(self):
         self.model = "?"
+        # Which engine is behind the numbers, once the server has said so.
+        # None until then, and never inferred from the model name.
+        self.engine = None
         self.requests = {}
         self._mlx_task = 0
         self._mlx_started = None    # ts of the current request's first line
@@ -727,6 +734,10 @@ class Tracker:
             task = self._mlx_task
             # MLX gives no context size; None keeps the ctx field honestly empty
             # rather than inventing a window the renderer would then draw.
+            # The MLX runner and llama-server write different logs and are
+            # read by different parsers, so on this path the engine is known
+            # for certain rather than detected.
+            self.engine = "MLX"
             outs.extend(self.feed(RequestStart(self.MLX_SLOT, task, ev.prompt_tokens, None)))
             outs.extend(self.feed(CacheInfo(self.MLX_SLOT, task, ev.cached)))
             if ev.miss:
@@ -821,6 +832,10 @@ class Tracker:
         nothing here was printed by the server, so a request that never sent a
         `usage` block closes with no rate at all rather than an estimate.
         """
+        if isinstance(ev, OaiEngine):
+            self.engine = ev.engine
+            return []
+
         if isinstance(ev, OaiRequestStart):
             outs = []
             if ev.model and ev.model != self.model:
@@ -1554,6 +1569,20 @@ def render_live_detail(data, snap, style, age=0.0, codex=None, system=None,
         waited = (data.get("elapsed") or 0) + age
         lines.append(style.dim("running past estimate - %s so far" % fmt_duration(waited)))
     return lines
+
+
+def render_board_title(snap, style):
+    """`llmwatch 0.9.1   qwen3.8-27b-4bit (MLX)`.
+
+    The engine is appended only when the server identified itself. A model name
+    does not imply one, so an unrecognised server gets the name alone rather
+    than a guess.
+    """
+    title = "llmwatch %s   %s" % (__version__, style.bold(snap.get("model", "?")))
+    engine = snap.get("engine")
+    if engine:
+        title += style.dim(" (%s)" % engine)
+    return title
 
 
 def render_idle(age, style, system=None):
@@ -2481,6 +2510,23 @@ def read_stream_usage(payload):
             timings if isinstance(timings, dict) else None)
 
 
+def read_stream_fingerprint(payload):
+    """Just `system_fingerprint`, for engine detection.
+
+    Deliberately not folded into read_stream_usage. That function is the one
+    with a test asserting no message content can escape it, and the way to keep
+    that true is to not give it more to return.
+    """
+    try:
+        obj = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    fingerprint = obj.get("system_fingerprint")
+    return fingerprint if isinstance(fingerprint, str) else None
+
+
 def usage_counts(usage):
     """(prompt, cached, completion) from a usage block, missing fields as 0."""
     if not isinstance(usage, dict):
@@ -2606,6 +2652,19 @@ def _proxy_server_class():
 
         def do_OPTIONS(self):
             self._relay()
+
+        def _note_engine(self, headers, obj):
+            """Learn the engine once, then never look again.
+
+            Detection is the only thing here that costs a parse it would not
+            otherwise do, so it stops as soon as the answer is known.
+            """
+            if self.server.engine is not None:
+                return
+            found = detect_engine(headers, obj)
+            if found:
+                self.server.engine = found
+                self._emit(OaiEngine(found, time.time()))
 
         def _emit(self, ev):
             try:
@@ -2744,6 +2803,7 @@ def _proxy_server_class():
             out_headers = [(k, v) for k, v in upstream.headers.items()
                            if k.lower() not in HOP_BY_HOP]
             length = upstream.headers.get("Content-Length")
+            self._note_engine(upstream.headers, None)
 
             # A response with a known length is not a stream; buffering it adds no
             # latency because the client cannot act on a partial body anyway.
@@ -2799,6 +2859,11 @@ def _proxy_server_class():
                             # yields whichever it did send.
                             if found_timings:
                                 timings = found_timings
+                            if self.server.engine is None:
+                                self._note_engine(None, {
+                                    "system_fingerprint":
+                                        read_stream_fingerprint(payload),
+                                    "timings": found_timings})
                     except Exception:
                         # Format drift costs the numbers for this request, not the
                         # request itself.
@@ -2866,6 +2931,7 @@ def _proxy_server_class():
                         usage = obj["usage"]
                     if isinstance(obj.get("timings"), dict):
                         timings = obj["timings"]
+                    self._note_engine(None, obj)
             except (ValueError, TypeError):
                 usage, timings = None, None
             # No first-token mark exists for a non-streamed response, so the split
@@ -2921,6 +2987,7 @@ def _proxy_server_class():
             # check below compares against something no client can influence.
             self.upstream_origin = urllib.parse.urlsplit(
                 upstream.rstrip("/"))[:2]
+            self.engine = None
             self.emit = emit
 
         def handle_error(self, request, client_address):
@@ -2954,6 +3021,44 @@ def safe_request_path(path):
     if "\\" in path:
         return None
     return path
+
+
+def detect_engine(headers, obj):
+    """Which engine served this response, or None if it did not say.
+
+    The board shows a model name, and a model name is not an engine: the same
+    `qwen3.8-27b-4bit` is served by MLX on one machine and llama.cpp on another,
+    and telling those apart is usually the reason for looking. So this reads
+    what the server states about itself and nothing else. Never the model name.
+
+    Unrecognised means unlabelled. A wrong engine label is worse than none,
+    because the label exists precisely to be compared against.
+
+    The tempting non-signal is `Server: BaseHTTP/0.6 Python/x.y`, which
+    mlx_lm.server does send -- as stdlib's default, along with every other
+    Python HTTP server including llmwatch's own proxy. Matching it would label
+    everything MLX.
+    """
+    headers = headers or {}
+    try:
+        server = str(headers.get("Server") or headers.get("server") or "")
+    except AttributeError:
+        server = ""
+    # llama.cpp names itself outright (tools/server/server-http.cpp).
+    if "llama.cpp" in server.lower():
+        return "llama.cpp"
+    if isinstance(obj, dict):
+        # `timings` is llama.cpp's own extension to the OpenAI response, so it
+        # identifies the engine even behind something that rewrote Server.
+        if isinstance(obj.get("timings"), dict):
+            return "llama.cpp"
+        # mlx_lm builds system_fingerprint as
+        # {mlx_lm_version}-{mlx_version}-{platform}-{gpu_arch}, and gpu_arch
+        # comes from mx.device_info(), which is applegpu_* wherever MLX runs.
+        fingerprint = obj.get("system_fingerprint")
+        if isinstance(fingerprint, str) and "applegpu" in fingerprint:
+            return "MLX"
+    return None
 
 
 # Where an OpenAI-compatible server is likely to be if one is running: 8080 is
@@ -3509,7 +3614,7 @@ def frame_lines(snap, live_text, style, cols, rows, hint=True, help_visible=Fals
     if len(live_block) >= budget:
         return live_block[-budget:]
 
-    title = "llmwatch %s   %s" % (__version__, style.bold(snap.get("model", "?")))
+    title = render_board_title(snap, style)
     meta = "%d req - %s" % (snap.get("requests", 0),
                             fmt_duration(snap.get("session_seconds", 0)))
     if snap.get("models_seen", 0) > 1:
@@ -4768,6 +4873,7 @@ def follow(args):
                 ui.upgrade_plan = upgrade_plan()
             cols, rows = screen.size()
             snap = stats.snapshot(tracker.model)
+            snap["engine"] = tracker.engine
             age = time.time() - live_at
             codex_state = codex_tail.state() if codex_tail else None
             system_state = probe.snapshot() if probe else None

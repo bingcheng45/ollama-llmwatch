@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from llmwatch import (  # noqa: E402
     DEFAULT_PROXY_PORT, OaiGenTick, OaiPrefillTick, OaiRequestAborted,
     LOOPBACK_HOSTS, OaiRequestEnd, OaiRequestStart, Style, Tracker,
-    _sse_events, detect_openai_server, draft_counts, render_idle,
+    _sse_events, detect_engine, detect_openai_server, draft_counts,
+    render_board_title, render_idle,
     parse_line, parse_listen, prepare_body, read_stream_usage, start_proxy,
     safe_request_path, usage_counts, valid_upstream,
 )
@@ -854,6 +855,53 @@ class TestProxyEndToEnd(unittest.TestCase):
         self.assertEqual(upstream.requests, [])
         self.assertEqual(seen, [])
 
+    def test_the_engine_is_identified_from_a_stream(self):
+        """MLX puts system_fingerprint in every chunk, so the engine is known
+        before the response finishes."""
+        fp = chunk(choices=[{"delta": {"content": "a"}}],
+                   system_fingerprint="0.31.3-0.32.1-macOS-26.4-arm64-arm-64bit-Mach-O-applegpu_g13s")
+        upstream = StubUpstream([fp, USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        engines = [e.engine for e in seen if type(e).__name__ == "OaiEngine"]
+        self.assertEqual(engines, ["MLX"])
+
+    def test_llama_cpp_is_identified_from_its_timings(self):
+        upstream = StubUpstream(
+            [delta("a"), SPEC_USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        engines = [e.engine for e in seen if type(e).__name__ == "OaiEngine"]
+        self.assertEqual(engines, ["llama.cpp"])
+
+    def test_the_engine_is_announced_once_not_per_request(self):
+        """It is a property of the server. Re-emitting it on every request
+        would make it look like something that changes."""
+        fp = chunk(choices=[{"delta": {"content": "a"}}],
+                   system_fingerprint="0.1.0-0.1.0-macOS-applegpu_g13s")
+        upstream = StubUpstream([fp, USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        for _ in range(2):
+            finished.clear()
+            self.post(port, {"model": "m", "stream": True})
+            self.assertTrue(finished.wait(10))
+        self.assertEqual(
+            len([e for e in seen if type(e).__name__ == "OaiEngine"]), 1)
+
+    def test_an_unidentifiable_server_produces_no_engine_event(self):
+        upstream = StubUpstream([delta("a"), USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        self.assertEqual(
+            [e for e in seen if type(e).__name__ == "OaiEngine"], [])
+
     def test_a_tool_call_only_turn_is_still_measured(self):
         """Through the proxy, end to end: opencode's tool-calling turns must
         arrive with a first-token mark and real token counts."""
@@ -1048,3 +1096,63 @@ class TestOpenAiServerHint(unittest.TestCase):
                            {"server_ok": False, "oai_port": 8080})
         self.assertIn("Ollama", line)
         self.assertIn("8080", line)
+
+
+class TestEngineDetection(unittest.TestCase):
+    """Which engine produced the numbers, when the server says so.
+
+    The header shows a model name, and a model name does not say whether it is
+    being served by MLX, llama.cpp or something else -- which is exactly the
+    thing you are choosing between when you compare them. Nothing is inferred
+    from the model name itself: `qwen3.8-27b-4bit` is served by MLX here and by
+    llama.cpp elsewhere.
+    """
+
+    def test_llama_cpp_says_so_in_a_header(self):
+        """server-http.cpp sets this literally, so it is not a guess."""
+        self.assertEqual(
+            detect_engine({"Server": "llama.cpp"}, None), "llama.cpp")
+
+    def test_llama_cpp_is_also_recognised_by_its_timings_block(self):
+        """Belt and braces: a fronting reverse proxy may rewrite Server, but
+        `timings` is llama.cpp's own extension and survives."""
+        self.assertEqual(
+            detect_engine({}, {"timings": {"predicted_per_second": 20.0}}),
+            "llama.cpp")
+
+    def test_mlx_is_recognised_by_its_fingerprint(self):
+        """mlx_lm builds system_fingerprint as
+        {mlx_lm_version}-{mlx_version}-{platform}-{gpu_arch}, and the gpu arch
+        comes from mx.device_info(), which is applegpu_* wherever MLX runs."""
+        self.assertEqual(
+            detect_engine({}, {"system_fingerprint":
+                               "0.31.3-0.32.1-macOS-26.4-arm64-arm-64bit-Mach-O-applegpu_g13s"}),
+            "MLX")
+
+    def test_the_python_default_header_is_not_a_signal(self):
+        """The trap. mlx_lm.server sends `Server: BaseHTTP/0.6 Python/3.14.4`
+        because that is stdlib's default -- and so does llmwatch's own proxy.
+        Matching on it would label every server MLX, including this one."""
+        self.assertIsNone(
+            detect_engine({"Server": "BaseHTTP/0.6 Python/3.14.4"}, None))
+
+    def test_an_unrecognised_server_is_left_unlabelled(self):
+        """No label beats a wrong one: the whole point is to tell two engines
+        apart, so a guess would defeat it."""
+        for headers, obj in (({}, None), ({"Server": "uvicorn"}, {}),
+                             ({}, {"system_fingerprint": "gpt-4o-2024"}),
+                             ({}, "not a dict"), (None, None)):
+            self.assertIsNone(detect_engine(headers, obj), (headers, obj))
+
+    def test_the_header_shows_the_engine_when_known(self):
+        style = Style(color=False, unicode_ok=False, width=100)
+        line = render_board_title(
+            {"model": "qwen3.8-27b-4bit", "engine": "MLX"}, style)
+        self.assertIn("qwen3.8-27b-4bit", line)
+        self.assertIn("MLX", line)
+
+    def test_the_header_is_unchanged_when_the_engine_is_unknown(self):
+        style = Style(color=False, unicode_ok=False, width=100)
+        line = render_board_title({"model": "qwen3.8-27b-4bit"}, style)
+        self.assertIn("qwen3.8-27b-4bit", line)
+        self.assertNotIn("(", line)
