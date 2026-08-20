@@ -628,9 +628,14 @@ Watch it, and point your client at `http://127.0.0.1:8080/v1` as usual:
 ollama-llmwatch --log /tmp/llama-dflash2.log
 ```
 
-If you have `LLMWATCH_PROXY` set in your shell profile, clear it for this command
-(`LLMWATCH_PROXY= ollama-llmwatch --log ...`). Otherwise llmwatch starts in proxy
-mode, reads the wire, and ignores the log you just pointed it at.
+An explicit `--log` beats `LLMWATCH_PROXY` if you have that exported, so this works
+as written whatever is in your shell profile. If you switch between engines often,
+two aliases save remembering which is which:
+
+```bash
+alias watch-mlx='ollama-llmwatch --proxy'
+alias watch-dflash='ollama-llmwatch --log /tmp/llama-dflash2.log'
+```
 
 The drafter is trained for one target model and will not work against another. To
 measure what it is worth on your own prompts, run the same ones without `--spec-type`

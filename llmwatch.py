@@ -3099,6 +3099,31 @@ def list_upstream_models(url, timeout=OAI_PROBE_TIMEOUT):
     return ids
 
 
+def wants_proxy(proxy_arg, log_arg, env_proxy):
+    """Should this run proxy an OpenAI server rather than read a log?
+
+    Precedence, because the two sources cannot both be the measurement:
+
+      --proxy            typed now, wins outright
+      --log without it   typed now, and says to read a log, so no proxy
+      LLMWATCH_PROXY     ambient, set once in a profile and then forgotten
+
+    The ambient one losing to a typed --log is the point. With it exported,
+    `--log` used to start in proxy mode anyway and the log was read by nothing,
+    which left `LLMWATCH_PROXY= ollama-llmwatch --log ...` as the only way to
+    say what should have been obvious.
+
+    Both typed together is still a real combination and still works: the proxy
+    measures, and a standalone mlx_lm.server log supplies the prefill progress
+    the wire cannot show.
+    """
+    if proxy_arg is not None:
+        return True
+    if log_arg:
+        return False
+    return bool(env_proxy)
+
+
 def log_event_allowed(ev, proxying):
     """May this log event be fed to the tracker?
 
@@ -4729,7 +4754,8 @@ def _key_reader(q, stop):
 
 def follow(args):
     # `--proxy` with no value yields "", which is still a request to proxy.
-    proxying = args.proxy is not None or bool(os.environ.get("LLMWATCH_PROXY"))
+    proxying = wants_proxy(args.proxy, args.log,
+                           os.environ.get("LLMWATCH_PROXY"))
     kind, target = find_log()
     if not kind and not proxying:
         sys.stderr.write(

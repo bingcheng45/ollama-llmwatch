@@ -19,6 +19,7 @@ from llmwatch import (  # noqa: E402
     LOOPBACK_HOSTS, OaiRequestEnd, OaiRequestStart, Style, Tracker,
     _sse_events, detect_engine, detect_openai_server, draft_counts,
     list_upstream_models, log_event_allowed, render_board_title,
+    wants_proxy,
     render_idle,
     parse_line, parse_listen, prepare_body, read_stream_usage, start_proxy,
     safe_request_path, usage_counts, valid_upstream,
@@ -1296,3 +1297,36 @@ class TestLogEventsWhileProxying(unittest.TestCase):
                 outs += t.feed(ev)
         ends = [o for o in outs if o.data.get("event") == "request_end"]
         self.assertEqual(len(ends), 1)
+
+
+class TestProxyModePrecedence(unittest.TestCase):
+    """LLMWATCH_PROXY is set once in a shell profile and then forgotten, so it
+    is ambient. `--log PATH` is typed deliberately, on this run, and says what
+    to watch. The typed one has to win, or the profile silently overrules the
+    command and the log is read by nothing.
+
+    That is how it went wrong: with LLMWATCH_PROXY exported, `--log` started
+    llmwatch in proxy mode anyway, and the only way out was to blank the
+    variable inline -- `LLMWATCH_PROXY= ollama-llmwatch --log ...`, which is
+    not a command anyone should have to remember.
+    """
+
+    def test_the_flag_turns_it_on(self):
+        self.assertTrue(wants_proxy("", None, None))
+
+    def test_the_environment_turns_it_on_when_nothing_else_is_said(self):
+        self.assertTrue(wants_proxy(None, None, "8081"))
+
+    def test_an_explicit_log_beats_the_ambient_variable(self):
+        """The fix. Typing --log is a statement about this run."""
+        self.assertFalse(wants_proxy(None, "/tmp/llama.log", "8081"))
+
+    def test_an_explicit_proxy_still_wins_alongside_a_log(self):
+        """Both typed on purpose is a real combination: the proxy measures, and
+        a standalone mlx_lm.server log supplies the prefill progress the wire
+        cannot show."""
+        self.assertTrue(wants_proxy("8081", "/tmp/mlx.log", None))
+
+    def test_neither_means_the_ollama_backend(self):
+        self.assertFalse(wants_proxy(None, None, None))
+        self.assertFalse(wants_proxy(None, None, ""))
