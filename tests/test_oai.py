@@ -18,7 +18,8 @@ from llmwatch import (  # noqa: E402
     DEFAULT_PROXY_PORT, OaiGenTick, OaiPrefillTick, OaiRequestAborted,
     LOOPBACK_HOSTS, OaiRequestEnd, OaiRequestStart, Style, Tracker,
     _sse_events, detect_engine, detect_openai_server, draft_counts,
-    list_upstream_models, render_board_title, render_idle,
+    list_upstream_models, log_event_allowed, render_board_title,
+    render_idle,
     parse_line, parse_listen, prepare_body, read_stream_usage, start_proxy,
     safe_request_path, usage_counts, valid_upstream,
 )
@@ -1244,3 +1245,54 @@ class TestListingUpstreamModels(unittest.TestCase):
 
     def test_junk_is_none(self):
         self.assertIsNone(list_upstream_models(self.serve(b"<html>no</html>")))
+
+
+class TestLogEventsWhileProxying(unittest.TestCase):
+    """Both sources measure the same request, so only one of them may count it.
+
+    Under --proxy the log was still parsed in full. Against a llama-server log
+    that meant every request was recorded twice, once off the wire and once
+    from the log, and the slot ids collide as well: OAI_SLOT is 1 and
+    llama-server hands out slots 1 upward, so the two also fought over the same
+    live request.
+
+    The log keeps the one job it was given here: prefill progress from a
+    standalone mlx_lm.server, which the wire cannot show because the whole
+    prefill happens before the first byte is sent.
+    """
+
+    def test_prefill_progress_is_still_allowed_through(self):
+        self.assertTrue(log_event_allowed(OaiPrefillTick(10, 100, 1.0), True))
+
+    def test_a_measurement_from_the_log_is_not(self):
+        from llmwatch import GenDone, PrefillDone, RequestEnd
+        for ev in (PrefillDone(1, 18, 1443.0, 63, 43.6),
+                   GenDone(1, 18, 4454.0, 80, 17.7),
+                   RequestEnd(1, 18, 5898.0, 143)):
+            self.assertFalse(log_event_allowed(ev, True), ev)
+
+    def test_nothing_is_filtered_when_not_proxying(self):
+        from llmwatch import GenDone, PrefillDone, RequestEnd
+        for ev in (PrefillDone(1, 18, 1443.0, 63, 43.6),
+                   GenDone(1, 18, 4454.0, 80, 17.7),
+                   RequestEnd(1, 18, 5898.0, 143),
+                   OaiPrefillTick(10, 100, 1.0)):
+            self.assertTrue(log_event_allowed(ev, False), ev)
+
+    def test_one_request_is_recorded_once_not_twice(self):
+        """The regression, end to end through the tracker: a proxied request
+        plus the same request's log lines must produce one request_end."""
+        t = Tracker()
+        outs = []
+        t.feed(OaiRequestStart("qwen", 100.0))
+        outs += t.feed(OaiRequestEnd(63, 0, 80, 100.0, 101.4, 105.9, 106.0))
+        for line in (
+            "x I slot print_timing: id  1 | task 18 | prompt eval time = 1443.76 ms / 63 tokens (22.92 ms per token, 43.64 tokens per second)\n",
+            "x I slot print_timing: id  1 | task 18 |        eval time = 4454.45 ms / 80 tokens (56.39 ms per token, 17.74 tokens per second)\n",
+            "x I slot print_timing: id  1 | task 18 |       total time = 5898.21 ms / 143 tokens\n",
+        ):
+            ev = parse_line(line)
+            if ev is not None and log_event_allowed(ev, True):
+                outs += t.feed(ev)
+        ends = [o for o in outs if o.data.get("event") == "request_end"]
+        self.assertEqual(len(ends), 1)

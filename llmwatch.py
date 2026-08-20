@@ -3099,6 +3099,30 @@ def list_upstream_models(url, timeout=OAI_PROBE_TIMEOUT):
     return ids
 
 
+def log_event_allowed(ev, proxying):
+    """May this log event be fed to the tracker?
+
+    Yes, unless --proxy is measuring the same requests from the wire. Both
+    sources describe the same traffic, so counting both records every request
+    twice, and the slot ids collide as well: OAI_SLOT is 1 and llama-server
+    hands out slots from 1 upward, so they also fight over the same live
+    request.
+
+    The wire wins because it is the source that is definitely present: --proxy
+    is used precisely when the log cannot be relied on. The one thing kept from
+    the log is prefill progress from a standalone mlx_lm.server, which the wire
+    genuinely cannot show -- the whole prefill happens before the first byte is
+    sent, so without this the bar sits at "starting" for minutes.
+
+    For llama.cpp the log is richer than the wire, carrying exact prefill and
+    generation rates and per-slot detail. Watch it with --log on its own rather
+    than both: this returns the wire's numbers, not the better ones.
+    """
+    if not proxying:
+        return True
+    return isinstance(ev, OaiPrefillTick)
+
+
 def detect_engine(headers, obj):
     """Which engine served this response, or None if it did not say.
 
@@ -4828,6 +4852,8 @@ def follow(args):
         if ev is None:
             if args.debug_unparsed and looks_like_timing(line):
                 sys.stderr.write("UNPARSED: %s" % line)
+            return False
+        if not log_event_allowed(ev, proxying):
             return False
         return dispatch(ev)
 
