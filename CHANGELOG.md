@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.9.2
+
+**The program is now a package, and the single file is generated from it.** `llmwatch.py` had
+reached 6,261 lines holding nine unrelated concerns, which made every change a search problem:
+a parser fix meant navigating past the proxy, the renderer and the history store to reach it.
+The code now lives in `llmwatch/`, one module per layer, ordered so that imports only ever point
+downwards.
+
+Nothing about how you install or run llmwatch changes.
+
+- **`curl -O llmwatch.py` still gets one script with no dependencies.** That file is now built by
+  `tools/bundle.py`, which concatenates the modules in the order their imports imply. Both builds
+  run the full test suite on every push, so the single file cannot quietly rot: it is the one
+  most people actually run.
+- **The layering is enforced rather than described.** The bundler works out its order from the
+  imports, so a cycle between two modules has no valid answer and stops the build instead of
+  failing at import time in front of a user. Splitting the file surfaced one real cycle, between
+  the settings and proxy code, which is now a separate layer.
+- **Fixed: the upgrade advice was about to start reading the wrong path.** `upgrade_command` and
+  `upgrade_plan` work out how you installed llmwatch from where the code lives, using `__file__`,
+  which in a package names whichever module happened to ask rather than the thing you installed.
+  Left alone it would have told contributors running a checkout to re-download a single file, and
+  the automatic upgrade would have tried to write that file over the package directory. Both now
+  resolve the install root explicitly, and refuse rather than guess when a source tree is neither
+  a checkout nor a package-manager install.
+- No behaviour changed anywhere else. Every one of the 254 top-level definitions came across
+  unmodified, comments included, which the test suite and a structural comparison against the
+  previous file both check.
+
 ## 0.9.1
 
 **You will now hear about new versions.** 0.8.0 shipped to GitHub and never reached PyPI, and

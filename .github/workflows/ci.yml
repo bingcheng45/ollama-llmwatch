@@ -49,8 +49,23 @@ jobs:
           echo "- \`${{ matrix.os }}\` Python ${{ matrix.python-version }}: ${line:-no test output}" \
             >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Check the CLI starts and reports its version
-        run: python llmwatch.py --version
+      # llmwatch.py is generated from the llmwatch/ package. An edit that only
+      # reached the package works everywhere the maintainers look and nowhere a
+      # `curl -O llmwatch.py` user runs it, so the two are compared on every
+      # push rather than at release time.
+      - name: Check the generated single file is up to date
+        run: python tools/bundle.py --check
+
+      # ...and that it is a working program, not just an up-to-date one: the
+      # whole suite again, against a tree where `import llmwatch` resolves to
+      # the single file instead of the package.
+      - name: Run the suite against the generated single file
+        run: python tools/check_bundle.py
+
+      - name: Check both entry points start and report the version
+        run: |
+          python llmwatch.py --version
+          python -m llmwatch --version
 
       - name: Check it fails cleanly with no log present
         run: |

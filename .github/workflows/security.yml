@@ -36,13 +36,13 @@ jobs:
       # must never take down the thing it is watching. Failing the build on
       # those would train everyone to ignore this job.
       - name: Fail on medium or high findings
-        run: bandit -r llmwatch.py --severity-level medium
+        run: bandit -r llmwatch/ tools/ --severity-level medium
 
       # Still printed, so a new low finding is visible to a reviewer rather
       # than silently swallowed by the gate above.
       - name: Full report, informational
         if: always()
-        run: bandit -r llmwatch.py || true
+        run: bandit -r llmwatch/ tools/ || true
 
   audit:
     name: dependency audit

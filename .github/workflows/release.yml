@@ -27,11 +27,18 @@ jobs:
       # drifted apart with nothing to notice. A version on PyPI can never be
       # reused or corrected, so disagreement about the number has to stop the
       # release rather than ship under whichever value happened to win.
+      # The single file is generated, and a release is the worst possible time
+      # to discover it was built from something other than what is being
+      # tagged: it is what every curl user gets, and PyPI versions cannot be
+      # reused if it turns out to be stale.
+      - name: Check the generated single file is up to date
+        run: python tools/bundle.py --check
+
       - name: Check the tag, the module and the package agree
         run: |
           set -eu
           tag="${GITHUB_REF_NAME#v}"
-          module=$(python -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('llmwatch.py').read()).group(1))")
+          module=$(python -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('llmwatch/constants.py').read()).group(1))")
           package=$(python -c "import re; print(re.search(r'^version = \"([^\"]+)\"', open('pyproject.toml').read(), re.M).group(1))")
           echo "tag=$tag module=$module package=$package"
           if [ "$tag" != "$module" ] || [ "$tag" != "$package" ]; then

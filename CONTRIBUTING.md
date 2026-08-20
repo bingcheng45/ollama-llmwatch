@@ -32,28 +32,52 @@ python3 -m unittest discover tests -v
 That is the whole setup. Python 3.9 or newer, no dependencies, no virtualenv needed, no build
 step. The tests need neither a network connection nor a running model.
 
-To try your change against a real model, run it from the checkout:
+To try your change against a real model, run the package from the checkout:
 
 ```bash
-python3 llmwatch.py
+python3 -m llmwatch
 ```
+
+Use `-m llmwatch`, not `python3 llmwatch.py`. The second one runs the generated single file,
+which still holds whatever was there before your edit until you rebuild it (see below), so it is
+the one way to test a change and watch it appear to do nothing.
 
 ## How this project is built
 
-**One file, standard library only.** `llmwatch.py` is the entire program, and it is meant to stay
-something you can read in an afternoon and `curl` onto a machine with nothing installed. A pull
-request adding a dependency needs to argue for itself; usually there is a way to do it with what
-Python already ships.
+**A package you edit, a single file you ship.** The program lives in `llmwatch/`, one module per
+layer. The `llmwatch.py` at the root is **generated**: `tools/bundle.py` concatenates the modules
+into it, and that is what a `curl` install downloads. Edit the package, then run:
+
+```bash
+python3 tools/bundle.py
+```
+
+Do not edit `llmwatch.py` by hand. CI runs `tools/bundle.py --check` on every push, so an edit
+made only there fails the build rather than quietly disappearing at the next release.
+
+This arrangement exists because both properties are worth keeping. Splitting the file made it
+navigable: a parser change is 300 lines of parser instead of one file in six thousand. Generating
+the single file kept the promise that you can `curl` one script onto a machine with nothing
+installed and run it. A pull request adding a dependency still needs to argue for itself; usually
+there is a way to do it with what Python already ships.
 
 **Four layers, the first three pure.** This is the reason almost everything is testable without a
 terminal or a model, and it is worth preserving:
 
 ```
-parse_line(line)       -> Event        no I/O
-Tracker.feed(event)    -> [Output]     state machine, no I/O
-render_*(...)          -> lines        formatting only
-follow()                               all the I/O lives here
+parse_line(line)       -> Event        no I/O            parser.py
+Tracker.feed(event)    -> [Output]     state machine     tracker.py
+render_*(...)          -> lines        formatting only   render.py and friends
+follow()                               all the I/O       cli.py
 ```
+
+**Imports point one way only.** The modules are ordered, roughly `constants` and `events` at the
+bottom up to `cli` at the top, and an import may only point downwards. Nothing inside the package
+imports the package root. This is not a style preference: the bundler works out its concatenation
+order from the imports themselves, so a cycle has no valid order and stops the build. If you need
+something from a layer above, the answer is almost always to move the shared definition down
+rather than to reach up for it. `tests/test_bundle.py` will tell you which two modules are
+involved.
 
 If you find yourself wanting to read a file or check the clock inside a parser, that is usually a
 sign the value should be passed in instead. Timestamps come from the log, not from
@@ -111,8 +135,9 @@ Match the file you are editing. Beyond that:
 
 ## Releasing
 
-For maintainers. Bump the version in **both** `llmwatch.py` and `pyproject.toml`, put that
-version at the top of `CHANGELOG.md`, then:
+For maintainers. Bump the version in **both** `llmwatch/constants.py` and `pyproject.toml`, run
+`python3 tools/bundle.py` so the generated file carries the new number, put that version at the
+top of `CHANGELOG.md`, then:
 
 ```bash
 git tag v0.9.1 && git push origin v0.9.1

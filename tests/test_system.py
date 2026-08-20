@@ -154,32 +154,23 @@ class TestExpensiveProbesAreRateLimited(unittest.TestCase):
     def test_repeated_asks_within_the_interval_probe_once(self):
         now = [1000.0]
         calls = []
-        probe = SystemProbe(clock=lambda: now[0])
-        import llmwatch
-        original = llmwatch.busiest_process
-        llmwatch.busiest_process = lambda: (calls.append(1), "python 98%")[1]
-        try:
-            for _ in range(10):                 # one second of frames
-                self.assertEqual(probe.busiest(), "python 98%")
-                now[0] += 0.1
-        finally:
-            llmwatch.busiest_process = original
+        probe = SystemProbe(clock=lambda: now[0],
+                            busiest_fn=lambda: (calls.append(1), "python 98%")[1])
+        for _ in range(10):                     # one second of frames
+            self.assertEqual(probe.busiest(), "python 98%")
+            now[0] += 0.1
         self.assertEqual(len(calls), 1, "forked ps %d times in one second" % len(calls))
 
     def test_it_does_refresh_once_the_interval_passes(self):
         """Throttling must not freeze the answer: the busiest process changes."""
         now = [1000.0]
         calls = []
-        probe = SystemProbe(clock=lambda: now[0])
-        import llmwatch
-        original = llmwatch.busiest_process
-        llmwatch.busiest_process = lambda: (calls.append(1), "p%d" % len(calls))[1]
-        try:
-            first = probe.busiest()
-            now[0] += SystemProbe.BUSIEST_INTERVAL + 0.1
-            second = probe.busiest()
-        finally:
-            llmwatch.busiest_process = original
+        probe = SystemProbe(clock=lambda: now[0],
+                            busiest_fn=lambda: (calls.append(1),
+                                                "p%d" % len(calls))[1])
+        first = probe.busiest()
+        now[0] += SystemProbe.BUSIEST_INTERVAL + 0.1
+        second = probe.busiest()
         self.assertEqual((first, second), ("p1", "p2"))
 
     def test_diagnose_uses_the_injected_reader_not_the_raw_one(self):
