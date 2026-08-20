@@ -271,6 +271,262 @@ Press **`h`** for in-app help explaining every number. **`q`** or **ctrl-c** qui
 
 ---
 
+## Watching a model that is not in Ollama
+
+MLX, LM Studio, a standalone `llama-server`, vLLM: anything that speaks the OpenAI
+API can be watched, but it takes one extra flag and one change in your coding tool.
+This section is the whole sequence, in order.
+
+### Why this one is different
+
+With Ollama there is nothing to configure, because Ollama writes the numbers into
+its log and llmwatch reads them from the outside. An OpenAI server does not.
+
+```
+   OLLAMA                              OPENAI-COMPATIBLE SERVER
+   (GGUF and -mlx models)              (mlx_lm.server, LM Studio, vLLM)
+        |                                       |
+        | writes token counts and rates         | logs only
+        | into its log                          | "Prompt processing progress: n/total"
+        v                                       v
+   +----------+                          +-----------+
+   | log file | --> llmwatch reads it    | log file  | --X  no counts, no rates
+   +----------+     passively            +-----------+      nothing to read
+                                                |
+   ZERO CONFIG                           the numbers exist only in the
+   just run: ollama-llmwatch             HTTP response, in `usage`
+                                                |
+                                         so llmwatch has to sit in the path
+```
+
+That is the entire reason for the extra setup. It is not a shortcut that could be
+automated away later: the data genuinely is not in the log, so the only place to
+read it is the wire.
+
+### Step 1: install llmwatch
+
+```bash
+uv tool install ollama-llmwatch      # or: pipx install ollama-llmwatch
+```
+
+### Step 2: get a model and start its server
+
+Pick the row for the engine you use. All of these listen on **8080** by default,
+which is the port llmwatch expects to forward to.
+
+**MLX (Apple Silicon, fastest option on a Mac)**
+
+```bash
+uv tool install mlx-lm
+hf download mlx-community/Qwen3-30B-A3B-4bit --local-dir ~/models/mlx/qwen3-30b-4bit
+mlx_lm.server --model ~/models/mlx/qwen3-30b-4bit --host 127.0.0.1 --port 8080
+```
+
+Any `mlx-community/*` model works. 4-bit quantisations are the usual choice: a 30B
+at 4-bit needs roughly 17 GB of unified memory, a 27B roughly 15 GB.
+
+**llama.cpp (GGUF, cross platform)**
+
+```bash
+llama-server -hf ggml-org/gpt-oss-20b-GGUF --host 127.0.0.1 --port 8080
+```
+
+`llama-server` can also be watched without a proxy at all, by pointing `--log` at
+its output, because its log does carry the numbers. The proxy still works and needs
+no log file.
+
+**LM Studio**
+
+Start the local server from the Developer tab. It listens on **1234**, not 8080, so
+llmwatch needs telling: `--upstream http://127.0.0.1:1234`.
+
+**vLLM**
+
+```bash
+vllm serve Qwen/Qwen3-30B-A3B --host 127.0.0.1 --port 8080
+```
+
+Before going further, check the server is actually up:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/models | head -c 80
+```
+
+Expect JSON beginning `{"object": "list"`. If this fails, nothing downstream can work.
+
+### Step 3: why llmwatch uses a second port
+
+A proxy stands between two programs, so it cannot share a port with either of them.
+Your model server keeps **8080**. llmwatch takes **8081** and forwards everything to
+8080, reading the numbers as they go past.
+
+```
+BEFORE
+                                       +------------------+
+  +----------+                         | model server     |
+  | your CLI | ----------------------> | :8080            |
+  +----------+        :8080            +------------------+
+
+                 llmwatch sees nothing
+
+
+AFTER
+  +----------+       +---------------+       +------------------+
+  | your CLI | ----> |   llmwatch    | ----> | model server     |
+  +----------+ :8081 |    :8081      | :8080 | :8080            |
+                     +-------+-------+       +------------------+
+                             |
+                             | reads `usage` and timings off the wire
+                             | (never the message content)
+                             v
+                     +---------------+
+                     | tok/s, prefill|
+                     | generate, TUI |
+                     +---------------+
+```
+
+Nothing about your model server changes. The only thing that moves is which address
+your coding tool dials.
+
+### Step 4: turn on proxy mode
+
+Either pass the flag:
+
+```bash
+ollama-llmwatch --proxy
+```
+
+or set it once and forget it, so plain `ollama-llmwatch` proxies from then on:
+
+```bash
+echo 'export LLMWATCH_PROXY=8081' >> ~/.zshrc
+```
+
+**Then open a new terminal.** Environment variables are read when a program starts,
+so a tab you already had open will not have it, and llmwatch will quietly come up in
+Ollama mode instead. This is the single most common way this goes wrong.
+
+Check before continuing:
+
+```bash
+echo $LLMWATCH_PROXY          # must print 8081
+```
+
+Both `8081` and `http://127.0.0.1:8080` are defaults, so there is nothing else to
+pass. Use `--upstream` only if your server is somewhere else, such as LM Studio:
+
+```bash
+ollama-llmwatch --proxy --upstream http://127.0.0.1:1234
+```
+
+### Step 5: point your tool at llmwatch
+
+Change the base URL from `:8080` to `:8081`. Every tool spells this differently, but
+it is always the same setting, and most of them read it at startup, so **restart the
+tool afterwards**.
+
+| tool | where | set it to |
+|------|-------|-----------|
+| opencode | `~/.config/opencode/opencode.json` | `"baseURL": "http://127.0.0.1:8081/v1"` |
+| Codex CLI | `~/.codex/config.toml` | `openai_base_url = "http://127.0.0.1:8081/v1"` |
+| Continue | `~/.continue/config.json` | `"apiBase": "http://127.0.0.1:8081/v1"` |
+| Aider | command line | `--openai-api-base http://127.0.0.1:8081/v1` |
+| open-webui | environment | `OPENAI_API_BASE_URL=http://127.0.0.1:8081/v1` |
+| OpenAI SDKs | environment | `OPENAI_BASE_URL=http://127.0.0.1:8081/v1` |
+
+opencode, in full:
+
+```json
+{
+  "provider": {
+    "local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8081/v1" },
+      "models": { "my-model": { "name": "My model" } }
+    }
+  },
+  "model": "local/my-model"
+}
+```
+
+Codex CLI, in full:
+
+```toml
+model = "my-model"
+openai_base_url = "http://127.0.0.1:8081/v1"
+```
+
+Your own script, whatever the language:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8081/v1", api_key="not-needed")
+```
+
+Key names move around between versions. If yours does not match, look for whatever
+your tool calls the base URL or API base, and confirm with the check below rather
+than by guessing.
+
+### Step 6: check it works before involving your tool
+
+Two commands, in a second terminal, while llmwatch is running. Do these first: they
+tell you whether the problem is llmwatch or your tool, which is the difference
+between a two minute fix and an afternoon.
+
+```bash
+lsof -nP -iTCP:8081 -sTCP:LISTEN
+```
+
+This must return a row. If it is empty, llmwatch is not proxying and step 4 did not
+take. Do not continue until it does.
+
+```bash
+curl -s -N http://127.0.0.1:8081/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"my-model","messages":[{"role":"user","content":"Count to 20."}],"max_tokens":80,"stream":true}' \
+  -o /dev/null -w "http=%{http_code}\n"
+```
+
+Watch the llmwatch screen while it runs. Rates should appear within a second or two.
+
+```
+  http=200   llmwatch works. If your tool still shows nothing, the tool is
+             still pointed at :8080, or it was not restarted.
+
+  http=000   nothing is listening on 8081. curl could not connect at all,
+             which is always step 4, never llmwatch or the model server.
+
+  it hangs   the model server is stuck, not llmwatch. Check whether it is
+             doing any work at all:
+                 ps -o %cpu= -p $(pgrep -f mlx_lm.server)
+             0.0% while a request is in flight means wedged. Restart it.
+```
+
+### The three ways this goes wrong
+
+```
+  1. ran ollama-llmwatch without proxy mode
+     -> it watches Ollama's log, finds nothing, and says "no model loaded".
+        True, and useless: your MLX model is invisible from that backend.
+
+  2. set LLMWATCH_PROXY but launched from an old terminal tab
+     -> the tab never inherited it. Looks exactly like never setting it.
+
+  3. left the coding tool pointed at :8080
+     -> traffic bypasses llmwatch completely. Everything works normally
+        and nothing is ever measured.
+```
+
+All three produce an empty screen and no error, which is what makes them expensive.
+llmwatch now checks for this itself: when the Ollama side has nothing to show and an
+OpenAI server is listening nearby, the idle line names the port and the flag.
+
+One caveat worth knowing on a Mac: two large models resident at once will swap, and
+a swapping MLX server can wedge hard enough to sit at 0% CPU with a request open. If
+you are comparing engines, run one at a time.
+
+---
+
 ## FAQ
 
 ### Does this need an internet connection?
@@ -401,6 +657,16 @@ Then point your client at the proxy instead of the server. The default upstream 
 
 A standalone `llama-server` can also be watched the older way, by pointing `--log` at its
 output, which adds the per-slot detail the wire does not carry.
+
+[Watching a model that is not in Ollama](#watching-a-model-that-is-not-in-ollama) has the
+full sequence, including which setting to change in opencode, Codex and the rest.
+
+### Why does the proxy need a second port?
+
+Because a proxy stands between two programs, and cannot share a port with either. Your model
+server keeps 8080; llmwatch takes 8081 and forwards to it. Nothing about the server changes,
+only the address your coding tool dials. Set `LLMWATCH_PROXY=8081` once in your shell profile
+and plain `ollama-llmwatch` proxies from then on, with no flags at all.
 
 ### Does it show speculative decoding (MTP, EAGLE, DFlash)?
 
