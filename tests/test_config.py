@@ -582,5 +582,34 @@ class TestFindingItFromThePane(unittest.TestCase):
         self.assertIsNone(action)
         self.assertEqual(state["level"], "top")
 
+
+class TestDiscoveredNamesCannotDriveTheTerminal(unittest.TestCase):
+    """A filename is chosen by whoever can write to the directory, and one of
+    the directories searched is world-writable. `\\x1b[2J` clears the screen and
+    `\\x1b]0;...\\x07` rewrites the title, so a name is untrusted input and has
+    to cross the same boundary every other untrusted string does.
+    """
+
+    def test_an_escape_sequence_in_a_filename_does_not_reach_the_terminal(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "pwn\x1b[2J\x1b]0;hijacked\x07.log")
+        with open(path, "w") as fh:
+            fh.write("x I slot print_timing: id  1 | task 1 | draft acceptance"
+                     " = 0.5 (  1 accepted /   2 generated), mean len =  1.00\n")
+        row = discover_backends(dirs=(d,), ports=())[0]
+        self.assertNotIn("\x1b", describe_backend(row))
+
+    def test_a_hostile_model_id_from_a_server_is_defused_too(self):
+        row = {"kind": "server", "engine": "llama.cpp", "port": 8080,
+               "models": ["evil\x1b[2Jname"], "apply": {}}
+        self.assertNotIn("\x1b", describe_backend(row))
+
+    def test_the_idle_line_defuses_them_as_well(self):
+        from llmwatch import render_idle
+        line = render_idle(5.0, PLAIN, {
+            "proxying": True, "upstream": "http://127.0.0.1:8080",
+            "upstream_models": ["a\x1b[2Jb"]})
+        self.assertNotIn("\x1b", line)
+
 if __name__ == "__main__":
     unittest.main()

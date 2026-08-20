@@ -1608,7 +1608,8 @@ def render_idle(age, style, system=None):
         # the server does not serve gets nothing back, and nothing says why.
         models = system.get("upstream_models")
         if models:
-            line += "  |  serving: %s" % ", ".join(models[:3])
+            line += "  |  serving: %s" % ", ".join(
+                safe_text(name, limit=60) for name in models[:3])
             if len(models) > 3:
                 line += " (+%d)" % (len(models) - 3)
         elif models == []:
@@ -2436,7 +2437,14 @@ _BACK = ("ESC", "LEFT")
 # a few directories, only *.log, only files touched recently, and only the tail
 # of each is read. This runs because somebody asked it to, so it may take a
 # moment, but it may not go wandering.
-LOG_SEARCH_DIRS = ("/tmp", "~/Library/Logs", "/var/log", "/opt/homebrew/var/log")
+# nosec B108 -- these are read, never written. bandit flags /tmp because a
+# world-writable directory is the wrong place to *create* a file; nothing here
+# creates one. It is however the right place to look, because it is where
+# people redirect a server's output. What that world-writability does mean is
+# that the names found here are attacker-controlled, so everything discovered
+# goes through safe_text before it can reach a terminal.
+LOG_SEARCH_DIRS = ("/tmp", "~/Library/Logs", "/var/log",  # nosec B108
+                   "/opt/homebrew/var/log")
 LOG_SEARCH_MAX_AGE = 24 * 3600.0
 LOG_SEARCH_TAIL = 64 * 1024
 LOG_SEARCH_FILES = 60
@@ -2564,15 +2572,21 @@ def discover_backends(dirs=LOG_SEARCH_DIRS, ports=DISCOVER_PORTS, now=None,
 
 def describe_backend(row):
     """One line for the pane, in the words the rest of the pane uses."""
+    # Everything interpolated here came from outside: a filename chosen by
+    # whoever could write to the directory, or a model id from a server's
+    # response. A name is allowed to contain an escape sequence, and one of
+    # these directories is world-writable.
     if row["kind"] == "log":
         return "%s log   %s   (%s old)" % (
-            row["engine"], row["path"], fmt_duration(row["age"]))
+            row["engine"], safe_text(row["path"], limit=120),
+            fmt_duration(row["age"]))
     if row["kind"] == "ollama":
         return "Ollama   %d model%s installed" % (
             len(row.get("models") or []),
             "" if len(row.get("models") or []) == 1 else "s")
     models = row.get("models") or []
-    what = models[0] if len(models) == 1 else "%d models" % len(models)
+    what = (safe_text(models[0], limit=80) if len(models) == 1
+            else "%d models" % len(models))
     engine = (row.get("engine") or "OpenAI") + " server"
     return "%s on :%d   %s" % (engine, row["port"], what or "no models")
 
