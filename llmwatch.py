@@ -2390,13 +2390,38 @@ def render_help(style, cols, rows):
 
 # Only the typed fields. The mode is picked with 1/2/3, so it is not a
 # cursor row and the cursor never points at something undrawn.
-SETTINGS_ROWS = ("proxy_port", "upstream", "log")
-
-SETTINGS_MODE_HELP = (
-    ("ollama", "Ollama", "nothing to configure, reads Ollama's own log"),
-    ("proxy", "An OpenAI server", "mlx_lm, LM Studio, vLLM: sits in front and reads the wire"),
-    ("log", "A log file", "llama.cpp: reads the server's log, no proxy needed"),
+# Named for what someone is running, not for how llmwatch connects to it.
+# "proxy" and "log" are true and useless to anyone who has not read the
+# README; "an MLX model" is what they would say out loud. Each preset carries
+# the settings that choice implies, so choosing is the whole interaction.
+#
+# Speculative variants (MTP, EAGLE, DFlash) are deliberately absent. They are
+# not a way of connecting and there is nothing to choose: whichever server is
+# in front, llmwatch reads the acceptance rate off it and says so.
+SETTINGS_PRESETS = (
+    ("ollama", "Ollama", "anything pulled with `ollama run`",
+     {"watch": "ollama"}),
+    ("mlx", "An MLX model", "served by mlx_lm.server",
+     {"watch": "proxy", "upstream": "http://127.0.0.1:8080"}),
+    ("gguf", "A GGUF model", "served by llama.cpp",
+     {"watch": "log"}),
+    ("lmstudio", "LM Studio", "its own local server",
+     {"watch": "proxy", "upstream": "http://127.0.0.1:1234"}),
+    ("other", "Something else", "anything speaking the OpenAI API",
+     {"watch": "proxy"}),
 )
+
+# Two levels: pick the thing to change, then change it. One flat list of every
+# setting is how a settings screen becomes a wall.
+SETTINGS_TOP = (("watch", "What you are running"),
+                ("where", "Where to find it"))
+
+SETTINGS_WHERE = (("proxy_port", "Port your apps use"),
+                  ("upstream", "Server address"),
+                  ("log", "Log file"))
+
+_ENTER = ("\r", "\n", "ENTER", " ")
+_BACK = ("ESC", "LEFT")
 
 
 def backend_suggestion(mode, system, busy):
@@ -2408,8 +2433,8 @@ def backend_suggestion(mode, system, busy):
 
     Never acted on automatically. Switching underneath someone would be worse
     than the empty board, because the numbers would quietly start meaning
-    something else and the screen would not admit it. Suggested, and accepted
-    by hand.
+    something else and the screen would not admit it. Suggested, and taken by
+    choosing it like any other option.
 
     `busy` is the veto. Traffic is arriving through the current backend, so it
     is the right one whatever else happens to be running.
@@ -2434,23 +2459,39 @@ def backend_suggestion(mode, system, busy):
     return None
 
 
+def preset_for(mode, upstream):
+    """Which preset a set of settings looks like, or None if it matches none.
+
+    So the pane can open with the current choice marked rather than making
+    someone work out which line describes what is already running.
+    """
+    for key, _title, _why, values in SETTINGS_PRESETS:
+        if values.get("watch") != mode:
+            continue
+        if "upstream" in values and values["upstream"] != upstream:
+            continue
+        return key
+    return None
+
+
 def settings_open(settings):
     """Pane state from the settings actually in force."""
+    mode = settings["watch"][0]
+    upstream = settings["upstream"][0]
     return {
-        "mode": settings["watch"][0],
+        "mode": mode,
         "proxy_port": settings["proxy_port"][0],
-        "upstream": settings["upstream"][0],
+        "upstream": upstream,
         "log": settings["log"][0] or "",
+        "preset": preset_for(mode, upstream),
         "sources": {k: v[1] for k, v in settings.items()},
+        "level": "top",
         "cursor": 0,
         "editing": None,
         "buffer": "",
-        "dirty": False,
-        # Fields changed in this pane. The source column exists to say where a
-        # value came from, so a value typed a moment ago must not still claim
-        # to be the default.
         "touched": set(),
         "message": "",
+        "suggestion": None,
     }
 
 
@@ -2466,21 +2507,34 @@ def settings_config(state):
     return data
 
 
+def _settings_rows(state):
+    if state["level"] == "top":
+        return SETTINGS_TOP
+    if state["level"] == "watch":
+        return [(p[0], p[1]) for p in SETTINGS_PRESETS]
+    return SETTINGS_WHERE
+
+
 def settings_key(state, key):
     """One keypress. Returns (state, action), action in None/close/save.
 
-    Editing is modal on purpose. Without it every letter would be a shortcut,
-    and typing a path would trigger half of them.
+    Arrows, enter, space and escape. No letter shortcuts: a letter is a
+    shortcut on one screen and half a filename on the next, and there is no
+    reading of the interface that makes both true at once.
+
+    Choosing saves. There is no separate save step to forget, and nothing here
+    is destructive enough to need confirming.
     """
     state = dict(state)
     state["message"] = ""
+    rows = _settings_rows(state)
 
     if state["editing"]:
         field = state["editing"]
-        if key in ("\x1b", "esc"):
+        if key in ("ESC",):
             state["editing"], state["buffer"] = None, ""
             return state, None
-        if key in ("\r", "\n", "enter"):
+        if key in ("\r", "\n", "ENTER"):
             value = state["buffer"].strip()
             if field == "proxy_port":
                 try:
@@ -2490,91 +2544,114 @@ def settings_key(state, key):
                     return state, None
             state[field] = value
             state["editing"], state["buffer"] = None, ""
-            state["dirty"] = True
             state["touched"] = set(state["touched"]) | {field}
-            return state, None
-        if key in ("\x7f", "\b", "backspace"):
+            return state, "save"
+        if key in ("\x7f", "\b", "BACKSPACE"):
             state["buffer"] = state["buffer"][:-1]
             return state, None
         if len(key) == 1 and key.isprintable():
             state["buffer"] += key
         return state, None
 
-    if key in ("\x1b", "esc", "s", "q"):
+    if key == "UP":
+        state["cursor"] = max(0, state["cursor"] - 1)
+        return state, None
+    if key == "DOWN":
+        state["cursor"] = min(len(rows) - 1, state["cursor"] + 1)
+        return state, None
+
+    if key in _BACK:
+        if state["level"] != "top":
+            state["level"], state["cursor"] = "top", 0
+            return state, None
         return state, "close"
-    if key == "w":
-        return state, "save"
-    if key in ("1", "2", "3"):
-        state["mode"] = SETTINGS_MODE_HELP[int(key) - 1][0]
-        state["dirty"] = True
+
+    if key in _ENTER:
+        name = rows[state["cursor"]][0]
+        if state["level"] == "top":
+            state["level"], state["cursor"] = name, 0
+            return state, None
+        if state["level"] == "watch":
+            values = dict(SETTINGS_PRESETS[state["cursor"]][3])
+            state["preset"] = name
+            state["mode"] = values["watch"]
+            if "upstream" in values:
+                state["upstream"] = values["upstream"]
+            state["level"], state["cursor"] = "top", 0
+            state["message"] = "saved"
+            return state, "save"
+        state["editing"] = name
+        state["buffer"] = str(state.get(name) or "")
         return state, None
-    if key == "a" and state.get("suggestion"):
-        state["mode"] = state["suggestion"]["mode"]
-        state["dirty"] = True
-        state["message"] = "taken. w saves it"
-        return state, None
-    if key in ("j", "down"):
-        state["cursor"] = min(state["cursor"] + 1, len(SETTINGS_ROWS) - 1)
-        return state, None
-    if key in ("k", "up"):
-        state["cursor"] = max(state["cursor"] - 1, 0)
-        return state, None
-    if key in ("\r", "\n", "enter"):
-        row = SETTINGS_ROWS[state["cursor"]]
-        state["editing"] = row
-        state["buffer"] = str(state.get(row) or "")
-        return state, None
+
     return state, None
 
 
+def _settings_summary(state, name):
+    """What the top level shows beside each row, in the same words as the
+    screen it opens."""
+    if name == "watch":
+        for key, title, _why, _values in SETTINGS_PRESETS:
+            if key == state["preset"]:
+                return title
+        return "custom"
+    if state["mode"] == "log":
+        return state.get("log") or "not set yet"
+    return state.get("upstream") or "not set yet"
+
+
 def render_settings(state, style, detected=None, width=100):
-    """The pane. Shows what is in force and where it came from before it offers
-    to change anything, because that is the question being asked."""
-    lines = [style.bold("  SETTINGS"), ""]
-    lines.append(style.dim("  what to watch"))
-    for index, (mode, title, why) in enumerate(SETTINGS_MODE_HELP, start=1):
-        chosen = "*" if state["mode"] == mode else " "
-        row = "   %s %d  %-18s %s" % (chosen, index, title, why)
-        lines.append(style.bold(row) if state["mode"] == mode else style.dim(row))
-    lines.append("")
+    """The pane. Two levels, and nothing on screen that is not either the
+    current answer or a way to change it."""
+    keys = {
+        "top": "up down move    enter open    esc close",
+        "watch": "up down move    enter choose    esc back",
+        "where": "up down move    enter edit    esc back",
+    }[state["level"]]
+    if state["editing"]:
+        keys = "type it in    enter keep    esc cancel"
 
-    def field(name, label, hint=""):
-        cursor = ">" if SETTINGS_ROWS[state["cursor"]] == name else " "
-        if state["editing"] == name:
-            shown = state["buffer"] + "_"
-            source = "typing, enter to keep, esc to drop"
-        elif name in state.get("touched", ()):
-            shown = str(state.get(name) or "-")
-            source = "typed"
-        else:
-            shown = str(state.get(name) or "-")
-            source = state["sources"].get(name, "default")
-        text = "  %s %-9s %-34s %s" % (cursor, label, shown, source)
-        if hint and not state["editing"]:
-            text += "  " + hint
-        return style.bold(text) if cursor == ">" else style.dim(text)
+    title = {"top": "SETTINGS",
+             "watch": "WHAT YOU ARE RUNNING",
+             "where": "WHERE TO FIND IT"}[state["level"]]
+    lines = [style.bold("  " + title) + style.dim("      " + keys), ""]
 
-    lines.append(style.dim("  settings"))
-    lines.append(field("proxy_port", "listen", "the port your client dials"))
-    lines.append(field("upstream", "server", "where your model server is"))
-    lines.append(field("log", "log", "for the log backend"))
+    if state["level"] == "top":
+        for index, (name, label) in enumerate(SETTINGS_TOP):
+            mark = ">" if index == state["cursor"] else " "
+            row = "  %s %-24s %s" % (mark, label, _settings_summary(state, name))
+            lines.append(style.bold(row) if mark == ">" else style.dim(row))
 
-    if state.get("suggestion"):
+    elif state["level"] == "watch":
+        for index, (name, label, why, _values) in enumerate(SETTINGS_PRESETS):
+            mark = ">" if index == state["cursor"] else " "
+            chosen = "*" if name == state["preset"] else " "
+            row = "  %s %s %-18s %s" % (mark, chosen, label, why)
+            lines.append(style.bold(row) if mark == ">" else style.dim(row))
+
+    else:
+        for index, (name, label) in enumerate(SETTINGS_WHERE):
+            mark = ">" if index == state["cursor"] else " "
+            if state["editing"] == name:
+                shown, source = state["buffer"] + "_", ""
+            elif name in state.get("touched", ()):
+                shown, source = str(state.get(name) or "-"), "typed"
+            else:
+                shown = str(state.get(name) or "-")
+                source = state["sources"].get(name, "default")
+            row = "  %s %-22s %-32s %s" % (mark, label, shown, source)
+            lines.append(style.bold(row) if mark == ">" else style.dim(row))
+
+    if state.get("suggestion") and state["level"] == "top":
         lines.append("")
-        lines.append(style.yellow(
-            "  suggested: %s  (a to accept)" % state["suggestion"]["why"]))
-    elif detected:
+        lines.append(style.yellow("  looks like: " + state["suggestion"]["why"]))
+    elif detected and state["level"] in ("top", "watch"):
         lines.append("")
         lines.append(style.dim("  found running: " + ", ".join(detected)))
 
-    lines.append("")
     if state["message"]:
+        lines.append("")
         lines.append(style.yellow("  " + state["message"]))
-    elif state["dirty"]:
-        lines.append(style.yellow("  unsaved. w saves. changes apply on restart"))
-    else:
-        lines.append(style.dim("  1/2/3 mode   j k move   enter edit   "
-                               "w save   esc close"))
     return lines
 
 

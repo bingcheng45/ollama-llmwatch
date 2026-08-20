@@ -182,8 +182,11 @@ def opened(**over):
 
 
 class TestSettingsPane(unittest.TestCase):
-    """Flags are for scripts and agents and still win. This is for the person
-    who should not have to learn them."""
+    """Arrows, enter, space, escape. Nothing else.
+
+    A letter cannot be both a shortcut and half a filename, and a settings
+    screen that needs its own key chart has failed at the one job it has.
+    """
 
     def press(self, state, *keys):
         action = None
@@ -191,63 +194,111 @@ class TestSettingsPane(unittest.TestCase):
             state, action = settings_key(state, key)
         return state, action
 
-    def test_a_number_picks_the_mode(self):
-        state, _ = self.press(opened(), "2")
-        self.assertEqual(state["mode"], "proxy")
-        self.assertTrue(state["dirty"])
-
-    def test_escape_closes_and_w_saves(self):
-        self.assertEqual(self.press(opened(), "\x1b")[1], "close")
-        self.assertEqual(self.press(opened(), "w")[1], "save")
-
-    def test_enter_on_a_text_row_starts_editing_prefilled(self):
-        state, _ = self.press(opened(), "j", "\r")
-        self.assertEqual(state["editing"], "upstream")
-        self.assertEqual(state["buffer"], "http://127.0.0.1:8080")
-
-    def test_typing_while_editing_is_not_taken_as_shortcuts(self):
-        """`w` is save and `1` picks a mode, and a path contains both. Editing
-        has to be modal or a path cannot be typed at all."""
-        state, action = self.press(opened(), "j", "j", "\r", "w", "1")
-        self.assertIsNone(action)
-        self.assertTrue(state["buffer"].endswith("w1"))
-        self.assertEqual(state["mode"], "ollama")
-
-    def test_enter_keeps_the_edit_and_escape_drops_it(self):
-        state, _ = self.press(opened(), "j", "j", "\r")
-        state["buffer"] = "/tmp/a.log"
-        state, _ = self.press(state, "\r")
-        self.assertEqual(state["log"], "/tmp/a.log")
-
-        state, _ = self.press(state, "\r")
-        state["buffer"] = "/tmp/discarded.log"
-        state, _ = self.press(state, "\x1b")
-        self.assertEqual(state["log"], "/tmp/a.log")
-        self.assertIsNone(state["editing"])
-
-    def test_backspace_deletes(self):
-        state, _ = self.press(opened(), "j", "j", "\r")
-        state["buffer"] = "abc"
-        state, _ = self.press(state, "\x7f")
-        self.assertEqual(state["buffer"], "ab")
-
-    def test_a_port_that_is_not_a_number_is_refused_not_stored(self):
+    def test_it_opens_on_a_menu_not_a_wall_of_fields(self):
         state = opened()
-        state["editing"], state["buffer"] = "proxy_port", "not-a-port"
+        self.assertEqual(state["level"], "top")
+        text = "\n".join(render_settings(state, PLAIN))
+        self.assertIn("What you are running", text)
+        self.assertIn("Where to find it", text)
+        self.assertNotIn("upstream", text)
+
+    def test_arrows_move_and_stop_at_the_ends(self):
+        state, _ = self.press(opened(), "UP")
+        self.assertEqual(state["cursor"], 0)
+        state, _ = self.press(state, "DOWN", "DOWN", "DOWN")
+        self.assertEqual(state["cursor"], 1)
+
+    def test_enter_opens_a_category_and_escape_comes_back(self):
+        state, _ = self.press(opened(), "\r")
+        self.assertEqual(state["level"], "watch")
+        state, _ = self.press(state, "ESC")
+        self.assertEqual(state["level"], "top")
+
+    def test_escape_at_the_top_closes(self):
+        self.assertEqual(self.press(opened(), "ESC")[1], "close")
+
+    def test_space_works_wherever_enter_does(self):
+        state, _ = self.press(opened(), " ")
+        self.assertEqual(state["level"], "watch")
+
+    def test_choosing_what_you_run_sets_everything_that_implies(self):
+        """The point of a preset: one choice, not three."""
+        state, action = self.press(opened(), "\r", "DOWN", "\r")
+        self.assertEqual(state["preset"], "mlx")
+        self.assertEqual(state["mode"], "proxy")
+        self.assertEqual(state["upstream"], "http://127.0.0.1:8080")
+        self.assertEqual(action, "save")
+        self.assertEqual(state["level"], "top")
+
+    def test_lm_studio_brings_its_own_port(self):
+        """Nobody should have to know LM Studio is 1234."""
+        state = opened()
+        state["cursor"] = 0
         state, _ = self.press(state, "\r")
+        state["cursor"] = 3
+        state, _ = self.press(state, "\r")
+        self.assertEqual(state["upstream"], "http://127.0.0.1:1234")
+
+    def test_choosing_saves_without_a_separate_step(self):
+        _state, action = self.press(opened(), "\r", "\r")
+        self.assertEqual(action, "save")
+
+    def test_no_letter_does_anything_at_the_menu(self):
+        for key in ("w", "a", "1", "2", "3", "j", "k", "q", "s"):
+            state, action = self.press(opened(), key)
+            self.assertIsNone(action, key)
+            self.assertEqual(state["level"], "top", key)
+            self.assertEqual(state["cursor"], 0, key)
+
+    def test_a_path_is_typed_only_after_choosing_to_edit_it(self):
+        state, _ = self.press(opened(), "DOWN", "\r")
+        self.assertEqual(state["level"], "where")
+        state, _ = self.press(state, "DOWN", "DOWN", "\r")
+        self.assertEqual(state["editing"], "log")
+        for ch in "/tmp/a.log":
+            state, _ = self.press(state, ch)
+        state, action = self.press(state, "\r")
+        self.assertEqual(state["log"], "/tmp/a.log")
+        self.assertEqual(action, "save")
+
+    def test_letters_typed_into_a_field_stay_in_the_field(self):
+        state, _ = self.press(opened(), "DOWN", "\r", "DOWN", "DOWN", "\r")
+        state, action = self.press(state, "w", "a", "1")
+        self.assertIsNone(action)
+        self.assertTrue(state["buffer"].endswith("wa1"))
+
+    def test_escape_while_typing_drops_the_edit_not_the_screen(self):
+        state, _ = self.press(opened(), "DOWN", "\r", "DOWN", "DOWN", "\r")
+        state["buffer"] = "/tmp/nope.log"
+        state, action = self.press(state, "ESC")
+        self.assertIsNone(action)
+        self.assertIsNone(state["editing"])
+        self.assertEqual(state["log"], "")
+
+    def test_a_port_that_is_not_a_number_is_refused(self):
+        state = opened()
+        state["level"], state["editing"], state["buffer"] = (
+            "where", "proxy_port", "not-a-port")
+        state, action = self.press(state, "\r")
         self.assertEqual(state["proxy_port"], 8081)
+        self.assertIsNone(action)
         self.assertIn("number", state["message"])
 
+    def test_the_menu_shows_the_current_answer_in_the_same_words(self):
+        state = opened(watch=("proxy", "config"),
+                       upstream=("http://127.0.0.1:1234", "config"))
+        text = "\n".join(render_settings(state, PLAIN))
+        self.assertIn("LM Studio", text)
+
     def test_what_gets_saved_is_only_what_the_pane_sets(self):
-        state, _ = self.press(opened(), "2")
+        state, _ = self.press(opened(), "\r", "DOWN", "\r")
         data = settings_config(state)
         self.assertEqual(data["watch"], "proxy")
-        self.assertIn("proxy_port", data)
         self.assertNotIn("cursor", data)
-        self.assertNotIn("editing", data)
+        self.assertNotIn("level", data)
 
     def test_a_saved_pane_round_trips_through_the_file(self):
-        state, _ = self.press(opened(), "2")
+        state, _ = self.press(opened(), "\r", "DOWN", "\r")
         path = os.path.join(tempfile.mkdtemp(), "config.json")
         self.assertTrue(write_config(settings_config(state), path))
         self.assertEqual(read_config(path)["watch"], "proxy")
@@ -255,44 +306,40 @@ class TestSettingsPane(unittest.TestCase):
 
 class TestSettingsRendering(unittest.TestCase):
 
-    def test_it_says_which_mode_is_in_force_and_where_it_came_from(self):
-        text = "\n".join(render_settings(
-            opened(watch=("proxy", "config")), PLAIN))
-        self.assertIn("An OpenAI server", text)
-        self.assertIn("config", text)
+    def test_each_level_names_only_the_keys_that_work_there(self):
+        state = opened()
+        self.assertIn("enter open", "\n".join(render_settings(state, PLAIN)))
+        state, _ = settings_key(state, "\r")
+        self.assertIn("enter choose", "\n".join(render_settings(state, PLAIN)))
+        state, _ = settings_key(state, "ESC")
+        state, _ = settings_key(state, "DOWN")
+        state, _ = settings_key(state, "\r")
+        self.assertIn("enter edit", "\n".join(render_settings(state, PLAIN)))
+
+    def test_the_chosen_option_is_marked(self):
+        state = opened()
+        state, _ = settings_key(state, "\r")
+        self.assertIn("* Ollama", "\n".join(render_settings(state, PLAIN)))
 
     def test_it_offers_what_it_found_running(self):
-        text = "\n".join(render_settings(
-            opened(), PLAIN, detected=[":8080 llama.cpp"]))
+        text = "\n".join(render_settings(opened(), PLAIN,
+                                         detected=[":8080 llama.cpp"]))
         self.assertIn(":8080 llama.cpp", text)
-
-    def test_unsaved_changes_are_called_out(self):
-        state, _ = settings_key(opened(), "2")
-        text = "\n".join(render_settings(state, PLAIN))
-        self.assertIn("unsaved", text)
-
-    def test_a_rejected_port_is_shown_rather_than_swallowed(self):
-        state = opened()
-        state["editing"], state["buffer"] = "proxy_port", "abc"
-        state, _ = settings_key(state, "\r")
-        self.assertIn("number", "\n".join(render_settings(state, PLAIN)))
-
-
-class TestTheSourceColumnStaysHonest(unittest.TestCase):
-    """It exists to answer "why is it doing that", so it cannot go on saying
-    `default` about a value typed a moment ago."""
 
     def test_a_typed_value_says_typed(self):
         state = opened()
+        state["level"] = "where"
         state["editing"], state["buffer"] = "log", "/tmp/a.log"
         state, _ = settings_key(state, "\r")
-        text = "\n".join(render_settings(state, PLAIN))
-        self.assertIn("typed", text)
+        self.assertIn("typed", "\n".join(render_settings(state, PLAIN)))
 
-    def test_an_untouched_value_still_reports_its_real_source(self):
-        state = opened(upstream=("http://127.0.0.1:1234", "config"))
-        text = "\n".join(render_settings(state, PLAIN))
-        self.assertIn("config", text)
+    def test_speculative_variants_are_not_offered_as_a_choice(self):
+        """MTP and the rest are not a way of connecting, and there is nothing
+        to pick: llmwatch reads acceptance off whichever server is in front."""
+        state, _ = settings_key(opened(), "\r")
+        text = "\n".join(render_settings(state, PLAIN)).lower()
+        for word in ("mtp", "eagle", "dflash", "speculative"):
+            self.assertNotIn(word, text)
 
 
 from llmwatch import backend_suggestion  # noqa: E402
@@ -357,25 +404,32 @@ class TestTheSuggestionReachesTheUser(unittest.TestCase):
         self.assertIn("8080", line)
         self.assertIn("press s", line)
 
-    def test_the_pane_offers_it_and_one_key_takes_it(self):
+    def test_the_pane_shows_it_without_inventing_a_shortcut_for_it(self):
+        """It is shown on the menu, and taken by choosing it like anything
+        else. A one-key accept would be the only letter in the interface, and
+        the reason for that letter would have to be remembered."""
         state = opened()
         state["suggestion"] = {"mode": "proxy", "why": "server on :8080"}
-        self.assertIn("a to accept", "\n".join(render_settings(state, PLAIN)))
-        state, _ = settings_key(state, "a")
-        self.assertEqual(state["mode"], "proxy")
-        self.assertTrue(state["dirty"])
+        text = "\n".join(render_settings(state, PLAIN))
+        self.assertIn("server on :8080", text)
+        self.assertNotIn("accept", text)
 
-    def test_accepting_does_not_save_by_itself(self):
-        """Nothing is written until w. A suggestion taken by accident has to be
-        as easy to drop as it was to take."""
+    def test_no_letter_takes_the_suggestion(self):
         state = opened()
         state["suggestion"] = {"mode": "proxy", "why": "x"}
-        state, action = settings_key(state, "a")
-        self.assertIsNone(action)
+        for key in ("a", "y", "s"):
+            after, action = settings_key(state, key)
+            self.assertIsNone(action, key)
+            self.assertEqual(after["mode"], "ollama", key)
 
-    def test_a_without_a_suggestion_does_nothing(self):
-        state, _ = settings_key(opened(), "a")
-        self.assertEqual(state["mode"], "ollama")
+    def test_the_suggestion_only_shows_on_the_menu(self):
+        """Deep in a list of options it would be noise: the choice is already
+        on screen."""
+        state = opened()
+        state["suggestion"] = {"mode": "proxy", "why": "server on :8080"}
+        state, _ = settings_key(state, "\r")
+        self.assertNotIn("server on :8080",
+                         "\n".join(render_settings(state, PLAIN)))
 
 if __name__ == "__main__":
     unittest.main()
