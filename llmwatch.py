@@ -1988,6 +1988,9 @@ class UIState:
         # resolving. Cleared on close so it is never stale.
         self.settings = None
         self.settings_saved = None
+        # Set by the pane, cleared by the loop, which is the only thing here
+        # allowed to open sockets and read files.
+        self.settings_discover = False
         self.model_a = None
         self.model_b = None
         # Set only by an explicit confirmation in the upgrade view. The loop
@@ -2043,6 +2046,8 @@ def handle_key(state, key, models, update=None):
             state.settings = None
         elif action == "save":
             state.settings_saved = settings_config(state.settings)
+        elif action == "discover":
+            state.settings_discover = True
         return True
 
     if key in ("s", "S"):
@@ -2416,12 +2421,160 @@ SETTINGS_PRESETS = (
 SETTINGS_TOP = (("watch", "What you are running"),
                 ("where", "Where to find it"))
 
-SETTINGS_WHERE = (("proxy_port", "Port your apps use"),
+# First, because it is the answer for anyone who would otherwise be stuck:
+# the other three rows all assume you know a port or a path.
+SETTINGS_WHERE = (("discover", "I do not know, find it for me"),
+                  ("proxy_port", "Port your apps use"),
                   ("upstream", "Server address"),
                   ("log", "Log file"))
 
 _ENTER = ("\r", "\n", "ENTER", " ")
 _BACK = ("ESC", "LEFT")
+
+
+# Where a log plausibly is, when someone does not know. Bounded on every axis:
+# a few directories, only *.log, only files touched recently, and only the tail
+# of each is read. This runs because somebody asked it to, so it may take a
+# moment, but it may not go wandering.
+LOG_SEARCH_DIRS = ("/tmp", "~/Library/Logs", "/var/log", "/opt/homebrew/var/log")
+LOG_SEARCH_MAX_AGE = 24 * 3600.0
+LOG_SEARCH_TAIL = 64 * 1024
+LOG_SEARCH_FILES = 60
+# Wider than the idle-screen probe: that one runs unattended and often, this
+# one runs once because it was asked to.
+DISCOVER_PORTS = (8080, 1234, 8000, 8081, 5000, 11434)
+# Ollama answers the OpenAI API too, but proxying it would be the wrong answer:
+# it writes a log with more in it than the wire carries.
+OLLAMA_PORT = 11434
+
+
+def identify_log(path, tail=LOG_SEARCH_TAIL):
+    """Which engine wrote this file, by reading it, or None.
+
+    Read rather than guessed from the name, because the name is whatever the
+    person redirecting stderr felt like typing. The parsers already know what
+    each engine's lines look like, so a line that parses is the identification.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > tail:
+                fh.seek(size - tail)
+            blob = fh.read(tail)
+    except (OSError, ValueError):
+        return None
+    try:
+        text = blob.decode("utf-8", "replace")
+    except (UnicodeError, AttributeError):
+        return None
+
+    saw_mlx = False
+    for line in text.splitlines()[-400:]:
+        line = line + "\n"
+        if RE_MLX_RUNNER_START.search(line) or parse_mlx_line(line) is not None:
+            saw_mlx = True
+        ev = parse_line(line)
+        if ev is None:
+            continue
+        engine = engine_from_log_event(ev)
+        if engine == "llama.cpp":
+            return "llama.cpp"
+        if engine == "MLX":
+            saw_mlx = True
+    return "MLX" if saw_mlx else None
+
+
+def _discover_logs(dirs=LOG_SEARCH_DIRS, now=None):
+    now = time.time() if now is None else now
+    found, seen = [], set()
+    paths = [os.path.expanduser(p) for p in candidate_paths()]
+    for directory in dirs:
+        directory = os.path.expanduser(directory)
+        try:
+            names = sorted(os.listdir(directory))[:LOG_SEARCH_FILES]
+        except OSError:
+            continue
+        paths.extend(os.path.join(directory, n) for n in names
+                     if n.endswith(".log"))
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age > LOG_SEARCH_MAX_AGE:
+            continue
+        engine = identify_log(path)
+        if engine:
+            found.append({"kind": "log", "engine": engine, "path": path,
+                          "age": age,
+                          "apply": {"watch": "log", "log": path}})
+    found.sort(key=lambda row: row["age"])
+    return found
+
+
+def _discover_servers(ports=DISCOVER_PORTS, timeout=None, skip_ports=()):
+    # Resolved here rather than as a default, so this can be defined
+    # beside the rest of the settings code instead of beside the probe.
+    timeout = OAI_PROBE_TIMEOUT if timeout is None else timeout
+    found = []
+    for port in ports:
+        # Our own proxy answers, and relays the upstream's Server header while
+        # it is at it, so it looks exactly like whatever is behind it. Offering
+        # it would point llmwatch at itself.
+        if port in skip_ports:
+            continue
+        url = "http://127.0.0.1:%d" % port
+        obj, headers = _fetch_openai_models(url, timeout, with_headers=True)
+        if obj is None or not ("data" in obj or obj.get("object") == "list"):
+            continue
+        models = [row.get("id") for row in (obj.get("data") or [])
+                  if isinstance(row, dict) and isinstance(row.get("id"), str)]
+        if port == OLLAMA_PORT:
+            found.append({"kind": "ollama", "engine": "Ollama", "port": port,
+                          "models": models, "apply": {"watch": "ollama"}})
+            continue
+        found.append({"kind": "server", "engine": detect_engine(headers, obj),
+                      "port": port, "models": models,
+                      "apply": {"watch": "proxy", "upstream": url}})
+    return found
+
+
+def discover_backends(dirs=LOG_SEARCH_DIRS, ports=DISCOVER_PORTS, now=None,
+                      skip_ports=()):
+    """Everything locally that looks watchable, best first.
+
+    Logs come before servers for the same engine, because a log carries the
+    server's own rates and its prefill progress where the wire carries neither.
+    """
+    logs = _discover_logs(dirs, now=now)
+    servers = _discover_servers(ports, skip_ports=skip_ports)
+    logged_engines = {row["engine"] for row in logs}
+    ranked = list(logs)
+    for row in servers:
+        # A llama.cpp server whose log was already found is the same thing
+        # twice, and the log is the better half.
+        if row["engine"] in logged_engines:
+            continue
+        ranked.append(row)
+    return ranked
+
+
+def describe_backend(row):
+    """One line for the pane, in the words the rest of the pane uses."""
+    if row["kind"] == "log":
+        return "%s log   %s   (%s old)" % (
+            row["engine"], row["path"], fmt_duration(row["age"]))
+    if row["kind"] == "ollama":
+        return "Ollama   %d model%s installed" % (
+            len(row.get("models") or []),
+            "" if len(row.get("models") or []) == 1 else "s")
+    models = row.get("models") or []
+    what = models[0] if len(models) == 1 else "%d models" % len(models)
+    engine = (row.get("engine") or "OpenAI") + " server"
+    return "%s on :%d   %s" % (engine, row["port"], what or "no models")
 
 
 def backend_suggestion(mode, system, busy):
@@ -2512,6 +2665,9 @@ def _settings_rows(state):
         return SETTINGS_TOP
     if state["level"] == "watch":
         return [(p[0], p[1]) for p in SETTINGS_PRESETS]
+    if state["level"] == "found":
+        return [(str(i), describe_backend(row))
+                for i, row in enumerate(state.get("found") or [])] or [("none", "")]
     return SETTINGS_WHERE
 
 
@@ -2571,6 +2727,19 @@ def settings_key(state, key):
         if state["level"] == "top":
             state["level"], state["cursor"] = name, 0
             return state, None
+        if state["level"] == "found":
+            rows_found = state.get("found") or []
+            if rows_found:
+                chosen = rows_found[state["cursor"]]
+                for key, value in chosen["apply"].items():
+                    state["mode" if key == "watch" else key] = value
+                state["preset"] = preset_for(state["mode"], state["upstream"])
+                state["touched"] = set(state["touched"]) | set(
+                    k for k in chosen["apply"] if k != "watch")
+                state["message"] = "saved"
+            state["level"], state["cursor"] = "top", 0
+            return state, "save" if rows_found else None
+
         if state["level"] == "watch":
             values = dict(SETTINGS_PRESETS[state["cursor"]][3])
             state["preset"] = name
@@ -2580,6 +2749,11 @@ def settings_key(state, key):
             state["level"], state["cursor"] = "top", 0
             state["message"] = "saved"
             return state, "save"
+        if name == "discover":
+            # The scan opens files and sockets, so the loop runs it. This stays
+            # a pure function of keypresses.
+            state["message"] = "looking..."
+            return state, "discover"
         state["editing"] = name
         state["buffer"] = str(state.get(name) or "")
         return state, None
@@ -2595,6 +2769,10 @@ def _settings_summary(state, name):
             if key == state["preset"]:
                 return title
         return "custom"
+    if state["mode"] == "ollama":
+        # Nothing to find: the log is located automatically. Showing a server
+        # address here would imply it mattered.
+        return "found automatically"
     if state["mode"] == "log":
         return state.get("log") or "not set yet"
     return state.get("upstream") or "not set yet"
@@ -2607,13 +2785,15 @@ def render_settings(state, style, detected=None, width=100):
         "top": "up down move    enter open    esc close",
         "watch": "up down move    enter choose    esc back",
         "where": "up down move    enter edit    esc back",
+        "found": "up down move    enter use    esc back",
     }[state["level"]]
     if state["editing"]:
         keys = "type it in    enter keep    esc cancel"
 
     title = {"top": "SETTINGS",
              "watch": "WHAT YOU ARE RUNNING",
-             "where": "WHERE TO FIND IT"}[state["level"]]
+             "where": "WHERE TO FIND IT",
+             "found": "WHAT I FOUND"}[state["level"]]
     lines = [style.bold("  " + title) + style.dim("      " + keys), ""]
 
     if state["level"] == "top":
@@ -2629,8 +2809,24 @@ def render_settings(state, style, detected=None, width=100):
             row = "  %s %s %-18s %s" % (mark, chosen, label, why)
             lines.append(style.bold(row) if mark == ">" else style.dim(row))
 
+    elif state["level"] == "found":
+        rows_found = state.get("found") or []
+        if not rows_found:
+            lines.append(style.dim("  nothing found. Is the model server "
+                                   "running?"))
+        for index, row in enumerate(rows_found):
+            mark = ">" if index == state["cursor"] else " "
+            text = "  %s %s" % (mark, describe_backend(row))
+            lines.append(style.bold(text) if mark == ">" else style.dim(text))
+
     else:
         for index, (name, label) in enumerate(SETTINGS_WHERE):
+            if name == "discover":
+                mark = ">" if index == state["cursor"] else " "
+                text = "  %s %s" % (mark, label)
+                lines.append(style.bold(text) if mark == ">"
+                             else style.dim(text))
+                continue
             mark = ">" if index == state["cursor"] else " "
             if state["editing"] == name:
                 shown, source = state["buffer"] + "_", ""
@@ -3373,7 +3569,7 @@ OAI_PROBE_PORTS = (8080, 1234, 8000)
 OAI_PROBE_TIMEOUT = 0.3
 
 
-def _fetch_openai_models(url, timeout):
+def _fetch_openai_models(url, timeout, with_headers=False):
     """The /v1/models payload from `url`, or None if it could not be had.
 
     None means "could not ask", which the callers keep distinct from "asked,
@@ -3388,13 +3584,15 @@ def _fetch_openai_models(url, timeout):
         with urllib.request.urlopen(url.rstrip("/") + "/v1/models",  # nosec B310
                                     timeout=timeout) as resp:
             body = resp.read(65536)
+            headers = dict(resp.headers)
     except (urllib.error.URLError, OSError, ValueError):
-        return None
+        return (None, {}) if with_headers else None
     try:
         obj = json.loads(body)
     except (ValueError, TypeError):
-        return None
-    return obj if isinstance(obj, dict) else None
+        return (None, {}) if with_headers else None
+    obj = obj if isinstance(obj, dict) else None
+    return (obj, headers) if with_headers else obj
 
 
 def list_upstream_models(url, timeout=OAI_PROBE_TIMEOUT):
@@ -5508,6 +5706,16 @@ def follow(args):
                 # which means the flags, the environment and the file.
                 ui.settings = settings_open(settings)
                 ui.settings["suggestion"] = (system_state or {}).get("suggestion")
+            if ui.settings_discover:
+                ui.settings_discover = False
+                # Skip our own listening port: the proxy answers, and relays
+                # the upstream's Server header, so it looks like whatever is
+                # behind it and would point llmwatch at itself.
+                mine = (proxy_at[1],) if proxy_at else ()
+                ui.settings["found"] = discover_backends(skip_ports=mine)
+                ui.settings["level"] = "found"
+                ui.settings["cursor"] = 0
+                ui.settings["message"] = ""
             if ui.settings_saved is not None:
                 ok = write_config(ui.settings_saved)
                 ui.settings_saved = None

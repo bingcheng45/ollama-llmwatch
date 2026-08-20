@@ -10,12 +10,14 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llmwatch import (  # noqa: E402
-    DEFAULT_PROXY_PORT, DEFAULT_UPSTREAM, config_path, effective_settings,
+    DEFAULT_PROXY_PORT, DEFAULT_UPSTREAM, LOG_SEARCH_MAX_AGE, config_path,
+    effective_settings,
     read_config, write_config,
 )
 
@@ -253,7 +255,7 @@ class TestSettingsPane(unittest.TestCase):
     def test_a_path_is_typed_only_after_choosing_to_edit_it(self):
         state, _ = self.press(opened(), "DOWN", "\r")
         self.assertEqual(state["level"], "where")
-        state, _ = self.press(state, "DOWN", "DOWN", "\r")
+        state, _ = self.press(state, "DOWN", "DOWN", "DOWN", "\r")
         self.assertEqual(state["editing"], "log")
         for ch in "/tmp/a.log":
             state, _ = self.press(state, ch)
@@ -262,13 +264,13 @@ class TestSettingsPane(unittest.TestCase):
         self.assertEqual(action, "save")
 
     def test_letters_typed_into_a_field_stay_in_the_field(self):
-        state, _ = self.press(opened(), "DOWN", "\r", "DOWN", "DOWN", "\r")
+        state, _ = self.press(opened(), "DOWN", "\r", "DOWN", "DOWN", "DOWN", "\r")
         state, action = self.press(state, "w", "a", "1")
         self.assertIsNone(action)
         self.assertTrue(state["buffer"].endswith("wa1"))
 
     def test_escape_while_typing_drops_the_edit_not_the_screen(self):
-        state, _ = self.press(opened(), "DOWN", "\r", "DOWN", "DOWN", "\r")
+        state, _ = self.press(opened(), "DOWN", "\r", "DOWN", "DOWN", "DOWN", "\r")
         state["buffer"] = "/tmp/nope.log"
         state, action = self.press(state, "ESC")
         self.assertIsNone(action)
@@ -430,6 +432,155 @@ class TestTheSuggestionReachesTheUser(unittest.TestCase):
         state, _ = settings_key(state, "\r")
         self.assertNotIn("server on :8080",
                          "\n".join(render_settings(state, PLAIN)))
+
+
+from llmwatch import (  # noqa: E402
+    describe_backend, discover_backends, identify_log,
+)
+
+
+class TestFindingItForYou(unittest.TestCase):
+    """"Where is it" assumes you know a port or a path. For anyone who does
+    not, that is the end of the road, so the first row offers to look."""
+
+    def write(self, name, text):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, name)
+        with open(path, "w") as fh:
+            fh.write(text)
+        return d, path
+
+    def test_a_log_is_identified_by_reading_it_not_by_its_name(self):
+        """The name is whatever the person redirecting stderr felt like
+        typing, so it says nothing."""
+        _d, path = self.write("anything-at-all.log",
+            "x I slot print_timing: id  3 | task 44 | draft acceptance = 0.57818"
+            " (  159 accepted /   275 generated), mean len =  4.97\n")
+        self.assertEqual(identify_log(path), "llama.cpp")
+
+    def test_an_unrelated_log_is_not_claimed(self):
+        _d, path = self.write("nginx.log", "127.0.0.1 - - [x] GET / 200\n")
+        self.assertIsNone(identify_log(path))
+
+    def test_a_missing_or_unreadable_file_is_not_an_error(self):
+        self.assertIsNone(identify_log("/nonexistent/nope.log"))
+        self.assertIsNone(identify_log("/"))
+
+    def test_binary_rubbish_does_not_crash_the_scan(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "x.log")
+        with open(path, "wb") as fh:
+            fh.write(bytes(range(256)) * 4)
+        self.assertIsNone(identify_log(path))
+
+    def test_a_stale_log_is_not_offered(self):
+        """A log from last week is not what is running now."""
+        d, path = self.write("old.log",
+            "x I slot print_timing: id  1 | task 1 | draft acceptance = 0.5"
+            " (  1 accepted /   2 generated), mean len =  1.00\n")
+        old = os.path.getmtime(path) + LOG_SEARCH_MAX_AGE + 60
+        found = discover_backends(dirs=(d,), ports=(), now=old)
+        self.assertEqual(found, [])
+
+    def test_the_freshest_log_comes_first(self):
+        d = tempfile.mkdtemp()
+        line = ("x I slot print_timing: id  1 | task 1 | draft acceptance = 0.5"
+                " (  1 accepted /   2 generated), mean len =  1.00\n")
+        for name, when in (("old.log", 5000), ("new.log", 10)):
+            path = os.path.join(d, name)
+            with open(path, "w") as fh:
+                fh.write(line)
+            os.utime(path, (time.time() - when, time.time() - when))
+        found = discover_backends(dirs=(d,), ports=())
+        self.assertTrue(found[0]["path"].endswith("new.log"))
+
+    def test_each_result_carries_what_to_do_about_it(self):
+        """The pane applies `apply` and has no opinions of its own."""
+        _d, path = self.write("a.log",
+            "x I slot print_timing: id  1 | task 1 | draft acceptance = 0.5"
+            " (  1 accepted /   2 generated), mean len =  1.00\n")
+        row = discover_backends(dirs=(os.path.dirname(path),), ports=())[0]
+        self.assertEqual(row["apply"], {"watch": "log", "log": path})
+        self.assertIn("llama.cpp", describe_backend(row))
+
+
+class TestTheScanDoesNotFindItself(unittest.TestCase):
+
+    def test_our_own_listening_port_is_skipped(self):
+        """llmwatch's proxy answers /v1/models and relays the upstream's Server
+        header, so it looks exactly like whatever is behind it. Offering it
+        would point llmwatch at itself."""
+        import http.server
+        import threading
+
+        body = json.dumps({"object": "list", "data": [{"id": "m"}]}).encode()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        port = srv.server_address[1]
+
+        self.assertTrue(discover_backends(dirs=(), ports=(port,)))
+        self.assertEqual(
+            discover_backends(dirs=(), ports=(port,), skip_ports=(port,)), [])
+
+
+class TestFindingItFromThePane(unittest.TestCase):
+
+    def press(self, state, *keys):
+        action = None
+        for key in keys:
+            state, action = settings_key(state, key)
+        return state, action
+
+    def test_the_first_row_offers_to_look(self):
+        state, _ = self.press(opened(), "DOWN", "\r")
+        text = "\n".join(render_settings(state, PLAIN))
+        self.assertIn("I do not know", text)
+
+    def test_choosing_it_asks_the_loop_to_scan(self):
+        """The pane opens no sockets and reads no files; it says what it wants
+        and the loop does it."""
+        state, action = self.press(opened(), "DOWN", "\r", "\r")
+        self.assertEqual(action, "discover")
+
+    def test_picking_a_result_applies_everything_it_implies(self):
+        state = opened()
+        state["level"], state["cursor"] = "found", 0
+        state["found"] = [{"kind": "log", "engine": "llama.cpp",
+                           "path": "/tmp/x.log", "age": 5.0,
+                           "apply": {"watch": "log", "log": "/tmp/x.log"}}]
+        state, action = self.press(state, "\r")
+        self.assertEqual(state["mode"], "log")
+        self.assertEqual(state["log"], "/tmp/x.log")
+        self.assertEqual(action, "save")
+        self.assertEqual(state["level"], "top")
+
+    def test_finding_nothing_says_so_rather_than_showing_an_empty_box(self):
+        state = opened()
+        state["level"], state["found"] = "found", []
+        text = "\n".join(render_settings(state, PLAIN))
+        self.assertIn("nothing found", text)
+
+    def test_escape_from_the_results_goes_back_not_out(self):
+        state = opened()
+        state["level"], state["found"] = "found", []
+        state, action = self.press(state, "ESC")
+        self.assertIsNone(action)
+        self.assertEqual(state["level"], "top")
 
 if __name__ == "__main__":
     unittest.main()
