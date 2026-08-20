@@ -177,8 +177,12 @@ OaiRequestEnd.__new__.__defaults__ = (None,)
 # to leave the board rather than sit there open forever.
 OaiRequestAborted = namedtuple("OaiRequestAborted", "ts")
 
+# Emitted once, the first time the upstream identifies itself. The engine is a
+# property of the server, not of a request, so it is not carried on every event.
+OaiEngine = namedtuple("OaiEngine", "engine ts")
+
 OAI_EVENTS = (OaiRequestStart, OaiPrefillTick, OaiGenTick, OaiRequestEnd,
-              OaiRequestAborted)
+              OaiRequestAborted, OaiEngine)
 
 # --------------------------------------------------------------------------
 # Layer 1: parsing
@@ -540,6 +544,9 @@ class Tracker:
 
     def __init__(self):
         self.model = "?"
+        # Which engine is behind the numbers, once the server has said so.
+        # None until then, and never inferred from the model name.
+        self.engine = None
         self.requests = {}
         self._mlx_task = 0
         self._mlx_started = None    # ts of the current request's first line
@@ -727,6 +734,10 @@ class Tracker:
             task = self._mlx_task
             # MLX gives no context size; None keeps the ctx field honestly empty
             # rather than inventing a window the renderer would then draw.
+            # The MLX runner and llama-server write different logs and are
+            # read by different parsers, so on this path the engine is known
+            # for certain rather than detected.
+            self.engine = "MLX"
             outs.extend(self.feed(RequestStart(self.MLX_SLOT, task, ev.prompt_tokens, None)))
             outs.extend(self.feed(CacheInfo(self.MLX_SLOT, task, ev.cached)))
             if ev.miss:
@@ -821,6 +832,10 @@ class Tracker:
         nothing here was printed by the server, so a request that never sent a
         `usage` block closes with no rate at all rather than an estimate.
         """
+        if isinstance(ev, OaiEngine):
+            self.engine = ev.engine
+            return []
+
         if isinstance(ev, OaiRequestStart):
             outs = []
             if ev.model and ev.model != self.model:
@@ -1556,19 +1571,65 @@ def render_live_detail(data, snap, style, age=0.0, codex=None, system=None,
     return lines
 
 
+def render_board_title(snap, style):
+    """`llmwatch 0.9.1   qwen3.8-27b-4bit (MLX)`.
+
+    The engine is appended only when the server identified itself. A model name
+    does not imply one, so an unrecognised server gets the name alone rather
+    than a guess.
+    """
+    title = "llmwatch %s   %s" % (__version__, style.bold(snap.get("model", "?")))
+    engine = snap.get("engine")
+    if engine:
+        title += style.dim(" (%s)" % engine)
+    return title
+
+
 def render_idle(age, style, system=None):
     """Idle is ambiguous: nothing has happened yet, or nothing CAN happen.
     Saying which is the difference between waiting patiently and waiting
     pointlessly."""
     spin = spinner_frame(time.time(), style)
     system = system or {}
+
+    # Under --proxy, Ollama is not the thing being watched and is frequently
+    # not running at all. Reporting its state here described a program the
+    # user had not asked about, and read as a detection failure: someone
+    # proxying a loaded llama.cpp server was told "no model loaded".
+    if system.get("proxying"):
+        where = system.get("upstream") or "the upstream"
+        if system.get("upstream_ok") is False:
+            return style.yellow(
+                "%s cannot reach %s - the proxy is up, the server behind it is not"
+                % (spin, where))
+        line = "%s waiting for a request  (idle %s)  |  forwarding to %s" % (
+            spin, fmt_duration(age), where)
+        # The silent failure this exists for: a client asking for a model id
+        # the server does not serve gets nothing back, and nothing says why.
+        models = system.get("upstream_models")
+        if models:
+            line += "  |  serving: %s" % ", ".join(
+                safe_text(name, limit=60) for name in models[:3])
+            if len(models) > 3:
+                line += " (+%d)" % (len(models) - 3)
+        elif models == []:
+            line += "  |  the server reports no models"
+        if system.get("suggestion"):
+            line += "  |  %s - press s" % system["suggestion"]["why"]
+        return style.dim(line)
+
     # An OpenAI server was found while the Ollama side had nothing to show.
     # Appended rather than substituted: whatever is wrong with Ollama is still
     # the more specific thing to say, and this is the likelier explanation of
     # why the screen is empty.
-    port = system.get("oai_port")
+    # A suggestion knows more than the bare detection does, so it wins the
+    # one line available.
+    suggestion = system.get("suggestion")
     hint = ""
-    if port:
+    if suggestion:
+        hint = "  |  %s - press s to switch" % suggestion["why"]
+    elif system.get("oai_port"):
+        port = system["oai_port"]
         hint = ("  |  OpenAI server on :%d - watch it with --proxy %d, and "
                 "point your client at :%d"
                 % (port, DEFAULT_PROXY_PORT, DEFAULT_PROXY_PORT))
@@ -1905,7 +1966,7 @@ HELP_TEXT = [
     ("", "speed, time-to-first-token, cache, what it saves per request, and"),
     ("", "median turn time split by effort level. See also --turns."),
     ("", ""),
-    ("keys", "h help   -   c compare   -   u upgrade, when one is available"
+    ("keys", "h help   -   s settings   -   c compare   -   u upgrade, when one is available"
              "   -   q or ctrl-c quit"),
 ]
 
@@ -1921,8 +1982,16 @@ class UIState:
     """
 
     def __init__(self):
-        self.view = "live"          # live | help | picker | compare | upgrade
+        self.view = "live"          # live | help | picker | compare | upgrade | settings
         self.cursor = 0
+        # Pane state, built by the loop when the pane opens because it needs
+        # the settings actually in force, which this class has no business
+        # resolving. Cleared on close so it is never stale.
+        self.settings = None
+        self.settings_saved = None
+        # Set by the pane, cleared by the loop, which is the only thing here
+        # allowed to open sockets and read files.
+        self.settings_discover = False
         self.model_a = None
         self.model_b = None
         # Set only by an explicit confirmation in the upgrade view. The loop
@@ -1967,6 +2036,23 @@ def handle_key(state, key, models, update=None):
         if not update:
             return False
         state.view = "upgrade"
+        return True
+
+    if state.view == "settings":
+        # Routed wholesale: the pane has a text field, and a path contains the
+        # same letters the board uses as shortcuts.
+        state.settings, action = settings_key(state.settings, key)
+        if action == "close":
+            state.view = "live"
+            state.settings = None
+        elif action == "save":
+            state.settings_saved = settings_config(state.settings)
+        elif action == "discover":
+            state.settings_discover = True
+        return True
+
+    if key in ("s", "S"):
+        state.view = "settings"
         return True
 
     if key in ("h", "H", "?"):
@@ -2297,6 +2383,489 @@ def render_help(style, cols, rows):
 
 
 # --------------------------------------------------------------------------
+# Layer 3b: the settings pane
+#
+# Flags stay: they are what a script or an agent uses, and they always win.
+# This is for the person who does not want to learn them, and it exists because
+# every confusion this tool has produced has been the same one -- which mode am
+# I in, and what is it watching. The pane answers that first and only then lets
+# anything be changed.
+#
+# Pure state in, lines out. The terminal only supplies keypresses.
+# --------------------------------------------------------------------------
+
+# Only the typed fields. The mode is picked with 1/2/3, so it is not a
+# cursor row and the cursor never points at something undrawn.
+# Named for what someone is running, not for how llmwatch connects to it.
+# "proxy" and "log" are true and useless to anyone who has not read the
+# README; "an MLX model" is what they would say out loud. Each preset carries
+# the settings that choice implies, so choosing is the whole interaction.
+#
+# Speculative variants (MTP, EAGLE, DFlash) are deliberately absent. They are
+# not a way of connecting and there is nothing to choose: whichever server is
+# in front, llmwatch reads the acceptance rate off it and says so.
+SETTINGS_PRESETS = (
+    ("ollama", "Ollama", "anything pulled with `ollama run`",
+     {"watch": "ollama"}),
+    ("mlx", "An MLX model", "served by mlx_lm.server",
+     {"watch": "proxy", "upstream": "http://127.0.0.1:8080"}),
+    ("gguf", "A GGUF model", "served by llama.cpp",
+     {"watch": "log"}),
+    ("lmstudio", "LM Studio", "its own local server",
+     {"watch": "proxy", "upstream": "http://127.0.0.1:1234"}),
+    ("other", "Something else", "anything speaking the OpenAI API",
+     {"watch": "proxy"}),
+)
+
+# Two levels: pick the thing to change, then change it. One flat list of every
+# setting is how a settings screen becomes a wall.
+SETTINGS_TOP = (("watch", "What you are running"),
+                ("where", "Where to find it"))
+
+# First, because it is the answer for anyone who would otherwise be stuck:
+# the other three rows all assume you know a port or a path.
+SETTINGS_WHERE = (("discover", "I do not know, find it for me"),
+                  ("proxy_port", "Port your apps use"),
+                  ("upstream", "Server address"),
+                  ("log", "Log file"))
+
+_ENTER = ("\r", "\n", "ENTER", " ")
+_BACK = ("ESC", "LEFT")
+
+
+# Where a log plausibly is, when someone does not know. Bounded on every axis:
+# a few directories, only *.log, only files touched recently, and only the tail
+# of each is read. This runs because somebody asked it to, so it may take a
+# moment, but it may not go wandering.
+# nosec B108 -- these are read, never written. bandit flags /tmp because a
+# world-writable directory is the wrong place to *create* a file; nothing here
+# creates one. It is however the right place to look, because it is where
+# people redirect a server's output. What that world-writability does mean is
+# that the names found here are attacker-controlled, so everything discovered
+# goes through safe_text before it can reach a terminal.
+LOG_SEARCH_DIRS = ("/tmp", "~/Library/Logs", "/var/log",  # nosec B108
+                   "/opt/homebrew/var/log")
+LOG_SEARCH_MAX_AGE = 24 * 3600.0
+LOG_SEARCH_TAIL = 64 * 1024
+LOG_SEARCH_FILES = 60
+# Wider than the idle-screen probe: that one runs unattended and often, this
+# one runs once because it was asked to.
+DISCOVER_PORTS = (8080, 1234, 8000, 8081, 5000, 11434)
+# Ollama answers the OpenAI API too, but proxying it would be the wrong answer:
+# it writes a log with more in it than the wire carries.
+OLLAMA_PORT = 11434
+
+
+def identify_log(path, tail=LOG_SEARCH_TAIL):
+    """Which engine wrote this file, by reading it, or None.
+
+    Read rather than guessed from the name, because the name is whatever the
+    person redirecting stderr felt like typing. The parsers already know what
+    each engine's lines look like, so a line that parses is the identification.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > tail:
+                fh.seek(size - tail)
+            blob = fh.read(tail)
+    except (OSError, ValueError):
+        return None
+    try:
+        text = blob.decode("utf-8", "replace")
+    except (UnicodeError, AttributeError):
+        return None
+
+    saw_mlx = False
+    for line in text.splitlines()[-400:]:
+        line = line + "\n"
+        if RE_MLX_RUNNER_START.search(line) or parse_mlx_line(line) is not None:
+            saw_mlx = True
+        ev = parse_line(line)
+        if ev is None:
+            continue
+        engine = engine_from_log_event(ev)
+        if engine == "llama.cpp":
+            return "llama.cpp"
+        if engine == "MLX":
+            saw_mlx = True
+    return "MLX" if saw_mlx else None
+
+
+def _discover_logs(dirs=LOG_SEARCH_DIRS, now=None):
+    now = time.time() if now is None else now
+    found, seen = [], set()
+    paths = [os.path.expanduser(p) for p in candidate_paths()]
+    for directory in dirs:
+        directory = os.path.expanduser(directory)
+        try:
+            names = sorted(os.listdir(directory))[:LOG_SEARCH_FILES]
+        except OSError:
+            continue
+        paths.extend(os.path.join(directory, n) for n in names
+                     if n.endswith(".log"))
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age > LOG_SEARCH_MAX_AGE:
+            continue
+        engine = identify_log(path)
+        if engine:
+            found.append({"kind": "log", "engine": engine, "path": path,
+                          "age": age,
+                          "apply": {"watch": "log", "log": path}})
+    found.sort(key=lambda row: row["age"])
+    return found
+
+
+def _discover_servers(ports=DISCOVER_PORTS, timeout=None, skip_ports=()):
+    # Resolved here rather than as a default, so this can be defined
+    # beside the rest of the settings code instead of beside the probe.
+    timeout = OAI_PROBE_TIMEOUT if timeout is None else timeout
+    found = []
+    for port in ports:
+        # Our own proxy answers, and relays the upstream's Server header while
+        # it is at it, so it looks exactly like whatever is behind it. Offering
+        # it would point llmwatch at itself.
+        if port in skip_ports:
+            continue
+        url = "http://127.0.0.1:%d" % port
+        obj, headers = _fetch_openai_models(url, timeout, with_headers=True)
+        if obj is None or not ("data" in obj or obj.get("object") == "list"):
+            continue
+        models = [row.get("id") for row in (obj.get("data") or [])
+                  if isinstance(row, dict) and isinstance(row.get("id"), str)]
+        if port == OLLAMA_PORT:
+            found.append({"kind": "ollama", "engine": "Ollama", "port": port,
+                          "models": models, "apply": {"watch": "ollama"}})
+            continue
+        found.append({"kind": "server", "engine": detect_engine(headers, obj),
+                      "port": port, "models": models,
+                      "apply": {"watch": "proxy", "upstream": url}})
+    return found
+
+
+def discover_backends(dirs=LOG_SEARCH_DIRS, ports=DISCOVER_PORTS, now=None,
+                      skip_ports=()):
+    """Everything locally that looks watchable, best first.
+
+    Logs come before servers for the same engine, because a log carries the
+    server's own rates and its prefill progress where the wire carries neither.
+    """
+    logs = _discover_logs(dirs, now=now)
+    servers = _discover_servers(ports, skip_ports=skip_ports)
+    logged_engines = {row["engine"] for row in logs}
+    ranked = list(logs)
+    for row in servers:
+        # A llama.cpp server whose log was already found is the same thing
+        # twice, and the log is the better half.
+        if row["engine"] in logged_engines:
+            continue
+        ranked.append(row)
+    return ranked
+
+
+def describe_backend(row):
+    """One line for the pane, in the words the rest of the pane uses."""
+    # Everything interpolated here came from outside: a filename chosen by
+    # whoever could write to the directory, or a model id from a server's
+    # response. A name is allowed to contain an escape sequence, and one of
+    # these directories is world-writable.
+    if row["kind"] == "log":
+        return "%s log   %s   (%s old)" % (
+            row["engine"], safe_text(row["path"], limit=120),
+            fmt_duration(row["age"]))
+    if row["kind"] == "ollama":
+        return "Ollama   %d model%s installed" % (
+            len(row.get("models") or []),
+            "" if len(row.get("models") or []) == 1 else "s")
+    models = row.get("models") or []
+    what = (safe_text(models[0], limit=80) if len(models) == 1
+            else "%d models" % len(models))
+    engine = (row.get("engine") or "OpenAI") + " server"
+    return "%s on :%d   %s" % (engine, row["port"], what or "no models")
+
+
+def backend_suggestion(mode, system, busy):
+    """A better backend than the one running, or None.
+
+    Choosing the backend is the one setting that cannot be got wrong loudly:
+    every wrong choice looks the same, an empty board, and nothing on it says
+    the mistake was in the choice rather than in the model.
+
+    Never acted on automatically. Switching underneath someone would be worse
+    than the empty board, because the numbers would quietly start meaning
+    something else and the screen would not admit it. Suggested, and taken by
+    choosing it like any other option.
+
+    `busy` is the veto. Traffic is arriving through the current backend, so it
+    is the right one whatever else happens to be running.
+    """
+    if busy or not system:
+        return None
+    port = system.get("oai_port")
+    loaded = system.get("models_loaded") or 0
+
+    if mode == "ollama" and not loaded and port:
+        return {"mode": "proxy",
+                "why": "an OpenAI server is answering on :%d and Ollama has "
+                       "nothing loaded" % port}
+    if mode == "proxy" and system.get("upstream_ok") is False and loaded:
+        return {"mode": "ollama",
+                "why": "the server being proxied is unreachable and Ollama has "
+                       "%d model%s loaded" % (loaded, "" if loaded == 1 else "s")}
+    if mode == "log" and port:
+        return {"mode": "proxy",
+                "why": "nothing is arriving in the log, and an OpenAI server "
+                       "is answering on :%d" % port}
+    return None
+
+
+def preset_for(mode, upstream):
+    """Which preset a set of settings looks like, or None if it matches none.
+
+    So the pane can open with the current choice marked rather than making
+    someone work out which line describes what is already running.
+    """
+    for key, _title, _why, values in SETTINGS_PRESETS:
+        if values.get("watch") != mode:
+            continue
+        if "upstream" in values and values["upstream"] != upstream:
+            continue
+        return key
+    return None
+
+
+def settings_open(settings):
+    """Pane state from the settings actually in force."""
+    mode = settings["watch"][0]
+    upstream = settings["upstream"][0]
+    return {
+        "mode": mode,
+        "proxy_port": settings["proxy_port"][0],
+        "upstream": upstream,
+        "log": settings["log"][0] or "",
+        "preset": preset_for(mode, upstream),
+        "sources": {k: v[1] for k, v in settings.items()},
+        "level": "top",
+        "cursor": 0,
+        "editing": None,
+        "buffer": "",
+        "touched": set(),
+        "message": "",
+        "suggestion": None,
+    }
+
+
+def settings_config(state):
+    """The subset worth saving. Only what this pane can set."""
+    data = {"watch": state["mode"]}
+    if state.get("proxy_port"):
+        data["proxy_port"] = int(state["proxy_port"])
+    if state.get("upstream"):
+        data["upstream"] = state["upstream"]
+    if state.get("log"):
+        data["log"] = state["log"]
+    return data
+
+
+def _settings_rows(state):
+    if state["level"] == "top":
+        return SETTINGS_TOP
+    if state["level"] == "watch":
+        return [(p[0], p[1]) for p in SETTINGS_PRESETS]
+    if state["level"] == "found":
+        return [(str(i), describe_backend(row))
+                for i, row in enumerate(state.get("found") or [])] or [("none", "")]
+    return SETTINGS_WHERE
+
+
+def settings_key(state, key):
+    """One keypress. Returns (state, action), action in None/close/save.
+
+    Arrows, enter, space and escape. No letter shortcuts: a letter is a
+    shortcut on one screen and half a filename on the next, and there is no
+    reading of the interface that makes both true at once.
+
+    Choosing saves. There is no separate save step to forget, and nothing here
+    is destructive enough to need confirming.
+    """
+    state = dict(state)
+    state["message"] = ""
+    rows = _settings_rows(state)
+
+    if state["editing"]:
+        field = state["editing"]
+        if key in ("ESC",):
+            state["editing"], state["buffer"] = None, ""
+            return state, None
+        if key in ("\r", "\n", "ENTER"):
+            value = state["buffer"].strip()
+            if field == "proxy_port":
+                try:
+                    value = int(value)
+                except ValueError:
+                    state["message"] = "a port has to be a number"
+                    return state, None
+            state[field] = value
+            state["editing"], state["buffer"] = None, ""
+            state["touched"] = set(state["touched"]) | {field}
+            return state, "save"
+        if key in ("\x7f", "\b", "BACKSPACE"):
+            state["buffer"] = state["buffer"][:-1]
+            return state, None
+        if len(key) == 1 and key.isprintable():
+            state["buffer"] += key
+        return state, None
+
+    if key == "UP":
+        state["cursor"] = max(0, state["cursor"] - 1)
+        return state, None
+    if key == "DOWN":
+        state["cursor"] = min(len(rows) - 1, state["cursor"] + 1)
+        return state, None
+
+    if key in _BACK:
+        if state["level"] != "top":
+            state["level"], state["cursor"] = "top", 0
+            return state, None
+        return state, "close"
+
+    if key in _ENTER:
+        name = rows[state["cursor"]][0]
+        if state["level"] == "top":
+            state["level"], state["cursor"] = name, 0
+            return state, None
+        if state["level"] == "found":
+            rows_found = state.get("found") or []
+            if rows_found:
+                chosen = rows_found[state["cursor"]]
+                for key, value in chosen["apply"].items():
+                    state["mode" if key == "watch" else key] = value
+                state["preset"] = preset_for(state["mode"], state["upstream"])
+                state["touched"] = set(state["touched"]) | set(
+                    k for k in chosen["apply"] if k != "watch")
+                state["message"] = "saved"
+            state["level"], state["cursor"] = "top", 0
+            return state, "save" if rows_found else None
+
+        if state["level"] == "watch":
+            values = dict(SETTINGS_PRESETS[state["cursor"]][3])
+            state["preset"] = name
+            state["mode"] = values["watch"]
+            if "upstream" in values:
+                state["upstream"] = values["upstream"]
+            state["level"], state["cursor"] = "top", 0
+            state["message"] = "saved"
+            return state, "save"
+        if name == "discover":
+            # The scan opens files and sockets, so the loop runs it. This stays
+            # a pure function of keypresses.
+            state["message"] = "looking..."
+            return state, "discover"
+        state["editing"] = name
+        state["buffer"] = str(state.get(name) or "")
+        return state, None
+
+    return state, None
+
+
+def _settings_summary(state, name):
+    """What the top level shows beside each row, in the same words as the
+    screen it opens."""
+    if name == "watch":
+        for key, title, _why, _values in SETTINGS_PRESETS:
+            if key == state["preset"]:
+                return title
+        return "custom"
+    if state["mode"] == "ollama":
+        # Nothing to find: the log is located automatically. Showing a server
+        # address here would imply it mattered.
+        return "found automatically"
+    if state["mode"] == "log":
+        return state.get("log") or "not set yet"
+    return state.get("upstream") or "not set yet"
+
+
+def render_settings(state, style, detected=None, width=100):
+    """The pane. Two levels, and nothing on screen that is not either the
+    current answer or a way to change it."""
+    keys = {
+        "top": "up down move    enter open    esc close",
+        "watch": "up down move    enter choose    esc back",
+        "where": "up down move    enter edit    esc back",
+        "found": "up down move    enter use    esc back",
+    }[state["level"]]
+    if state["editing"]:
+        keys = "type it in    enter keep    esc cancel"
+
+    title = {"top": "SETTINGS",
+             "watch": "WHAT YOU ARE RUNNING",
+             "where": "WHERE TO FIND IT",
+             "found": "WHAT I FOUND"}[state["level"]]
+    lines = [style.bold("  " + title) + style.dim("      " + keys), ""]
+
+    if state["level"] == "top":
+        for index, (name, label) in enumerate(SETTINGS_TOP):
+            mark = ">" if index == state["cursor"] else " "
+            row = "  %s %-24s %s" % (mark, label, _settings_summary(state, name))
+            lines.append(style.bold(row) if mark == ">" else style.dim(row))
+
+    elif state["level"] == "watch":
+        for index, (name, label, why, _values) in enumerate(SETTINGS_PRESETS):
+            mark = ">" if index == state["cursor"] else " "
+            chosen = "*" if name == state["preset"] else " "
+            row = "  %s %s %-18s %s" % (mark, chosen, label, why)
+            lines.append(style.bold(row) if mark == ">" else style.dim(row))
+
+    elif state["level"] == "found":
+        rows_found = state.get("found") or []
+        if not rows_found:
+            lines.append(style.dim("  nothing found. Is the model server "
+                                   "running?"))
+        for index, row in enumerate(rows_found):
+            mark = ">" if index == state["cursor"] else " "
+            text = "  %s %s" % (mark, describe_backend(row))
+            lines.append(style.bold(text) if mark == ">" else style.dim(text))
+
+    else:
+        for index, (name, label) in enumerate(SETTINGS_WHERE):
+            if name == "discover":
+                mark = ">" if index == state["cursor"] else " "
+                text = "  %s %s" % (mark, label)
+                lines.append(style.bold(text) if mark == ">"
+                             else style.dim(text))
+                continue
+            mark = ">" if index == state["cursor"] else " "
+            if state["editing"] == name:
+                shown, source = state["buffer"] + "_", ""
+            elif name in state.get("touched", ()):
+                shown, source = str(state.get(name) or "-"), "typed"
+            else:
+                shown = str(state.get(name) or "-")
+                source = state["sources"].get(name, "default")
+            row = "  %s %-22s %-32s %s" % (mark, label, shown, source)
+            lines.append(style.bold(row) if mark == ">" else style.dim(row))
+
+    if state.get("suggestion") and state["level"] == "top":
+        lines.append("")
+        lines.append(style.yellow("  looks like: " + state["suggestion"]["why"]))
+    elif detected and state["level"] in ("top", "watch"):
+        lines.append("")
+        lines.append(style.dim("  found running: " + ", ".join(detected)))
+
+    if state["message"]:
+        lines.append("")
+        lines.append(style.yellow("  " + state["message"]))
+    return lines
+
+
+# --------------------------------------------------------------------------
 # Layer 4: I/O
 # --------------------------------------------------------------------------
 
@@ -2481,6 +3050,23 @@ def read_stream_usage(payload):
             timings if isinstance(timings, dict) else None)
 
 
+def read_stream_fingerprint(payload):
+    """Just `system_fingerprint`, for engine detection.
+
+    Deliberately not folded into read_stream_usage. That function is the one
+    with a test asserting no message content can escape it, and the way to keep
+    that true is to not give it more to return.
+    """
+    try:
+        obj = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    fingerprint = obj.get("system_fingerprint")
+    return fingerprint if isinstance(fingerprint, str) else None
+
+
 def usage_counts(usage):
     """(prompt, cached, completion) from a usage block, missing fields as 0."""
     if not isinstance(usage, dict):
@@ -2606,6 +3192,22 @@ def _proxy_server_class():
 
         def do_OPTIONS(self):
             self._relay()
+
+        def _note_engine(self, headers, obj):
+            """Announce the engine, and again if it ever changes.
+
+            Not latched. Stopping MLX and starting llama.cpp on the same port
+            is routine, and a label that was learned once would then name the
+            server that had been replaced, which is worse than naming none
+            because it is confidently wrong.
+
+            Cheap enough to repeat: the header check is a dict lookup, and the
+            body is only looked at once per request by the caller.
+            """
+            found = detect_engine(headers, obj)
+            if found and found != self.server.engine:
+                self.server.engine = found
+                self._emit(OaiEngine(found, time.time()))
 
         def _emit(self, ev):
             try:
@@ -2744,6 +3346,7 @@ def _proxy_server_class():
             out_headers = [(k, v) for k, v in upstream.headers.items()
                            if k.lower() not in HOP_BY_HOP]
             length = upstream.headers.get("Content-Length")
+            self._note_engine(upstream.headers, None)
 
             # A response with a known length is not a stream; buffering it adds no
             # latency because the client cannot act on a partial body anyway.
@@ -2772,6 +3375,9 @@ def _proxy_server_class():
             # poisons `peak` and the token-weighted average.
             last_token, arrivals = None, 0
             last_tick = 0.0
+            # One body inspection per request: enough to notice a swapped
+            # server, cheap enough not to matter.
+            engine_checked = False
             try:
                 while True:
                     chunk = upstream.read(4096)
@@ -2799,6 +3405,17 @@ def _proxy_server_class():
                             # yields whichever it did send.
                             if found_timings:
                                 timings = found_timings
+                            # llama.cpp puts timings on the final chunk and
+                            # MLX puts its fingerprint on every one, so the
+                            # free check runs always and the parse runs once.
+                            if found_timings:
+                                self._note_engine(None,
+                                                  {"timings": found_timings})
+                            elif not engine_checked:
+                                engine_checked = True
+                                self._note_engine(None, {
+                                    "system_fingerprint":
+                                        read_stream_fingerprint(payload)})
                     except Exception:
                         # Format drift costs the numbers for this request, not the
                         # request itself.
@@ -2866,6 +3483,7 @@ def _proxy_server_class():
                         usage = obj["usage"]
                     if isinstance(obj.get("timings"), dict):
                         timings = obj["timings"]
+                    self._note_engine(None, obj)
             except (ValueError, TypeError):
                 usage, timings = None, None
             # No first-token mark exists for a non-streamed response, so the split
@@ -2921,6 +3539,7 @@ def _proxy_server_class():
             # check below compares against something no client can influence.
             self.upstream_origin = urllib.parse.urlsplit(
                 upstream.rstrip("/"))[:2]
+            self.engine = None
             self.emit = emit
 
         def handle_error(self, request, client_address):
@@ -2964,6 +3583,270 @@ OAI_PROBE_PORTS = (8080, 1234, 8000)
 OAI_PROBE_TIMEOUT = 0.3
 
 
+def _fetch_openai_models(url, timeout, with_headers=False):
+    """The /v1/models payload from `url`, or None if it could not be had.
+
+    None means "could not ask", which the callers keep distinct from "asked,
+    and it serves nothing".
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        # nosec B310 -- callers pass a validated http(s) upstream or a literal
+        # loopback URL built from a constant port.
+        with urllib.request.urlopen(url.rstrip("/") + "/v1/models",  # nosec B310
+                                    timeout=timeout) as resp:
+            body = resp.read(65536)
+            headers = dict(resp.headers)
+    except (urllib.error.URLError, OSError, ValueError):
+        return (None, {}) if with_headers else None
+    try:
+        obj = json.loads(body)
+    except (ValueError, TypeError):
+        return (None, {}) if with_headers else None
+    obj = obj if isinstance(obj, dict) else None
+    return (obj, headers) if with_headers else obj
+
+
+def list_upstream_models(url, timeout=OAI_PROBE_TIMEOUT):
+    """Model ids the upstream says it serves, or None if it could not be asked.
+
+    Shown on the idle screen because the failure it explains is silent: a
+    client configured with a model id the server does not serve gets nothing
+    back, and nothing anywhere says why. Swapping one local server for another
+    is enough to cause it, since the id is usually the file path or repo name
+    and changes with the server.
+    """
+    obj = _fetch_openai_models(url, timeout)
+    if obj is None:
+        return None
+    data = obj.get("data")
+    if not isinstance(data, list):
+        return None
+    ids = [row.get("id") for row in data
+           if isinstance(row, dict) and isinstance(row.get("id"), str)]
+    return ids
+
+
+def engine_from_log_event(ev):
+    """Which engine wrote this log event, or None if it did not come from a log.
+
+    Read from the event type rather than detected, because the two runners
+    write different logs and are parsed by different functions: whichever one
+    produced the event already knew.
+
+    Only for events that arrived from a log. The Tracker re-feeds some of these
+    to itself while translating an MLX request, and reading the type inside
+    feed() would flip MLX to llama.cpp halfway through its own request. Proxied
+    events return None: that path detects its own engine from the wire, and a
+    guess here must not overwrite it.
+    """
+    if isinstance(ev, MLX_EVENTS):
+        return "MLX"
+    if isinstance(ev, OAI_EVENTS):
+        return None
+    return "llama.cpp"
+
+
+def model_name_for_board(tracked, running):
+    """The model name to show, filling in from `ollama ps` when the log did not
+    say.
+
+    The log names the model once, on the line that selects it. llmwatch started
+    against an already-loaded model never sees that line and shows `?` until the
+    next model load, which can be hours.
+
+    Only when exactly one model is resident. With two there is no way to tell
+    which served the request, and naming the wrong one is worse than naming
+    none, because every rate on the board is scoped by model. A name that came
+    from the log always wins: it saw the model actually serve something, where
+    `ollama ps` only knows what is loaded.
+    """
+    if tracked and tracked != "?":
+        return tracked
+    if running and len(running) == 1:
+        return running[0]
+    return tracked or "?"
+
+
+# --------------------------------------------------------------------------
+# Saved settings
+#
+# So that `ollama-llmwatch` on its own does what you configured, rather than
+# needing the same flags typed every time. The file is the least authoritative
+# source there is: anything typed now beats it, because a setting saved months
+# ago must never silently overrule the command in front of you.
+# --------------------------------------------------------------------------
+
+WATCH_MODES = ("ollama", "proxy", "log")
+CONFIG_KEYS = ("watch", "proxy_port", "upstream", "log")
+
+
+def config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ollama-llmwatch", "config.json")
+
+
+def read_config(path=None):
+    """Saved settings, or {} if there are none that can be used.
+
+    Never raises and never blocks startup. A settings file that cannot be read
+    is a reason to fall back to defaults, not a reason to refuse to run, and an
+    unrecognised key is dropped rather than kept: the file is hand-edited as
+    often as not, and a typo should not become a setting that does nothing
+    forever without saying so.
+    """
+    try:
+        with open(path or config_path()) as fh:
+            obj = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    clean = {k: v for k, v in obj.items() if k in CONFIG_KEYS}
+    if clean.get("watch") not in WATCH_MODES:
+        clean.pop("watch", None)
+    return clean
+
+
+def write_config(data, path=None):
+    """Save settings. True if it worked.
+
+    Returns rather than raises for the same reason as above: failing to save a
+    preference must not take the screen down with it.
+    """
+    target = path or config_path()
+    try:
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(target, "w") as fh:
+            json.dump({k: v for k, v in data.items() if k in CONFIG_KEYS},
+                      fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def effective_settings(args, env, config):
+    """{setting: (value, source)} with source in flag/env/config/default.
+
+    The source is carried because a settings file invites exactly one question
+    the moment anything surprises you, which is where the value came from. The
+    settings pane answers it without anyone having to guess.
+    """
+    log_arg = getattr(args, "log", None)
+    proxy_arg = getattr(args, "proxy", None)
+    upstream_arg = getattr(args, "upstream", None)
+
+    if proxy_arg is not None:
+        watch = ("proxy", "flag")
+    elif log_arg:
+        watch = ("log", "flag")
+    elif env.get("LLMWATCH_PROXY"):
+        watch = ("proxy", "env")
+    elif env.get("LLMWATCH_LOG"):
+        watch = ("log", "env")
+    elif config.get("watch"):
+        watch = (config["watch"], "config")
+    else:
+        watch = ("ollama", "default")
+
+    if proxy_arg:
+        port = (parse_listen(proxy_arg)[1], "flag")
+    elif env.get("LLMWATCH_PROXY"):
+        port = (parse_listen(env["LLMWATCH_PROXY"])[1], "env")
+    elif config.get("proxy_port"):
+        port = (config["proxy_port"], "config")
+    else:
+        port = (DEFAULT_PROXY_PORT, "default")
+
+    if upstream_arg:
+        upstream = (upstream_arg, "flag")
+    elif env.get("LLMWATCH_UPSTREAM"):
+        upstream = (env["LLMWATCH_UPSTREAM"], "env")
+    elif config.get("upstream"):
+        upstream = (config["upstream"], "config")
+    else:
+        upstream = (DEFAULT_UPSTREAM, "default")
+
+    if log_arg:
+        log = (log_arg, "flag")
+    elif env.get("LLMWATCH_LOG"):
+        log = (env["LLMWATCH_LOG"], "env")
+    elif config.get("log"):
+        log = (config["log"], "config")
+    else:
+        log = (None, "default")
+
+    return {"watch": watch, "proxy_port": port,
+            "upstream": upstream, "log": log}
+
+
+def log_event_allowed(ev, proxying):
+    """May this log event be fed to the tracker?
+
+    Yes, unless --proxy is measuring the same requests from the wire. Both
+    sources describe the same traffic, so counting both records every request
+    twice, and the slot ids collide as well: OAI_SLOT is 1 and llama-server
+    hands out slots from 1 upward, so they also fight over the same live
+    request.
+
+    The wire wins because it is the source that is definitely present: --proxy
+    is used precisely when the log cannot be relied on. The one thing kept from
+    the log is prefill progress from a standalone mlx_lm.server, which the wire
+    genuinely cannot show -- the whole prefill happens before the first byte is
+    sent, so without this the bar sits at "starting" for minutes.
+
+    For llama.cpp the log is richer than the wire, carrying exact prefill and
+    generation rates and per-slot detail. Watch it with --log on its own rather
+    than both: this returns the wire's numbers, not the better ones.
+    """
+    if not proxying:
+        return True
+    return isinstance(ev, OaiPrefillTick)
+
+
+def detect_engine(headers, obj):
+    """Which engine served this response, or None if it did not say.
+
+    The board shows a model name, and a model name is not an engine: the same
+    `qwen3.8-27b-4bit` is served by MLX on one machine and llama.cpp on another,
+    and telling those apart is usually the reason for looking. So this reads
+    what the server states about itself and nothing else. Never the model name.
+
+    Unrecognised means unlabelled. A wrong engine label is worse than none,
+    because the label exists precisely to be compared against.
+
+    The tempting non-signal is `Server: BaseHTTP/0.6 Python/x.y`, which
+    mlx_lm.server does send -- as stdlib's default, along with every other
+    Python HTTP server including llmwatch's own proxy. Matching it would label
+    everything MLX.
+    """
+    headers = headers or {}
+    try:
+        server = str(headers.get("Server") or headers.get("server") or "")
+    except AttributeError:
+        server = ""
+    # llama.cpp names itself outright (tools/server/server-http.cpp).
+    if "llama.cpp" in server.lower():
+        return "llama.cpp"
+    if isinstance(obj, dict):
+        # `timings` is llama.cpp's own extension to the OpenAI response, so it
+        # identifies the engine even behind something that rewrote Server.
+        if isinstance(obj.get("timings"), dict):
+            return "llama.cpp"
+        # mlx_lm builds system_fingerprint as
+        # {mlx_lm_version}-{mlx_version}-{platform}-{gpu_arch}, and gpu_arch
+        # comes from mx.device_info(), which is applegpu_* wherever MLX runs.
+        fingerprint = obj.get("system_fingerprint")
+        if isinstance(fingerprint, str) and "applegpu" in fingerprint:
+            return "MLX"
+    return None
+
+
 def detect_openai_server(ports=OAI_PROBE_PORTS, timeout=OAI_PROBE_TIMEOUT):
     """The first loopback port answering /v1/models like an OpenAI server.
 
@@ -2978,22 +3861,9 @@ def detect_openai_server(ports=OAI_PROBE_PORTS, timeout=OAI_PROBE_TIMEOUT):
     endpoint, because pointing --proxy at some unrelated local service would
     route the user's traffic through it.
     """
-    import urllib.error
-    import urllib.request
-
     for port in ports:
-        url = "http://127.0.0.1:%d/v1/models" % port
-        try:
-            # nosec B310 -- literal http:// on loopback, port from a constant.
-            with urllib.request.urlopen(url, timeout=timeout) as resp:  # nosec B310
-                body = resp.read(4096)
-        except (urllib.error.URLError, OSError, ValueError):
-            continue
-        try:
-            obj = json.loads(body)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(obj, dict) and ("data" in obj or obj.get("object") == "list"):
+        obj = _fetch_openai_models("http://127.0.0.1:%d" % port, timeout)
+        if obj is not None and ("data" in obj or obj.get("object") == "list"):
             return port
     return None
 
@@ -3492,6 +4362,18 @@ def frame_lines(snap, live_text, style, cols, rows, hint=True, help_visible=Fals
                          + render_upgrade_confirm(update, style, cols,
                                                   plan=ui.upgrade_plan), "live")
 
+    if ui is not None and getattr(ui, "view", None) == "settings" and ui.settings:
+        # Same rule as help: the board goes, the live line stays, because
+        # changing a setting is no reason to lose sight of a running request.
+        found = []
+        if (system or {}).get("oai_port"):
+            found.append(":%d" % system["oai_port"])
+        pane = render_settings(ui.settings, style, detected=found, width=cols)
+        tail = ["", divider("live"), live_text or style.dim("idle")]
+        for detail in (live_detail or []):
+            tail.append(detail)
+        return pane + tail
+
     if help_visible:
         # Help replaces the board but keeps the live line: you should never lose
         # sight of the running request just because you asked what a column means.
@@ -3509,7 +4391,7 @@ def frame_lines(snap, live_text, style, cols, rows, hint=True, help_visible=Fals
     if len(live_block) >= budget:
         return live_block[-budget:]
 
-    title = "llmwatch %s   %s" % (__version__, style.bold(snap.get("model", "?")))
+    title = render_board_title(snap, style)
     meta = "%d req - %s" % (snap.get("requests", 0),
                             fmt_duration(snap.get("session_seconds", 0)))
     if snap.get("models_seen", 0) > 1:
@@ -3537,7 +4419,7 @@ def frame_lines(snap, live_text, style, cols, rows, hint=True, help_visible=Fals
                   # Last of the optional blocks, so a short terminal drops the
                   # version notice before it drops anything you are watching.
                   ["", render_update(update, style)] if update else [],
-                  ["", style.dim("h help   -   c compare   -   ctrl-c quit")] if hint else []):
+                  ["", style.dim("h help   -   s settings   -   c compare   -   ctrl-c quit")] if hint else []):
         if block and len(head) + len(block) + len(live_block) <= budget:
             head.extend(block)
     return head + live_block
@@ -3952,8 +4834,12 @@ class SystemProbe:
     # probe that opens a socket, so it must not become a thing llmwatch does
     # continuously to somebody else's server.
     OAI_INTERVAL = 30.0
+    # Long enough that a slow first request is not mistaken for a wrong
+    # backend: a 27B pays about ten seconds just to load.
+    QUIET_BEFORE_LOOKING = 60.0
 
-    def __init__(self, clock=time.monotonic, look_for_oai=False):
+    def __init__(self, clock=time.monotonic, look_for_oai=False,
+                 upstream=None):
         self._clock = clock
         # -inf, not 0: time.monotonic() can start near zero, in which case
         # `now - 0 < INTERVAL` and the very first poll probes nothing. That would
@@ -3968,12 +4854,22 @@ class SystemProbe:
         self.memory_free_pct = None
         self.load1 = None
         self.models_loaded = None
+        self.model_names = []
         self.models_gb = None
         self.server_ok = None          # None = not checked yet
         self.server_problem = None
         self._look_for_oai = look_for_oai
         self._oai_at = float("-inf")
         self.oai_port = None
+        # Set only under --proxy. The idle screen then describes this server
+        # rather than Ollama, which is not what is being watched.
+        self.upstream = upstream
+        # How long the watched backend has shown nothing. Set by the loop,
+        # which is the only thing that knows.
+        self.idle_seconds = None
+        self._upstream_at = float("-inf")
+        self.upstream_ok = None
+        self.upstream_models = None
 
     def poll(self):
         now = self._clock()
@@ -3988,11 +4884,23 @@ class SystemProbe:
         # Only when the Ollama side has nothing to show. A working Ollama setup
         # never probes anything, so this cannot cost or surprise the people it
         # has nothing to tell.
+        # Widened from "Ollama has nothing loaded" to "the backend being
+        # watched has gone quiet", because the backend that is wrong is exactly
+        # the one that never shows anything, whichever it is.
+        quiet = (self.idle_seconds is not None
+                 and self.idle_seconds >= self.QUIET_BEFORE_LOOKING)
         if (self._look_for_oai
-                and (self.server_ok is False or self.models_loaded == 0)
+                and (self.server_ok is False or self.models_loaded == 0 or quiet)
                 and now - self._oai_at >= self.OAI_INTERVAL):
             self._oai_at = now
             self.oai_port = detect_openai_server()
+        # Same rate limit and the same reason: this opens a socket, so it is
+        # not something to do on every frame.
+        if self.upstream and now - self._upstream_at >= self.OAI_INTERVAL:
+            self._upstream_at = now
+            models = list_upstream_models(self.upstream)
+            self.upstream_ok = models is not None
+            self.upstream_models = models
 
     def _read_load(self):
         try:
@@ -4041,6 +4949,9 @@ class SystemProbe:
         out = result.stdout
         rows = [r for r in out.splitlines()[1:] if r.strip()]
         self.models_loaded = len(rows)
+        # First column is the model name. Read here rather than shelling out
+        # again, so filling in a missing name costs nothing extra.
+        self.model_names = [r.split()[0] for r in rows if r.split()]
         total = 0.0
         for row in rows:
             match = re.search(r"([\d.]+)\s*GB", row)
@@ -4094,7 +5005,11 @@ class SystemProbe:
                 "swap_used_gb": self.swap_used_gb, "swap_total_gb": self.swap_total_gb,
                 "memory_free_pct": self.memory_free_pct, "load1": self.load1,
                 "models_loaded": self.models_loaded, "models_gb": self.models_gb,
+                "models_running": self.model_names,
                 "oai_port": self.oai_port,
+                "proxying": bool(self.upstream), "upstream": self.upstream,
+                "upstream_ok": self.upstream_ok,
+                "upstream_models": self.upstream_models,
                 "contention": self.contention()}
 
 
@@ -4528,7 +5443,14 @@ def _key_reader(q, stop):
 
 def follow(args):
     # `--proxy` with no value yields "", which is still a request to proxy.
-    proxying = args.proxy is not None or bool(os.environ.get("LLMWATCH_PROXY"))
+    # Saved settings are consulted last of all, so `ollama-llmwatch` on its own
+    # does what was configured while anything typed now still wins.
+    settings = effective_settings(args, os.environ, read_config())
+    proxying = settings["watch"][0] == "proxy"
+    if settings["watch"][0] == "log" and settings["log"][0]:
+        # find_log reads this, so a configured path arrives the same way an
+        # explicit --log does.
+        os.environ["LLMWATCH_LOG"] = settings["log"][0]
     kind, target = find_log()
     if not kind and not proxying:
         sys.stderr.write(
@@ -4557,9 +5479,12 @@ def follow(args):
 
     proxy_at, upstream = None, None
     if proxying:
-        listen = parse_listen(args.proxy or os.environ.get("LLMWATCH_PROXY"))
-        upstream = (args.upstream or os.environ.get("LLMWATCH_UPSTREAM")
-                    or DEFAULT_UPSTREAM)
+        listen = ("127.0.0.1", settings["proxy_port"][0])
+        if args.proxy:
+            listen = parse_listen(args.proxy)
+        elif os.environ.get("LLMWATCH_PROXY"):
+            listen = parse_listen(os.environ["LLMWATCH_PROXY"])
+        upstream = settings["upstream"][0]
         if not valid_upstream(upstream):
             sys.stderr.write(
                 "llmwatch: --upstream must be http:// or https://, got %r\n"
@@ -4621,7 +5546,8 @@ def follow(args):
     codex_tail = CodexTail() if args.codex else None
     # The OpenAI probe is only useful when not already proxying: if --proxy is
     # set, the server is already being watched and there is nothing to suggest.
-    probe = SystemProbe(look_for_oai=not proxying)  # cheap and rate-limited
+    probe = SystemProbe(look_for_oai=not proxying,
+                        upstream=upstream if proxying else None)
     history = None if args.no_history else History()
     progress_floor = ProgressFloor()   # displayed progress must never rewind
     ui = UIState()
@@ -4651,6 +5577,13 @@ def follow(args):
             if args.debug_unparsed and looks_like_timing(line):
                 sys.stderr.write("UNPARSED: %s" % line)
             return False
+        if not log_event_allowed(ev, proxying):
+            return False
+        # Servers get swapped on the same machine between runs of llmwatch and
+        # during them, so this is re-read per event rather than latched.
+        engine = engine_from_log_event(ev)
+        if engine:
+            tracker.engine = engine
         return dispatch(ev)
 
     def dispatch(ev):
@@ -4758,6 +5691,7 @@ def follow(args):
             update_box["announced"] = True
             commit(render_update(update_box["latest"], style))
         if probe:
+            probe.idle_seconds = time.time() - idle_since
             probe.poll()               # self-rate-limited: 5s cheap, 15s models
         if tui:
             if ui.view == "upgrade" and ui.upgrade_plan is None:
@@ -4768,9 +5702,42 @@ def follow(args):
                 ui.upgrade_plan = upgrade_plan()
             cols, rows = screen.size()
             snap = stats.snapshot(tracker.model)
+            snap["engine"] = tracker.engine
             age = time.time() - live_at
             codex_state = codex_tail.state() if codex_tail else None
             system_state = probe.snapshot() if probe else None
+            if system_state is not None:
+                system_state["suggestion"] = backend_suggestion(
+                    settings["watch"][0], system_state,
+                    busy=(time.time() - idle_since) < 5.0)
+            snap["model"] = model_name_for_board(
+                snap.get("model"),
+                (system_state or {}).get("models_running"))
+            if ui.view == "settings" and ui.settings is None:
+                # Carried in so the pane can offer it, rather than working it
+                # out again from a snapshot it does not have.
+                # Built here, not in UIState: it needs the settings in force,
+                # which means the flags, the environment and the file.
+                ui.settings = settings_open(settings)
+                ui.settings["suggestion"] = (system_state or {}).get("suggestion")
+            if ui.settings_discover:
+                ui.settings_discover = False
+                # Skip our own listening port: the proxy answers, and relays
+                # the upstream's Server header, so it looks like whatever is
+                # behind it and would point llmwatch at itself.
+                mine = (proxy_at[1],) if proxy_at else ()
+                ui.settings["found"] = discover_backends(skip_ports=mine)
+                ui.settings["level"] = "found"
+                ui.settings["cursor"] = 0
+                ui.settings["message"] = ""
+            if ui.settings_saved is not None:
+                ok = write_config(ui.settings_saved)
+                ui.settings_saved = None
+                if ui.settings:
+                    ui.settings["dirty"] = not ok
+                    ui.settings["message"] = (
+                        "saved to %s, restart to apply" % config_path() if ok
+                        else "could not write %s" % config_path())
             style.width = cols          # keep renderers in step with resizes
             screen.draw(compose_frame(
                 snap, live_text(), style, cols, rows,

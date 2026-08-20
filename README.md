@@ -529,6 +529,120 @@ you are comparing engines, run one at a time.
 
 ---
 
+## llama.cpp: use `--log`, not `--proxy`
+
+llama.cpp is the exception to the section above. Its log carries everything, so there
+is no proxy, no second port, and nothing to change in your client.
+
+```
+  MLX and the rest                     llama.cpp
+
+  client --> llmwatch --> mlx :8080    client -----------> llama-server :8080
+              :8081                                              | writes
+              reads the wire                                     v
+                                                          the server log
+                                                                 | reads
+                                                                 v
+                                                            llmwatch --log
+```
+
+The wire can only time arrivals from outside. The log is the server's own
+measurement, and it has things the wire structurally cannot show:
+
+| | `--log` | `--proxy` |
+|---|---|---|
+| generation tok/s | server's own figure | timed from outside |
+| prefill tok/s | server's own figure | includes queueing, so lower |
+| prefill progress bar | yes | no: prefill finishes before the first byte is sent |
+| draft acceptance | yes | yes |
+| per-slot detail, cache, graphs reused | yes | no |
+| needs a client change | no | yes |
+
+Do not pass both. They measure the same requests, so the numbers would be recorded
+twice; llmwatch drops the log's measurements when proxying to prevent that, which
+makes the combination safe rather than better. Pick one.
+
+### Speculative decoding (DFlash, MTP, EAGLE)
+
+A drafter guesses several tokens ahead and the big model verifies them in one pass.
+Accepted guesses are free, so output is identical and only the speed changes. The
+number that matters is the acceptance rate, because it can go the wrong way:
+
+| workload | acceptance | effect |
+|---|---|---|
+| code, structured output | 58-81% | 1.5x faster |
+| rote output, lists | 93% | 2x faster |
+| freeform prose | 18% | **0.6x, slower than no drafter** |
+
+Measured on one M1 Max with the same model and the same three prompts. Below roughly
+half, verification costs more than the accepted tokens save, and the base build wins.
+llmwatch shows this as `DRAFT n% accepted`, and warns when it drops far enough that
+the drafter is losing you time.
+
+### Running DFlash 2 end to end
+
+DFlash 2 is not in mainline llama.cpp yet, so the server has to be built from the
+pull request that adds it.
+
+```bash
+mkdir -p ~/llama.cpp-dflash2 && cd ~/llama.cpp-dflash2
+git init -q
+git remote add origin https://github.com/ggml-org/llama.cpp.git
+git fetch --depth 1 origin pull/27342/head:pr-27342
+git switch pr-27342
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON   # -DGGML_CUDA=ON on NVIDIA
+cmake --build build -j
+```
+
+Check the feature is in the binary before going further:
+
+```bash
+./build/bin/llama-server --help | grep -o draft-dflash
+```
+
+Then serve, keeping the log where llmwatch can read it:
+
+```bash
+./build/bin/llama-server \
+  -hf  ggml-org/Qwen3.8-27B-GGUF:Q4_K_M \
+  -hfd incoai/Qwen3.8-27B-DFlash2-GGUF:Q4_K_M \
+  --spec-type draft-dflash --spec-draft-n-max 7 \
+  --host 127.0.0.1 --port 8080 2>&1 | tee /tmp/llama-dflash2.log
+```
+
+First run downloads about 20 GB and takes around a minute to load. Wait for both of:
+
+```
+srv  llama_server: model loaded
+common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dflash'
+```
+
+Without the second line the drafter did not load and you are timing the base build.
+A line reading `dflash requires ctx_other to be set` during startup is expected and
+says so itself; the drafter loads immediately after it.
+
+Watch it, and point your client at `http://127.0.0.1:8080/v1` as usual:
+
+```bash
+ollama-llmwatch --log /tmp/llama-dflash2.log
+```
+
+An explicit `--log` beats `LLMWATCH_PROXY` if you have that exported, so this works
+as written whatever is in your shell profile. If you switch between engines often,
+two aliases save remembering which is which:
+
+```bash
+alias watch-mlx='ollama-llmwatch --proxy'
+alias watch-dflash='ollama-llmwatch --log /tmp/llama-dflash2.log'
+```
+
+The drafter is trained for one target model and will not work against another. To
+measure what it is worth on your own prompts, run the same ones without `--spec-type`
+and compare.
+
+---
+
 ## FAQ
 
 ### Does this need an internet connection?
@@ -657,11 +771,13 @@ llmwatch --proxy 9000 --upstream http://127.0.0.1:1234
 Then point your client at the proxy instead of the server. The default upstream is
 `http://127.0.0.1:8080`, which is already where `llama-server` listens.
 
-A standalone `llama-server` can also be watched the older way, by pointing `--log` at its
-output, which adds the per-slot detail the wire does not carry.
+For a standalone `llama-server`, prefer `--log`: its log carries the server's own prefill and
+generation rates, the prefill progress bar, and per-slot detail that the wire cannot show, and
+it needs no client change at all. See
+[llama.cpp: use --log, not --proxy](#llamacpp-use---log-not---proxy).
 
-[Watching a model that is not in Ollama](#watching-a-model-that-is-not-in-ollama) has the
-full sequence, including which setting to change in opencode, Codex and the rest.
+For everything else, [Watching a model that is not in Ollama](#watching-a-model-that-is-not-in-ollama)
+has the full sequence, including which setting to change in opencode, Codex and the rest.
 
 ### Why does the proxy need a second port?
 
@@ -678,6 +794,9 @@ that. `--log` reads llama.cpp's `draft acceptance` line; `--proxy` reads `draft_
 `draft_n_accepted` from the `timings` block llama-server sends beside `usage`. Either way it
 lands in the same place: the `drafts` figure on the board, the `draft_rate` column in your
 history, and a warning when acceptance drops far enough that the drafter is costing you time.
+
+[Running DFlash 2 end to end](#running-dflash-2-end-to-end) has the build and serve commands,
+and the measured acceptance rates for three kinds of workload.
 
 Acceptance appears only while a drafter is loaded. Servers running without one, and every
 OpenAI server that is not llama.cpp, simply show no draft figure rather than a zero.

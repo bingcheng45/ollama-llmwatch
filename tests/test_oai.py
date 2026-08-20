@@ -16,8 +16,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llmwatch import (  # noqa: E402
     DEFAULT_PROXY_PORT, OaiGenTick, OaiPrefillTick, OaiRequestAborted,
-    LOOPBACK_HOSTS, OaiRequestEnd, OaiRequestStart, Style, Tracker,
-    _sse_events, detect_openai_server, draft_counts, render_idle,
+    LOOPBACK_HOSTS, OaiEngine, OaiRequestEnd, OaiRequestStart, Style,
+    Tracker,
+    _sse_events, detect_engine, detect_openai_server, draft_counts,
+    engine_from_log_event, list_upstream_models, log_event_allowed,
+    model_name_for_board,
+    render_board_title,
+    render_idle,
     parse_line, parse_listen, prepare_body, read_stream_usage, start_proxy,
     safe_request_path, usage_counts, valid_upstream,
 )
@@ -854,6 +859,72 @@ class TestProxyEndToEnd(unittest.TestCase):
         self.assertEqual(upstream.requests, [])
         self.assertEqual(seen, [])
 
+    def test_the_engine_is_identified_from_a_stream(self):
+        """MLX puts system_fingerprint in every chunk, so the engine is known
+        before the response finishes."""
+        fp = chunk(choices=[{"delta": {"content": "a"}}],
+                   system_fingerprint="0.31.3-0.32.1-macOS-26.4-arm64-arm-64bit-Mach-O-applegpu_g13s")
+        upstream = StubUpstream([fp, USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        engines = [e.engine for e in seen if type(e).__name__ == "OaiEngine"]
+        self.assertEqual(engines, ["MLX"])
+
+    def test_llama_cpp_is_identified_from_its_timings(self):
+        upstream = StubUpstream(
+            [delta("a"), SPEC_USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        engines = [e.engine for e in seen if type(e).__name__ == "OaiEngine"]
+        self.assertEqual(engines, ["llama.cpp"])
+
+    def test_the_engine_is_announced_once_not_per_request(self):
+        """It is a property of the server. Re-emitting it on every request
+        would make it look like something that changes."""
+        fp = chunk(choices=[{"delta": {"content": "a"}}],
+                   system_fingerprint="0.1.0-0.1.0-macOS-applegpu_g13s")
+        upstream = StubUpstream([fp, USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        for _ in range(2):
+            finished.clear()
+            self.post(port, {"model": "m", "stream": True})
+            self.assertTrue(finished.wait(10))
+        self.assertEqual(
+            len([e for e in seen if type(e).__name__ == "OaiEngine"]), 1)
+
+    def test_the_engine_is_re_announced_when_the_server_changes(self):
+        """Not latched: stopping one server and starting another on the same
+        port is routine, and a label learned once would go on naming the one
+        that was replaced."""
+        upstream = StubUpstream(
+            [delta("a"), SPEC_USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        engines = [e.engine for e in seen if type(e).__name__ == "OaiEngine"]
+        self.assertEqual(engines, ["llama.cpp"])
+        # Same engine again must not re-announce; only a change does.
+        finished.clear()
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        engines = [e.engine for e in seen if type(e).__name__ == "OaiEngine"]
+        self.assertEqual(engines, ["llama.cpp"])
+
+    def test_an_unidentifiable_server_produces_no_engine_event(self):
+        upstream = StubUpstream([delta("a"), USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        self.assertEqual(
+            [e for e in seen if type(e).__name__ == "OaiEngine"], [])
+
     def test_a_tool_call_only_turn_is_still_measured(self):
         """Through the proxy, end to end: opencode's tool-calling turns must
         arrive with a first-token mark and real token counts."""
@@ -1048,3 +1119,287 @@ class TestOpenAiServerHint(unittest.TestCase):
                            {"server_ok": False, "oai_port": 8080})
         self.assertIn("Ollama", line)
         self.assertIn("8080", line)
+
+
+class TestEngineDetection(unittest.TestCase):
+    """Which engine produced the numbers, when the server says so.
+
+    The header shows a model name, and a model name does not say whether it is
+    being served by MLX, llama.cpp or something else -- which is exactly the
+    thing you are choosing between when you compare them. Nothing is inferred
+    from the model name itself: `qwen3.8-27b-4bit` is served by MLX here and by
+    llama.cpp elsewhere.
+    """
+
+    def test_llama_cpp_says_so_in_a_header(self):
+        """server-http.cpp sets this literally, so it is not a guess."""
+        self.assertEqual(
+            detect_engine({"Server": "llama.cpp"}, None), "llama.cpp")
+
+    def test_llama_cpp_is_also_recognised_by_its_timings_block(self):
+        """Belt and braces: a fronting reverse proxy may rewrite Server, but
+        `timings` is llama.cpp's own extension and survives."""
+        self.assertEqual(
+            detect_engine({}, {"timings": {"predicted_per_second": 20.0}}),
+            "llama.cpp")
+
+    def test_mlx_is_recognised_by_its_fingerprint(self):
+        """mlx_lm builds system_fingerprint as
+        {mlx_lm_version}-{mlx_version}-{platform}-{gpu_arch}, and the gpu arch
+        comes from mx.device_info(), which is applegpu_* wherever MLX runs."""
+        self.assertEqual(
+            detect_engine({}, {"system_fingerprint":
+                               "0.31.3-0.32.1-macOS-26.4-arm64-arm-64bit-Mach-O-applegpu_g13s"}),
+            "MLX")
+
+    def test_the_python_default_header_is_not_a_signal(self):
+        """The trap. mlx_lm.server sends `Server: BaseHTTP/0.6 Python/3.14.4`
+        because that is stdlib's default -- and so does llmwatch's own proxy.
+        Matching on it would label every server MLX, including this one."""
+        self.assertIsNone(
+            detect_engine({"Server": "BaseHTTP/0.6 Python/3.14.4"}, None))
+
+    def test_an_unrecognised_server_is_left_unlabelled(self):
+        """No label beats a wrong one: the whole point is to tell two engines
+        apart, so a guess would defeat it."""
+        for headers, obj in (({}, None), ({"Server": "uvicorn"}, {}),
+                             ({}, {"system_fingerprint": "gpt-4o-2024"}),
+                             ({}, "not a dict"), (None, None)):
+            self.assertIsNone(detect_engine(headers, obj), (headers, obj))
+
+    def test_the_header_shows_the_engine_when_known(self):
+        style = Style(color=False, unicode_ok=False, width=100)
+        line = render_board_title(
+            {"model": "qwen3.8-27b-4bit", "engine": "MLX"}, style)
+        self.assertIn("qwen3.8-27b-4bit", line)
+        self.assertIn("MLX", line)
+
+    def test_the_header_is_unchanged_when_the_engine_is_unknown(self):
+        style = Style(color=False, unicode_ok=False, width=100)
+        line = render_board_title({"model": "qwen3.8-27b-4bit"}, style)
+        self.assertIn("qwen3.8-27b-4bit", line)
+        self.assertNotIn("(", line)
+
+
+class TestIdleSpeaksAboutWhatIsBeingWatched(unittest.TestCase):
+    """Under --proxy the idle screen used to report on Ollama, which is not
+    the thing being watched and is often not even running. Someone proxying a
+    loaded llama.cpp server read `no model loaded - the first request pays a
+    load`, which was true of Ollama, irrelevant to them, and looked like a
+    detection failure.
+    """
+
+    def style(self):
+        return Style(color=False, unicode_ok=False, width=100)
+
+    def test_ollama_state_is_not_reported_while_proxying(self):
+        line = render_idle(5.0, self.style(),
+                           {"models_loaded": 0, "server_ok": False,
+                            "proxying": True,
+                            "upstream": "http://127.0.0.1:8080"})
+        self.assertNotIn("Ollama", line)
+        self.assertNotIn("no model loaded", line)
+
+    def test_the_upstream_is_named_so_it_is_obvious_what_is_watched(self):
+        line = render_idle(5.0, self.style(),
+                           {"proxying": True,
+                            "upstream": "http://127.0.0.1:8080"})
+        self.assertIn("127.0.0.1:8080", line)
+
+    def test_the_upstream_models_are_listed(self):
+        """The mismatch this exists for: the client asks for a model id the
+        server does not serve, gets nothing, and nothing says why. Showing what
+        the server does offer makes it a glance rather than an investigation."""
+        line = render_idle(5.0, self.style(),
+                           {"proxying": True,
+                            "upstream": "http://127.0.0.1:8080",
+                            "upstream_models": ["ggml-org/Qwen3.8-27B-GGUF:Q4_K_M"]})
+        self.assertIn("ggml-org/Qwen3.8-27B-GGUF:Q4_K_M", line)
+
+    def test_an_unreachable_upstream_says_so_rather_than_blaming_ollama(self):
+        line = render_idle(5.0, self.style(),
+                           {"proxying": True, "server_ok": False,
+                            "upstream": "http://127.0.0.1:8080",
+                            "upstream_ok": False})
+        self.assertNotIn("Ollama", line)
+        self.assertIn("8080", line)
+
+    def test_the_ollama_wording_is_untouched_when_not_proxying(self):
+        line = render_idle(5.0, self.style(), {"models_loaded": 0})
+        self.assertIn("no model loaded", line)
+        line = render_idle(5.0, self.style(), {"server_ok": False})
+        self.assertIn("Ollama", line)
+
+
+class TestListingUpstreamModels(unittest.TestCase):
+
+    def serve(self, body):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d" % srv.server_address[1]
+
+    def test_ids_come_back_in_order(self):
+        url = self.serve(json.dumps({"object": "list", "data": [
+            {"id": "a"}, {"id": "b"}]}).encode())
+        self.assertEqual(list_upstream_models(url), ["a", "b"])
+
+    def test_an_unreachable_upstream_is_none_not_empty(self):
+        """None means "could not ask"; [] would mean "asked, serves nothing",
+        and the idle screen says different things about each."""
+        self.assertIsNone(list_upstream_models("http://127.0.0.1:1"))
+
+    def test_junk_is_none(self):
+        self.assertIsNone(list_upstream_models(self.serve(b"<html>no</html>")))
+
+
+class TestLogEventsWhileProxying(unittest.TestCase):
+    """Both sources measure the same request, so only one of them may count it.
+
+    Under --proxy the log was still parsed in full. Against a llama-server log
+    that meant every request was recorded twice, once off the wire and once
+    from the log, and the slot ids collide as well: OAI_SLOT is 1 and
+    llama-server hands out slots 1 upward, so the two also fought over the same
+    live request.
+
+    The log keeps the one job it was given here: prefill progress from a
+    standalone mlx_lm.server, which the wire cannot show because the whole
+    prefill happens before the first byte is sent.
+    """
+
+    def test_prefill_progress_is_still_allowed_through(self):
+        self.assertTrue(log_event_allowed(OaiPrefillTick(10, 100, 1.0), True))
+
+    def test_a_measurement_from_the_log_is_not(self):
+        from llmwatch import GenDone, PrefillDone, RequestEnd
+        for ev in (PrefillDone(1, 18, 1443.0, 63, 43.6),
+                   GenDone(1, 18, 4454.0, 80, 17.7),
+                   RequestEnd(1, 18, 5898.0, 143)):
+            self.assertFalse(log_event_allowed(ev, True), ev)
+
+    def test_nothing_is_filtered_when_not_proxying(self):
+        from llmwatch import GenDone, PrefillDone, RequestEnd
+        for ev in (PrefillDone(1, 18, 1443.0, 63, 43.6),
+                   GenDone(1, 18, 4454.0, 80, 17.7),
+                   RequestEnd(1, 18, 5898.0, 143),
+                   OaiPrefillTick(10, 100, 1.0)):
+            self.assertTrue(log_event_allowed(ev, False), ev)
+
+    def test_one_request_is_recorded_once_not_twice(self):
+        """The regression, end to end through the tracker: a proxied request
+        plus the same request's log lines must produce one request_end."""
+        t = Tracker()
+        outs = []
+        t.feed(OaiRequestStart("qwen", 100.0))
+        outs += t.feed(OaiRequestEnd(63, 0, 80, 100.0, 101.4, 105.9, 106.0))
+        for line in (
+            "x I slot print_timing: id  1 | task 18 | prompt eval time = 1443.76 ms / 63 tokens (22.92 ms per token, 43.64 tokens per second)\n",
+            "x I slot print_timing: id  1 | task 18 |        eval time = 4454.45 ms / 80 tokens (56.39 ms per token, 17.74 tokens per second)\n",
+            "x I slot print_timing: id  1 | task 18 |       total time = 5898.21 ms / 143 tokens\n",
+        ):
+            ev = parse_line(line)
+            if ev is not None and log_event_allowed(ev, True):
+                outs += t.feed(ev)
+        ends = [o for o in outs if o.data.get("event") == "request_end"]
+        self.assertEqual(len(ends), 1)
+
+
+class TestTheModelNameWhenTheLogNeverSaidIt(unittest.TestCase):
+    """The log names the model once, on the line that selects it. Attach after
+    that has scrolled past -- which is what happens whenever llmwatch is
+    started at a model that is already loaded -- and the board says `?` until
+    the next model load, which may be hours.
+
+    `ollama ps` knows, and is already being run for the resident-model count.
+    """
+
+    def test_one_running_model_fills_the_gap(self):
+        self.assertEqual(
+            model_name_for_board("?", ["qwen3.8:27b-mtp-128k"]),
+            "qwen3.8:27b-mtp-128k")
+        self.assertEqual(
+            model_name_for_board(None, ["qwen3.8:27b-mtp-128k"]),
+            "qwen3.8:27b-mtp-128k")
+
+    def test_two_running_models_stay_unknown(self):
+        """With more than one resident there is no way to tell which served the
+        request, and naming the wrong one is worse than naming none: every rate
+        on the board is scoped by model."""
+        self.assertEqual(model_name_for_board("?", ["a", "b"]), "?")
+
+    def test_nothing_running_stays_unknown(self):
+        self.assertEqual(model_name_for_board("?", []), "?")
+        self.assertEqual(model_name_for_board("?", None), "?")
+
+    def test_a_name_from_the_log_is_never_overridden(self):
+        """The log saw the model actually serve the request. `ollama ps` only
+        knows what is resident, which is not the same claim."""
+        self.assertEqual(model_name_for_board("from-log", ["other"]), "from-log")
+
+
+class TestEngineFollowsAServerSwap(unittest.TestCase):
+    """Local servers get swapped on the same port all the time: stop MLX, start
+    llama.cpp, keep the client pointed where it was. Detecting the engine once
+    and never again meant the board kept naming the one that had been replaced,
+    which is worse than naming none, because it is now confidently wrong.
+    """
+
+    def test_a_new_engine_replaces_the_old_one(self):
+        t = Tracker()
+        t.feed(OaiEngine("MLX", 1.0))
+        self.assertEqual(t.engine, "MLX")
+        t.feed(OaiEngine("llama.cpp", 2.0))
+        self.assertEqual(t.engine, "llama.cpp")
+
+    def test_the_log_backend_names_llama_cpp_too(self):
+        """It only ever set MLX, so watching Ollama serve a GGUF model showed
+        no engine at all, and switching from an -mlx model to a GGUF one left
+        the previous answer standing."""
+        ev = parse_line(
+            "x I slot print_timing: id  3 | task 44 | draft acceptance = 0.57818"
+            " (  159 accepted /   275 generated), mean len =  4.97\n")
+        self.assertIsNotNone(ev)
+        self.assertEqual(engine_from_log_event(ev), "llama.cpp")
+
+    def test_the_mlx_runner_is_still_named_mlx(self):
+        from llmwatch import MlxGenStats
+        self.assertEqual(
+            engine_from_log_event(MlxGenStats(1, 8, 6, 0.75, 8.0, 1.0)), "MLX")
+
+    def test_a_proxied_event_does_not_claim_an_engine(self):
+        """The proxy detects its own engine from the wire; a log reader must not
+        overwrite that with a guess."""
+        self.assertIsNone(engine_from_log_event(OaiGenTick(5, 1.0)))
+
+    def test_an_mlx_run_after_a_llama_cpp_one_is_not_stuck(self):
+        from llmwatch import MlxRequestStart
+        t = Tracker()
+        t.engine = "llama.cpp"
+        t.feed(MlxRequestStart(10, 0, False, 1.0))
+        self.assertEqual(t.engine, "MLX")
+
+    def test_an_internally_refed_event_cannot_change_the_engine(self):
+        """The MLX path re-feeds DraftAcceptance itself, so reading the engine
+        off the event type inside feed() would have flipped MLX to llama.cpp
+        halfway through its own request."""
+        from llmwatch import MlxGenStats, MlxRequestStart
+        t = Tracker()
+        t.feed(MlxRequestStart(10, 0, False, 1.0))
+        t.feed(MlxGenStats(1, 8, 6, 0.75, 8.0, 2.0))
+        self.assertEqual(t.engine, "MLX")
