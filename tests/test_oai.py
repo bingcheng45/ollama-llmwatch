@@ -18,7 +18,8 @@ from llmwatch import (  # noqa: E402
     DEFAULT_PROXY_PORT, OaiGenTick, OaiPrefillTick, OaiRequestAborted,
     LOOPBACK_HOSTS, OaiRequestEnd, OaiRequestStart, Style, Tracker,
     _sse_events, detect_engine, detect_openai_server, draft_counts,
-    list_upstream_models, log_event_allowed, render_board_title,
+    list_upstream_models, log_event_allowed, model_name_for_board,
+    render_board_title,
     wants_proxy,
     render_idle,
     parse_line, parse_listen, prepare_body, read_stream_usage, start_proxy,
@@ -1330,3 +1331,36 @@ class TestProxyModePrecedence(unittest.TestCase):
     def test_neither_means_the_ollama_backend(self):
         self.assertFalse(wants_proxy(None, None, None))
         self.assertFalse(wants_proxy(None, None, ""))
+
+
+class TestTheModelNameWhenTheLogNeverSaidIt(unittest.TestCase):
+    """The log names the model once, on the line that selects it. Attach after
+    that has scrolled past -- which is what happens whenever llmwatch is
+    started at a model that is already loaded -- and the board says `?` until
+    the next model load, which may be hours.
+
+    `ollama ps` knows, and is already being run for the resident-model count.
+    """
+
+    def test_one_running_model_fills_the_gap(self):
+        self.assertEqual(
+            model_name_for_board("?", ["qwen3.8:27b-mtp-128k"]),
+            "qwen3.8:27b-mtp-128k")
+        self.assertEqual(
+            model_name_for_board(None, ["qwen3.8:27b-mtp-128k"]),
+            "qwen3.8:27b-mtp-128k")
+
+    def test_two_running_models_stay_unknown(self):
+        """With more than one resident there is no way to tell which served the
+        request, and naming the wrong one is worse than naming none: every rate
+        on the board is scoped by model."""
+        self.assertEqual(model_name_for_board("?", ["a", "b"]), "?")
+
+    def test_nothing_running_stays_unknown(self):
+        self.assertEqual(model_name_for_board("?", []), "?")
+        self.assertEqual(model_name_for_board("?", None), "?")
+
+    def test_a_name_from_the_log_is_never_overridden(self):
+        """The log saw the model actually serve the request. `ollama ps` only
+        knows what is resident, which is not the same claim."""
+        self.assertEqual(model_name_for_board("from-log", ["other"]), "from-log")

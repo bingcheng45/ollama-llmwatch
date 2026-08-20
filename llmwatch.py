@@ -3099,6 +3099,27 @@ def list_upstream_models(url, timeout=OAI_PROBE_TIMEOUT):
     return ids
 
 
+def model_name_for_board(tracked, running):
+    """The model name to show, filling in from `ollama ps` when the log did not
+    say.
+
+    The log names the model once, on the line that selects it. llmwatch started
+    against an already-loaded model never sees that line and shows `?` until the
+    next model load, which can be hours.
+
+    Only when exactly one model is resident. With two there is no way to tell
+    which served the request, and naming the wrong one is worse than naming
+    none, because every rate on the board is scoped by model. A name that came
+    from the log always wins: it saw the model actually serve something, where
+    `ollama ps` only knows what is loaded.
+    """
+    if tracked and tracked != "?":
+        return tracked
+    if running and len(running) == 1:
+        return running[0]
+    return tracked or "?"
+
+
 def wants_proxy(proxy_arg, log_arg, env_proxy):
     """Should this run proxy an OpenAI server rather than read a log?
 
@@ -4178,6 +4199,7 @@ class SystemProbe:
         self.memory_free_pct = None
         self.load1 = None
         self.models_loaded = None
+        self.model_names = []
         self.models_gb = None
         self.server_ok = None          # None = not checked yet
         self.server_problem = None
@@ -4264,6 +4286,9 @@ class SystemProbe:
         out = result.stdout
         rows = [r for r in out.splitlines()[1:] if r.strip()]
         self.models_loaded = len(rows)
+        # First column is the model name. Read here rather than shelling out
+        # again, so filling in a missing name costs nothing extra.
+        self.model_names = [r.split()[0] for r in rows if r.split()]
         total = 0.0
         for row in rows:
             match = re.search(r"([\d.]+)\s*GB", row)
@@ -4317,6 +4342,7 @@ class SystemProbe:
                 "swap_used_gb": self.swap_used_gb, "swap_total_gb": self.swap_total_gb,
                 "memory_free_pct": self.memory_free_pct, "load1": self.load1,
                 "models_loaded": self.models_loaded, "models_gb": self.models_gb,
+                "models_running": self.model_names,
                 "oai_port": self.oai_port,
                 "proxying": bool(self.upstream), "upstream": self.upstream,
                 "upstream_ok": self.upstream_ok,
@@ -5002,6 +5028,9 @@ def follow(args):
             age = time.time() - live_at
             codex_state = codex_tail.state() if codex_tail else None
             system_state = probe.snapshot() if probe else None
+            snap["model"] = model_name_for_board(
+                snap.get("model"),
+                (system_state or {}).get("models_running"))
             style.width = cols          # keep renderers in step with resizes
             screen.draw(compose_frame(
                 snap, live_text(), style, cols, rows,
