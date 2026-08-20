@@ -1958,7 +1958,7 @@ HELP_TEXT = [
     ("", "speed, time-to-first-token, cache, what it saves per request, and"),
     ("", "median turn time split by effort level. See also --turns."),
     ("", ""),
-    ("keys", "h help   -   c compare   -   u upgrade, when one is available"
+    ("keys", "h help   -   s settings   -   c compare   -   u upgrade, when one is available"
              "   -   q or ctrl-c quit"),
 ]
 
@@ -1974,8 +1974,13 @@ class UIState:
     """
 
     def __init__(self):
-        self.view = "live"          # live | help | picker | compare | upgrade
+        self.view = "live"          # live | help | picker | compare | upgrade | settings
         self.cursor = 0
+        # Pane state, built by the loop when the pane opens because it needs
+        # the settings actually in force, which this class has no business
+        # resolving. Cleared on close so it is never stale.
+        self.settings = None
+        self.settings_saved = None
         self.model_a = None
         self.model_b = None
         # Set only by an explicit confirmation in the upgrade view. The loop
@@ -2020,6 +2025,21 @@ def handle_key(state, key, models, update=None):
         if not update:
             return False
         state.view = "upgrade"
+        return True
+
+    if state.view == "settings":
+        # Routed wholesale: the pane has a text field, and a path contains the
+        # same letters the board uses as shortcuts.
+        state.settings, action = settings_key(state.settings, key)
+        if action == "close":
+            state.view = "live"
+            state.settings = None
+        elif action == "save":
+            state.settings_saved = settings_config(state.settings)
+        return True
+
+    if key in ("s", "S"):
+        state.view = "settings"
         return True
 
     if key in ("h", "H", "?"):
@@ -2347,6 +2367,164 @@ def render_help(style, cols, rows):
         out.append("  " + (style.cyan(padded) if label else padded) +
                    " " + (text if label else style.dim(text)))
     return out[:max(1, rows - 1)]
+
+
+# --------------------------------------------------------------------------
+# Layer 3b: the settings pane
+#
+# Flags stay: they are what a script or an agent uses, and they always win.
+# This is for the person who does not want to learn them, and it exists because
+# every confusion this tool has produced has been the same one -- which mode am
+# I in, and what is it watching. The pane answers that first and only then lets
+# anything be changed.
+#
+# Pure state in, lines out. The terminal only supplies keypresses.
+# --------------------------------------------------------------------------
+
+# Only the typed fields. The mode is picked with 1/2/3, so it is not a
+# cursor row and the cursor never points at something undrawn.
+SETTINGS_ROWS = ("proxy_port", "upstream", "log")
+
+SETTINGS_MODE_HELP = (
+    ("ollama", "Ollama", "nothing to configure, reads Ollama's own log"),
+    ("proxy", "An OpenAI server", "mlx_lm, LM Studio, vLLM: sits in front and reads the wire"),
+    ("log", "A log file", "llama.cpp: reads the server's log, no proxy needed"),
+)
+
+
+def settings_open(settings):
+    """Pane state from the settings actually in force."""
+    return {
+        "mode": settings["watch"][0],
+        "proxy_port": settings["proxy_port"][0],
+        "upstream": settings["upstream"][0],
+        "log": settings["log"][0] or "",
+        "sources": {k: v[1] for k, v in settings.items()},
+        "cursor": 0,
+        "editing": None,
+        "buffer": "",
+        "dirty": False,
+        # Fields changed in this pane. The source column exists to say where a
+        # value came from, so a value typed a moment ago must not still claim
+        # to be the default.
+        "touched": set(),
+        "message": "",
+    }
+
+
+def settings_config(state):
+    """The subset worth saving. Only what this pane can set."""
+    data = {"watch": state["mode"]}
+    if state.get("proxy_port"):
+        data["proxy_port"] = int(state["proxy_port"])
+    if state.get("upstream"):
+        data["upstream"] = state["upstream"]
+    if state.get("log"):
+        data["log"] = state["log"]
+    return data
+
+
+def settings_key(state, key):
+    """One keypress. Returns (state, action), action in None/close/save.
+
+    Editing is modal on purpose. Without it every letter would be a shortcut,
+    and typing a path would trigger half of them.
+    """
+    state = dict(state)
+    state["message"] = ""
+
+    if state["editing"]:
+        field = state["editing"]
+        if key in ("\x1b", "esc"):
+            state["editing"], state["buffer"] = None, ""
+            return state, None
+        if key in ("\r", "\n", "enter"):
+            value = state["buffer"].strip()
+            if field == "proxy_port":
+                try:
+                    value = int(value)
+                except ValueError:
+                    state["message"] = "a port has to be a number"
+                    return state, None
+            state[field] = value
+            state["editing"], state["buffer"] = None, ""
+            state["dirty"] = True
+            state["touched"] = set(state["touched"]) | {field}
+            return state, None
+        if key in ("\x7f", "\b", "backspace"):
+            state["buffer"] = state["buffer"][:-1]
+            return state, None
+        if len(key) == 1 and key.isprintable():
+            state["buffer"] += key
+        return state, None
+
+    if key in ("\x1b", "esc", "s", "q"):
+        return state, "close"
+    if key == "w":
+        return state, "save"
+    if key in ("1", "2", "3"):
+        state["mode"] = SETTINGS_MODE_HELP[int(key) - 1][0]
+        state["dirty"] = True
+        return state, None
+    if key in ("j", "down"):
+        state["cursor"] = min(state["cursor"] + 1, len(SETTINGS_ROWS) - 1)
+        return state, None
+    if key in ("k", "up"):
+        state["cursor"] = max(state["cursor"] - 1, 0)
+        return state, None
+    if key in ("\r", "\n", "enter"):
+        row = SETTINGS_ROWS[state["cursor"]]
+        state["editing"] = row
+        state["buffer"] = str(state.get(row) or "")
+        return state, None
+    return state, None
+
+
+def render_settings(state, style, detected=None, width=100):
+    """The pane. Shows what is in force and where it came from before it offers
+    to change anything, because that is the question being asked."""
+    lines = [style.bold("  SETTINGS"), ""]
+    lines.append(style.dim("  what to watch"))
+    for index, (mode, title, why) in enumerate(SETTINGS_MODE_HELP, start=1):
+        chosen = "*" if state["mode"] == mode else " "
+        row = "   %s %d  %-18s %s" % (chosen, index, title, why)
+        lines.append(style.bold(row) if state["mode"] == mode else style.dim(row))
+    lines.append("")
+
+    def field(name, label, hint=""):
+        cursor = ">" if SETTINGS_ROWS[state["cursor"]] == name else " "
+        if state["editing"] == name:
+            shown = state["buffer"] + "_"
+            source = "typing, enter to keep, esc to drop"
+        elif name in state.get("touched", ()):
+            shown = str(state.get(name) or "-")
+            source = "typed"
+        else:
+            shown = str(state.get(name) or "-")
+            source = state["sources"].get(name, "default")
+        text = "  %s %-9s %-34s %s" % (cursor, label, shown, source)
+        if hint and not state["editing"]:
+            text += "  " + hint
+        return style.bold(text) if cursor == ">" else style.dim(text)
+
+    lines.append(style.dim("  settings"))
+    lines.append(field("proxy_port", "listen", "the port your client dials"))
+    lines.append(field("upstream", "server", "where your model server is"))
+    lines.append(field("log", "log", "for the log backend"))
+
+    if detected:
+        lines.append("")
+        lines.append(style.dim("  found running: " + ", ".join(detected)))
+
+    lines.append("")
+    if state["message"]:
+        lines.append(style.yellow("  " + state["message"]))
+    elif state["dirty"]:
+        lines.append(style.yellow("  unsaved. w saves. changes apply on restart"))
+    else:
+        lines.append(style.dim("  1/2/3 mode   j k move   enter edit   "
+                               "w save   esc close"))
+    return lines
 
 
 # --------------------------------------------------------------------------
@@ -3152,29 +3330,119 @@ def model_name_for_board(tracked, running):
     return tracked or "?"
 
 
-def wants_proxy(proxy_arg, log_arg, env_proxy):
-    """Should this run proxy an OpenAI server rather than read a log?
+# --------------------------------------------------------------------------
+# Saved settings
+#
+# So that `ollama-llmwatch` on its own does what you configured, rather than
+# needing the same flags typed every time. The file is the least authoritative
+# source there is: anything typed now beats it, because a setting saved months
+# ago must never silently overrule the command in front of you.
+# --------------------------------------------------------------------------
 
-    Precedence, because the two sources cannot both be the measurement:
+WATCH_MODES = ("ollama", "proxy", "log")
+CONFIG_KEYS = ("watch", "proxy_port", "upstream", "log")
 
-      --proxy            typed now, wins outright
-      --log without it   typed now, and says to read a log, so no proxy
-      LLMWATCH_PROXY     ambient, set once in a profile and then forgotten
 
-    The ambient one losing to a typed --log is the point. With it exported,
-    `--log` used to start in proxy mode anyway and the log was read by nothing,
-    which left `LLMWATCH_PROXY= ollama-llmwatch --log ...` as the only way to
-    say what should have been obvious.
+def config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ollama-llmwatch", "config.json")
 
-    Both typed together is still a real combination and still works: the proxy
-    measures, and a standalone mlx_lm.server log supplies the prefill progress
-    the wire cannot show.
+
+def read_config(path=None):
+    """Saved settings, or {} if there are none that can be used.
+
+    Never raises and never blocks startup. A settings file that cannot be read
+    is a reason to fall back to defaults, not a reason to refuse to run, and an
+    unrecognised key is dropped rather than kept: the file is hand-edited as
+    often as not, and a typo should not become a setting that does nothing
+    forever without saying so.
     """
-    if proxy_arg is not None:
+    try:
+        with open(path or config_path()) as fh:
+            obj = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    clean = {k: v for k, v in obj.items() if k in CONFIG_KEYS}
+    if clean.get("watch") not in WATCH_MODES:
+        clean.pop("watch", None)
+    return clean
+
+
+def write_config(data, path=None):
+    """Save settings. True if it worked.
+
+    Returns rather than raises for the same reason as above: failing to save a
+    preference must not take the screen down with it.
+    """
+    target = path or config_path()
+    try:
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(target, "w") as fh:
+            json.dump({k: v for k, v in data.items() if k in CONFIG_KEYS},
+                      fh, indent=2, sort_keys=True)
+            fh.write("\n")
         return True
-    if log_arg:
+    except (OSError, ValueError, TypeError):
         return False
-    return bool(env_proxy)
+
+
+def effective_settings(args, env, config):
+    """{setting: (value, source)} with source in flag/env/config/default.
+
+    The source is carried because a settings file invites exactly one question
+    the moment anything surprises you, which is where the value came from. The
+    settings pane answers it without anyone having to guess.
+    """
+    log_arg = getattr(args, "log", None)
+    proxy_arg = getattr(args, "proxy", None)
+    upstream_arg = getattr(args, "upstream", None)
+
+    if proxy_arg is not None:
+        watch = ("proxy", "flag")
+    elif log_arg:
+        watch = ("log", "flag")
+    elif env.get("LLMWATCH_PROXY"):
+        watch = ("proxy", "env")
+    elif env.get("LLMWATCH_LOG"):
+        watch = ("log", "env")
+    elif config.get("watch"):
+        watch = (config["watch"], "config")
+    else:
+        watch = ("ollama", "default")
+
+    if proxy_arg:
+        port = (parse_listen(proxy_arg)[1], "flag")
+    elif env.get("LLMWATCH_PROXY"):
+        port = (parse_listen(env["LLMWATCH_PROXY"])[1], "env")
+    elif config.get("proxy_port"):
+        port = (config["proxy_port"], "config")
+    else:
+        port = (DEFAULT_PROXY_PORT, "default")
+
+    if upstream_arg:
+        upstream = (upstream_arg, "flag")
+    elif env.get("LLMWATCH_UPSTREAM"):
+        upstream = (env["LLMWATCH_UPSTREAM"], "env")
+    elif config.get("upstream"):
+        upstream = (config["upstream"], "config")
+    else:
+        upstream = (DEFAULT_UPSTREAM, "default")
+
+    if log_arg:
+        log = (log_arg, "flag")
+    elif env.get("LLMWATCH_LOG"):
+        log = (env["LLMWATCH_LOG"], "env")
+    elif config.get("log"):
+        log = (config["log"], "config")
+    else:
+        log = (None, "default")
+
+    return {"watch": watch, "proxy_port": port,
+            "upstream": upstream, "log": log}
 
 
 def log_event_allowed(ev, proxying):
@@ -3754,6 +4022,18 @@ def frame_lines(snap, live_text, style, cols, rows, hint=True, help_visible=Fals
                          + render_upgrade_confirm(update, style, cols,
                                                   plan=ui.upgrade_plan), "live")
 
+    if ui is not None and getattr(ui, "view", None) == "settings" and ui.settings:
+        # Same rule as help: the board goes, the live line stays, because
+        # changing a setting is no reason to lose sight of a running request.
+        found = []
+        if (system or {}).get("oai_port"):
+            found.append(":%d" % system["oai_port"])
+        pane = render_settings(ui.settings, style, detected=found, width=cols)
+        tail = ["", divider("live"), live_text or style.dim("idle")]
+        for detail in (live_detail or []):
+            tail.append(detail)
+        return pane + tail
+
     if help_visible:
         # Help replaces the board but keeps the live line: you should never lose
         # sight of the running request just because you asked what a column means.
@@ -3799,7 +4079,7 @@ def frame_lines(snap, live_text, style, cols, rows, hint=True, help_visible=Fals
                   # Last of the optional blocks, so a short terminal drops the
                   # version notice before it drops anything you are watching.
                   ["", render_update(update, style)] if update else [],
-                  ["", style.dim("h help   -   c compare   -   ctrl-c quit")] if hint else []):
+                  ["", style.dim("h help   -   s settings   -   c compare   -   ctrl-c quit")] if hint else []):
         if block and len(head) + len(block) + len(live_block) <= budget:
             head.extend(block)
     return head + live_block
@@ -4812,8 +5092,14 @@ def _key_reader(q, stop):
 
 def follow(args):
     # `--proxy` with no value yields "", which is still a request to proxy.
-    proxying = wants_proxy(args.proxy, args.log,
-                           os.environ.get("LLMWATCH_PROXY"))
+    # Saved settings are consulted last of all, so `ollama-llmwatch` on its own
+    # does what was configured while anything typed now still wins.
+    settings = effective_settings(args, os.environ, read_config())
+    proxying = settings["watch"][0] == "proxy"
+    if settings["watch"][0] == "log" and settings["log"][0]:
+        # find_log reads this, so a configured path arrives the same way an
+        # explicit --log does.
+        os.environ["LLMWATCH_LOG"] = settings["log"][0]
     kind, target = find_log()
     if not kind and not proxying:
         sys.stderr.write(
@@ -4842,9 +5128,12 @@ def follow(args):
 
     proxy_at, upstream = None, None
     if proxying:
-        listen = parse_listen(args.proxy or os.environ.get("LLMWATCH_PROXY"))
-        upstream = (args.upstream or os.environ.get("LLMWATCH_UPSTREAM")
-                    or DEFAULT_UPSTREAM)
+        listen = ("127.0.0.1", settings["proxy_port"][0])
+        if args.proxy:
+            listen = parse_listen(args.proxy)
+        elif os.environ.get("LLMWATCH_PROXY"):
+            listen = parse_listen(os.environ["LLMWATCH_PROXY"])
+        upstream = settings["upstream"][0]
         if not valid_upstream(upstream):
             sys.stderr.write(
                 "llmwatch: --upstream must be http:// or https://, got %r\n"
@@ -5068,6 +5357,18 @@ def follow(args):
             snap["model"] = model_name_for_board(
                 snap.get("model"),
                 (system_state or {}).get("models_running"))
+            if ui.view == "settings" and ui.settings is None:
+                # Built here, not in UIState: it needs the settings in force,
+                # which means the flags, the environment and the file.
+                ui.settings = settings_open(settings)
+            if ui.settings_saved is not None:
+                ok = write_config(ui.settings_saved)
+                ui.settings_saved = None
+                if ui.settings:
+                    ui.settings["dirty"] = not ok
+                    ui.settings["message"] = (
+                        "saved to %s, restart to apply" % config_path() if ok
+                        else "could not write %s" % config_path())
             style.width = cols          # keep renderers in step with resizes
             screen.draw(compose_frame(
                 snap, live_text(), style, cols, rows,
