@@ -294,5 +294,88 @@ class TestTheSourceColumnStaysHonest(unittest.TestCase):
         text = "\n".join(render_settings(state, PLAIN))
         self.assertIn("config", text)
 
+
+from llmwatch import backend_suggestion  # noqa: E402
+
+
+class TestNoticingTheWrongBackend(unittest.TestCase):
+    """Picking the backend is the one thing that cannot be got wrong quietly,
+    because every wrong choice looks identical: an empty board. So when the
+    chosen one has nothing to show and another plainly does, say so.
+
+    Only ever a suggestion. Switching under someone silently would be worse
+    than the empty board, since the numbers would change meaning without
+    anything on screen admitting it.
+    """
+
+    def test_nothing_to_say_when_the_current_backend_is_working(self):
+        self.assertIsNone(backend_suggestion(
+            "ollama", {"models_loaded": 1, "oai_port": 8080}, busy=True))
+
+    def test_ollama_with_nothing_loaded_and_a_server_running_suggests_it(self):
+        got = backend_suggestion(
+            "ollama", {"models_loaded": 0, "oai_port": 8080}, busy=False)
+        self.assertEqual(got["mode"], "proxy")
+        self.assertIn("8080", got["why"])
+
+    def test_a_proxy_that_cannot_reach_its_server_suggests_ollama(self):
+        got = backend_suggestion(
+            "proxy", {"upstream_ok": False, "models_loaded": 2}, busy=False)
+        self.assertEqual(got["mode"], "ollama")
+
+    def test_a_proxy_with_nothing_else_running_says_nothing(self):
+        """No suggestion is better than a bad one: if Ollama is empty too,
+        switching solves nothing."""
+        self.assertIsNone(backend_suggestion(
+            "proxy", {"upstream_ok": False, "models_loaded": 0}, busy=False))
+
+    def test_a_stale_log_with_a_server_running_suggests_the_proxy(self):
+        got = backend_suggestion(
+            "log", {"oai_port": 8080}, busy=False)
+        self.assertEqual(got["mode"], "proxy")
+
+    def test_a_busy_backend_is_never_second_guessed(self):
+        """Traffic is arriving. Whatever else is running is not the point."""
+        for mode in ("ollama", "proxy", "log"):
+            self.assertIsNone(backend_suggestion(
+                mode, {"models_loaded": 0, "oai_port": 8080,
+                       "upstream_ok": False}, busy=True), mode)
+
+    def test_it_survives_an_empty_system_snapshot(self):
+        self.assertIsNone(backend_suggestion("ollama", None, busy=False))
+        self.assertIsNone(backend_suggestion("ollama", {}, busy=False))
+
+
+class TestTheSuggestionReachesTheUser(unittest.TestCase):
+
+    def test_the_idle_line_offers_it_and_says_which_key(self):
+        from llmwatch import render_idle
+        line = render_idle(90.0, PLAIN, {
+            "models_loaded": 0,
+            "suggestion": {"mode": "proxy",
+                           "why": "an OpenAI server is answering on :8080"}})
+        self.assertIn("8080", line)
+        self.assertIn("press s", line)
+
+    def test_the_pane_offers_it_and_one_key_takes_it(self):
+        state = opened()
+        state["suggestion"] = {"mode": "proxy", "why": "server on :8080"}
+        self.assertIn("a to accept", "\n".join(render_settings(state, PLAIN)))
+        state, _ = settings_key(state, "a")
+        self.assertEqual(state["mode"], "proxy")
+        self.assertTrue(state["dirty"])
+
+    def test_accepting_does_not_save_by_itself(self):
+        """Nothing is written until w. A suggestion taken by accident has to be
+        as easy to drop as it was to take."""
+        state = opened()
+        state["suggestion"] = {"mode": "proxy", "why": "x"}
+        state, action = settings_key(state, "a")
+        self.assertIsNone(action)
+
+    def test_a_without_a_suggestion_does_nothing(self):
+        state, _ = settings_key(opened(), "a")
+        self.assertEqual(state["mode"], "ollama")
+
 if __name__ == "__main__":
     unittest.main()

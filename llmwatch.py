@@ -1613,15 +1613,22 @@ def render_idle(age, style, system=None):
                 line += " (+%d)" % (len(models) - 3)
         elif models == []:
             line += "  |  the server reports no models"
+        if system.get("suggestion"):
+            line += "  |  %s - press s" % system["suggestion"]["why"]
         return style.dim(line)
 
     # An OpenAI server was found while the Ollama side had nothing to show.
     # Appended rather than substituted: whatever is wrong with Ollama is still
     # the more specific thing to say, and this is the likelier explanation of
     # why the screen is empty.
-    port = system.get("oai_port")
+    # A suggestion knows more than the bare detection does, so it wins the
+    # one line available.
+    suggestion = system.get("suggestion")
     hint = ""
-    if port:
+    if suggestion:
+        hint = "  |  %s - press s to switch" % suggestion["why"]
+    elif system.get("oai_port"):
+        port = system["oai_port"]
         hint = ("  |  OpenAI server on :%d - watch it with --proxy %d, and "
                 "point your client at :%d"
                 % (port, DEFAULT_PROXY_PORT, DEFAULT_PROXY_PORT))
@@ -2392,6 +2399,41 @@ SETTINGS_MODE_HELP = (
 )
 
 
+def backend_suggestion(mode, system, busy):
+    """A better backend than the one running, or None.
+
+    Choosing the backend is the one setting that cannot be got wrong loudly:
+    every wrong choice looks the same, an empty board, and nothing on it says
+    the mistake was in the choice rather than in the model.
+
+    Never acted on automatically. Switching underneath someone would be worse
+    than the empty board, because the numbers would quietly start meaning
+    something else and the screen would not admit it. Suggested, and accepted
+    by hand.
+
+    `busy` is the veto. Traffic is arriving through the current backend, so it
+    is the right one whatever else happens to be running.
+    """
+    if busy or not system:
+        return None
+    port = system.get("oai_port")
+    loaded = system.get("models_loaded") or 0
+
+    if mode == "ollama" and not loaded and port:
+        return {"mode": "proxy",
+                "why": "an OpenAI server is answering on :%d and Ollama has "
+                       "nothing loaded" % port}
+    if mode == "proxy" and system.get("upstream_ok") is False and loaded:
+        return {"mode": "ollama",
+                "why": "the server being proxied is unreachable and Ollama has "
+                       "%d model%s loaded" % (loaded, "" if loaded == 1 else "s")}
+    if mode == "log" and port:
+        return {"mode": "proxy",
+                "why": "nothing is arriving in the log, and an OpenAI server "
+                       "is answering on :%d" % port}
+    return None
+
+
 def settings_open(settings):
     """Pane state from the settings actually in force."""
     return {
@@ -2466,6 +2508,11 @@ def settings_key(state, key):
         state["mode"] = SETTINGS_MODE_HELP[int(key) - 1][0]
         state["dirty"] = True
         return state, None
+    if key == "a" and state.get("suggestion"):
+        state["mode"] = state["suggestion"]["mode"]
+        state["dirty"] = True
+        state["message"] = "taken. w saves it"
+        return state, None
     if key in ("j", "down"):
         state["cursor"] = min(state["cursor"] + 1, len(SETTINGS_ROWS) - 1)
         return state, None
@@ -2512,7 +2559,11 @@ def render_settings(state, style, detected=None, width=100):
     lines.append(field("upstream", "server", "where your model server is"))
     lines.append(field("log", "log", "for the log backend"))
 
-    if detected:
+    if state.get("suggestion"):
+        lines.append("")
+        lines.append(style.yellow(
+            "  suggested: %s  (a to accept)" % state["suggestion"]["why"]))
+    elif detected:
         lines.append("")
         lines.append(style.dim("  found running: " + ", ".join(detected)))
 
@@ -4494,6 +4545,9 @@ class SystemProbe:
     # probe that opens a socket, so it must not become a thing llmwatch does
     # continuously to somebody else's server.
     OAI_INTERVAL = 30.0
+    # Long enough that a slow first request is not mistaken for a wrong
+    # backend: a 27B pays about ten seconds just to load.
+    QUIET_BEFORE_LOOKING = 60.0
 
     def __init__(self, clock=time.monotonic, look_for_oai=False,
                  upstream=None):
@@ -4521,6 +4575,9 @@ class SystemProbe:
         # Set only under --proxy. The idle screen then describes this server
         # rather than Ollama, which is not what is being watched.
         self.upstream = upstream
+        # How long the watched backend has shown nothing. Set by the loop,
+        # which is the only thing that knows.
+        self.idle_seconds = None
         self._upstream_at = float("-inf")
         self.upstream_ok = None
         self.upstream_models = None
@@ -4538,8 +4595,13 @@ class SystemProbe:
         # Only when the Ollama side has nothing to show. A working Ollama setup
         # never probes anything, so this cannot cost or surprise the people it
         # has nothing to tell.
+        # Widened from "Ollama has nothing loaded" to "the backend being
+        # watched has gone quiet", because the backend that is wrong is exactly
+        # the one that never shows anything, whichever it is.
+        quiet = (self.idle_seconds is not None
+                 and self.idle_seconds >= self.QUIET_BEFORE_LOOKING)
         if (self._look_for_oai
-                and (self.server_ok is False or self.models_loaded == 0)
+                and (self.server_ok is False or self.models_loaded == 0 or quiet)
                 and now - self._oai_at >= self.OAI_INTERVAL):
             self._oai_at = now
             self.oai_port = detect_openai_server()
@@ -5340,6 +5402,7 @@ def follow(args):
             update_box["announced"] = True
             commit(render_update(update_box["latest"], style))
         if probe:
+            probe.idle_seconds = time.time() - idle_since
             probe.poll()               # self-rate-limited: 5s cheap, 15s models
         if tui:
             if ui.view == "upgrade" and ui.upgrade_plan is None:
@@ -5354,13 +5417,20 @@ def follow(args):
             age = time.time() - live_at
             codex_state = codex_tail.state() if codex_tail else None
             system_state = probe.snapshot() if probe else None
+            if system_state is not None:
+                system_state["suggestion"] = backend_suggestion(
+                    settings["watch"][0], system_state,
+                    busy=(time.time() - idle_since) < 5.0)
             snap["model"] = model_name_for_board(
                 snap.get("model"),
                 (system_state or {}).get("models_running"))
             if ui.view == "settings" and ui.settings is None:
+                # Carried in so the pane can offer it, rather than working it
+                # out again from a snapshot it does not have.
                 # Built here, not in UIState: it needs the settings in force,
                 # which means the flags, the environment and the file.
                 ui.settings = settings_open(settings)
+                ui.settings["suggestion"] = (system_state or {}).get("suggestion")
             if ui.settings_saved is not None:
                 ok = write_config(ui.settings_saved)
                 ui.settings_saved = None
