@@ -16,9 +16,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llmwatch import (  # noqa: E402
     DEFAULT_PROXY_PORT, OaiGenTick, OaiPrefillTick, OaiRequestAborted,
-    LOOPBACK_HOSTS, OaiRequestEnd, OaiRequestStart, Style, Tracker,
+    LOOPBACK_HOSTS, OaiEngine, OaiRequestEnd, OaiRequestStart, Style,
+    Tracker,
     _sse_events, detect_engine, detect_openai_server, draft_counts,
-    list_upstream_models, log_event_allowed, model_name_for_board,
+    engine_from_log_event, list_upstream_models, log_event_allowed,
+    model_name_for_board,
     render_board_title,
     wants_proxy,
     render_idle,
@@ -896,6 +898,25 @@ class TestProxyEndToEnd(unittest.TestCase):
         self.assertEqual(
             len([e for e in seen if type(e).__name__ == "OaiEngine"]), 1)
 
+    def test_the_engine_is_re_announced_when_the_server_changes(self):
+        """Not latched: stopping one server and starting another on the same
+        port is routine, and a label learned once would go on naming the one
+        that was replaced."""
+        upstream = StubUpstream(
+            [delta("a"), SPEC_USAGE_CHUNK, b"data: [DONE]\n\n"])
+        self.addCleanup(upstream.close)
+        seen, port, finished = self.run_proxy(upstream.url)
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        engines = [e.engine for e in seen if type(e).__name__ == "OaiEngine"]
+        self.assertEqual(engines, ["llama.cpp"])
+        # Same engine again must not re-announce; only a change does.
+        finished.clear()
+        self.post(port, {"model": "m", "stream": True})
+        self.assertTrue(finished.wait(10))
+        engines = [e.engine for e in seen if type(e).__name__ == "OaiEngine"]
+        self.assertEqual(engines, ["llama.cpp"])
+
     def test_an_unidentifiable_server_produces_no_engine_event(self):
         upstream = StubUpstream([delta("a"), USAGE_CHUNK, b"data: [DONE]\n\n"])
         self.addCleanup(upstream.close)
@@ -1364,3 +1385,55 @@ class TestTheModelNameWhenTheLogNeverSaidIt(unittest.TestCase):
         """The log saw the model actually serve the request. `ollama ps` only
         knows what is resident, which is not the same claim."""
         self.assertEqual(model_name_for_board("from-log", ["other"]), "from-log")
+
+
+class TestEngineFollowsAServerSwap(unittest.TestCase):
+    """Local servers get swapped on the same port all the time: stop MLX, start
+    llama.cpp, keep the client pointed where it was. Detecting the engine once
+    and never again meant the board kept naming the one that had been replaced,
+    which is worse than naming none, because it is now confidently wrong.
+    """
+
+    def test_a_new_engine_replaces_the_old_one(self):
+        t = Tracker()
+        t.feed(OaiEngine("MLX", 1.0))
+        self.assertEqual(t.engine, "MLX")
+        t.feed(OaiEngine("llama.cpp", 2.0))
+        self.assertEqual(t.engine, "llama.cpp")
+
+    def test_the_log_backend_names_llama_cpp_too(self):
+        """It only ever set MLX, so watching Ollama serve a GGUF model showed
+        no engine at all, and switching from an -mlx model to a GGUF one left
+        the previous answer standing."""
+        ev = parse_line(
+            "x I slot print_timing: id  3 | task 44 | draft acceptance = 0.57818"
+            " (  159 accepted /   275 generated), mean len =  4.97\n")
+        self.assertIsNotNone(ev)
+        self.assertEqual(engine_from_log_event(ev), "llama.cpp")
+
+    def test_the_mlx_runner_is_still_named_mlx(self):
+        from llmwatch import MlxGenStats
+        self.assertEqual(
+            engine_from_log_event(MlxGenStats(1, 8, 6, 0.75, 8.0, 1.0)), "MLX")
+
+    def test_a_proxied_event_does_not_claim_an_engine(self):
+        """The proxy detects its own engine from the wire; a log reader must not
+        overwrite that with a guess."""
+        self.assertIsNone(engine_from_log_event(OaiGenTick(5, 1.0)))
+
+    def test_an_mlx_run_after_a_llama_cpp_one_is_not_stuck(self):
+        from llmwatch import MlxRequestStart
+        t = Tracker()
+        t.engine = "llama.cpp"
+        t.feed(MlxRequestStart(10, 0, False, 1.0))
+        self.assertEqual(t.engine, "MLX")
+
+    def test_an_internally_refed_event_cannot_change_the_engine(self):
+        """The MLX path re-feeds DraftAcceptance itself, so reading the engine
+        off the event type inside feed() would have flipped MLX to llama.cpp
+        halfway through its own request."""
+        from llmwatch import MlxGenStats, MlxRequestStart
+        t = Tracker()
+        t.feed(MlxRequestStart(10, 0, False, 1.0))
+        t.feed(MlxGenStats(1, 8, 6, 0.75, 8.0, 2.0))
+        self.assertEqual(t.engine, "MLX")

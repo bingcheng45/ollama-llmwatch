@@ -2678,15 +2678,18 @@ def _proxy_server_class():
             self._relay()
 
         def _note_engine(self, headers, obj):
-            """Learn the engine once, then never look again.
+            """Announce the engine, and again if it ever changes.
 
-            Detection is the only thing here that costs a parse it would not
-            otherwise do, so it stops as soon as the answer is known.
+            Not latched. Stopping MLX and starting llama.cpp on the same port
+            is routine, and a label that was learned once would then name the
+            server that had been replaced, which is worse than naming none
+            because it is confidently wrong.
+
+            Cheap enough to repeat: the header check is a dict lookup, and the
+            body is only looked at once per request by the caller.
             """
-            if self.server.engine is not None:
-                return
             found = detect_engine(headers, obj)
-            if found:
+            if found and found != self.server.engine:
                 self.server.engine = found
                 self._emit(OaiEngine(found, time.time()))
 
@@ -2856,6 +2859,9 @@ def _proxy_server_class():
             # poisons `peak` and the token-weighted average.
             last_token, arrivals = None, 0
             last_tick = 0.0
+            # One body inspection per request: enough to notice a swapped
+            # server, cheap enough not to matter.
+            engine_checked = False
             try:
                 while True:
                     chunk = upstream.read(4096)
@@ -2883,11 +2889,17 @@ def _proxy_server_class():
                             # yields whichever it did send.
                             if found_timings:
                                 timings = found_timings
-                            if self.server.engine is None:
+                            # llama.cpp puts timings on the final chunk and
+                            # MLX puts its fingerprint on every one, so the
+                            # free check runs always and the parse runs once.
+                            if found_timings:
+                                self._note_engine(None,
+                                                  {"timings": found_timings})
+                            elif not engine_checked:
+                                engine_checked = True
                                 self._note_engine(None, {
                                     "system_fingerprint":
-                                        read_stream_fingerprint(payload),
-                                    "timings": found_timings})
+                                        read_stream_fingerprint(payload)})
                     except Exception:
                         # Format drift costs the numbers for this request, not the
                         # request itself.
@@ -3097,6 +3109,26 @@ def list_upstream_models(url, timeout=OAI_PROBE_TIMEOUT):
     ids = [row.get("id") for row in data
            if isinstance(row, dict) and isinstance(row.get("id"), str)]
     return ids
+
+
+def engine_from_log_event(ev):
+    """Which engine wrote this log event, or None if it did not come from a log.
+
+    Read from the event type rather than detected, because the two runners
+    write different logs and are parsed by different functions: whichever one
+    produced the event already knew.
+
+    Only for events that arrived from a log. The Tracker re-feeds some of these
+    to itself while translating an MLX request, and reading the type inside
+    feed() would flip MLX to llama.cpp halfway through its own request. Proxied
+    events return None: that path detects its own engine from the wire, and a
+    guess here must not overwrite it.
+    """
+    if isinstance(ev, MLX_EVENTS):
+        return "MLX"
+    if isinstance(ev, OAI_EVENTS):
+        return None
+    return "llama.cpp"
 
 
 def model_name_for_board(tracked, running):
@@ -4907,6 +4939,11 @@ def follow(args):
             return False
         if not log_event_allowed(ev, proxying):
             return False
+        # Servers get swapped on the same machine between runs of llmwatch and
+        # during them, so this is re-read per event rather than latched.
+        engine = engine_from_log_event(ev)
+        if engine:
+            tracker.engine = engine
         return dispatch(ev)
 
     def dispatch(ev):
