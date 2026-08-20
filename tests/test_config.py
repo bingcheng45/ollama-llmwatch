@@ -16,7 +16,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llmwatch import (  # noqa: E402
-    DEFAULT_PROXY_PORT, DEFAULT_UPSTREAM, LOG_SEARCH_MAX_AGE, config_path,
+    DEFAULT_PROXY_PORT, DEFAULT_UPSTREAM, LOG_SEARCH_MAX_AGE, SETTINGS_TOP,
+    config_path,
     effective_settings,
     read_config, write_config,
 )
@@ -208,7 +209,7 @@ class TestSettingsPane(unittest.TestCase):
         state, _ = self.press(opened(), "UP")
         self.assertEqual(state["cursor"], 0)
         state, _ = self.press(state, "DOWN", "DOWN", "DOWN")
-        self.assertEqual(state["cursor"], 1)
+        self.assertEqual(state["cursor"], len(SETTINGS_TOP) - 1)
 
     def test_enter_opens_a_category_and_escape_comes_back(self):
         state, _ = self.press(opened(), "\r")
@@ -610,6 +611,64 @@ class TestDiscoveredNamesCannotDriveTheTerminal(unittest.TestCase):
             "proxying": True, "upstream": "http://127.0.0.1:8080",
             "upstream_models": ["a\x1b[2Jb"]})
         self.assertNotIn("\x1b", line)
+
+
+class TestPointingAppsFromThePane(unittest.TestCase):
+    """The failure this closes is silent: a client left pointing at the model
+    server works perfectly and is never measured, and the empty board looks
+    like llmwatch is broken."""
+
+    def press(self, state, *keys):
+        action = None
+        for key in keys:
+            state, action = settings_key(state, key)
+        return state, action
+
+    def test_the_menu_offers_it(self):
+        text = "\n".join(render_settings(opened(), PLAIN))
+        self.assertIn("Point my apps at llmwatch", text)
+
+    def test_opening_it_asks_the_loop_to_read_the_configs(self):
+        """The pane touches no files of its own."""
+        state, action = self.press(opened(), "DOWN", "DOWN", "\r")
+        self.assertEqual(action, "clients")
+        self.assertEqual(state["level"], "clients")
+
+    def test_choosing_one_asks_the_loop_to_repoint_that_one(self):
+        state = opened()
+        state["level"], state["cursor"] = "clients", 1
+        state["clients"] = [{"name": "a", "url": "x", "path": "/p", "key": "k"},
+                            {"name": "b", "url": "y", "path": "/q", "key": "k"}]
+        state, action = self.press(state, "\r")
+        self.assertEqual(action, "point")
+        self.assertEqual(state["point_index"], 1)
+
+    def test_the_one_already_pointed_here_is_marked(self):
+        state = opened()
+        state["level"] = "clients"
+        state["listen_url"] = "http://127.0.0.1:8081/v1"
+        state["clients"] = [
+            {"name": "opencode", "url": "http://127.0.0.1:8081/v1",
+             "path": "/p", "key": "k"},
+            {"name": "Codex", "url": "http://127.0.0.1:10100/v1",
+             "path": "/q", "key": "k"}]
+        text = "\n".join(render_settings(state, PLAIN))
+        self.assertIn("* here", text)
+        # and the one pointed somewhere else is shown, not hidden or changed
+        self.assertIn("10100", text)
+
+    def test_no_known_apps_says_so(self):
+        state = opened()
+        state["level"], state["clients"] = "clients", []
+        self.assertIn("no apps found",
+                      "\n".join(render_settings(state, PLAIN)))
+
+    def test_a_hostile_url_in_someone_elses_config_is_defused(self):
+        state = opened()
+        state["level"] = "clients"
+        state["clients"] = [{"name": "x", "url": "http://a\x1b[2Jb",
+                             "path": "/p", "key": "k"}]
+        self.assertNotIn("\x1b", "\n".join(render_settings(state, PLAIN)))
 
 if __name__ == "__main__":
     unittest.main()
