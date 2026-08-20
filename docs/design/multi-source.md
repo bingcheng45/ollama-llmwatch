@@ -2,6 +2,9 @@
 
 Status: proposed, nothing implemented.
 
+Line references below were checked against `c157a59`. They rot; the function
+names beside them do not, so search for those if a number has drifted.
+
 ## What is being asked for
 
 Run Ollama, a proxied MLX server and a llama.cpp log at the same time, and see
@@ -38,7 +41,7 @@ describes neither. The class docstring already argues this point for the MTP
 and base builds of one model; two engines is the same problem, larger.
 
 **One log is tailed.** A single `subprocess.Popen(tail_command(kind, target))`
-at `llmwatch.py:5184`.
+at `llmwatch.py:5535`.
 
 The failure mode throughout is that wrong answers look plausible. Nothing
 errors, the board fills, and the numbers are averages of things that should
@@ -88,7 +91,7 @@ request attributed to the right engine.
 
 ### 4. Show it
 
-- `render_recent` (`llmwatch.py:1904`) gains an engine column. Columns today are
+- `render_recent` (`llmwatch.py:1905`) gains an engine column. Columns today are
   task, prompt, total, prefill speed, share of wait.
 - The board either sections by source or labels every row. Sectioning reads
   better with two, labelling scales further.
