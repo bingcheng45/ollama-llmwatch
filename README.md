@@ -322,8 +322,10 @@ hf download mlx-community/Qwen3-30B-A3B-4bit --local-dir ~/models/mlx/qwen3-30b-
 mlx_lm.server --model ~/models/mlx/qwen3-30b-4bit --host 127.0.0.1 --port 8080
 ```
 
-Any `mlx-community/*` model works. 4-bit quantisations are the usual choice: a 30B
-at 4-bit needs roughly 17 GB of unified memory, a 27B roughly 15 GB.
+Any `mlx-community/*` model works, and 4-bit is the usual choice. Budget a little
+over half a gigabyte of unified memory per billion parameters: a 27B at 4 bits
+measured 14.1 GB on disk and 14.5 GB resident once loaded, so a 30B lands near
+16 GB. The KV cache grows on top of that with context length.
 
 **llama.cpp (GGUF, cross platform)**
 
