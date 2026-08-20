@@ -33,11 +33,27 @@ def strip_ansi(text):
 
 
 class TestNoNetworkDependency(unittest.TestCase):
-    """This started as "no network client, at all", and that is still nearly
-    true. The update check is the single exception, and these tests are what
-    keep it single: one import, inside one function, reachable only through the
-    check, and no second network client sneaking in beside it.
+    """This started as "no network client, at all", and the shape of the rule
+    has survived even though the list has grown to three.
+
+    The exceptions are the update check, --proxy, and the OpenAI-server probe.
+    A proxy cannot avoid an HTTP stack -- being one is the entire feature --
+    but it can avoid making every other run pay for it. So the rule is no
+    longer "one import" but "nothing at module scope, and only in the functions
+    that cannot work without it": starting llmwatch to watch a local model
+    still loads no HTTP stack at all.
+
+    The probe is the one that deserves an argument, since it is the only entry
+    here that opens a socket llmwatch was not asked to open. It is bounded on
+    every axis that matters: loopback only, three constant ports, a 0.3s
+    timeout, at most once every 30s, and only while the Ollama backend has
+    nothing to show. A working Ollama setup never reaches it. Growing this list
+    should keep costing an argument like this one.
     """
+
+    # All lazy, and all checked below for being lazy.
+    HTTP_HOLDERS = ["fetch_latest_version", "_proxy_server_class",
+                    "detect_openai_server"]
 
     def source(self):
         path = os.path.join(os.path.dirname(os.path.dirname(
@@ -45,27 +61,26 @@ class TestNoNetworkDependency(unittest.TestCase):
         with open(path) as fh:
             return fh.read()
 
-    def test_no_network_client_other_than_urllib(self):
-        """A tool whose entire premise is watching a LOCAL model has no business
-        with an HTTP stack."""
-        for module in ("import requests", "import socket", "import http",
-                       "import httpx", "from urllib3"):
+    def test_no_third_party_network_client(self):
+        """stdlib or nothing. A tool that watches a LOCAL model has no business
+        pulling an HTTP library in as a dependency."""
+        for module in ("import requests", "import httpx", "from urllib3",
+                       "import aiohttp", "import socket"):
             self.assertNotIn(module, self.source(), module)
 
-    def test_urllib_is_imported_once_and_only_for_the_update_check(self):
-        source = self.source()
-        self.assertEqual(source.count("import urllib"), 1)
-        tree = ast.parse(source)
+    def test_http_is_imported_only_where_it_cannot_be_avoided(self):
+        tree = ast.parse(self.source())
         holders = [node.name for node in ast.walk(tree)
                    if isinstance(node, ast.FunctionDef)
                    and any(isinstance(inner, (ast.Import, ast.ImportFrom))
-                           and "urllib" in ast.dump(inner)
+                           and ("urllib" in ast.dump(inner)
+                                or "http" in ast.dump(inner))
                            for inner in ast.walk(node))]
-        self.assertEqual(holders, ["fetch_latest_version"])
+        self.assertEqual(sorted(holders), sorted(self.HTTP_HOLDERS))
 
     def test_it_is_not_imported_at_module_scope(self):
-        """Keeping the import inside that one function means starting llmwatch
-        never loads an HTTP stack unless the check actually runs."""
+        """Keeping the imports inside those functions means starting llmwatch
+        never loads an HTTP stack unless the check or the proxy actually runs."""
         tree = ast.parse(self.source())
         top_level = [ast.dump(node) for node in tree.body
                      if isinstance(node, (ast.Import, ast.ImportFrom))]
