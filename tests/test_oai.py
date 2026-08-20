@@ -18,7 +18,7 @@ from llmwatch import (  # noqa: E402
     DEFAULT_PROXY_PORT, OaiGenTick, OaiPrefillTick, OaiRequestAborted,
     LOOPBACK_HOSTS, OaiRequestEnd, OaiRequestStart, Style, Tracker,
     _sse_events, detect_engine, detect_openai_server, draft_counts,
-    render_board_title, render_idle,
+    list_upstream_models, render_board_title, render_idle,
     parse_line, parse_listen, prepare_body, read_stream_usage, start_proxy,
     safe_request_path, usage_counts, valid_upstream,
 )
@@ -1156,3 +1156,91 @@ class TestEngineDetection(unittest.TestCase):
         line = render_board_title({"model": "qwen3.8-27b-4bit"}, style)
         self.assertIn("qwen3.8-27b-4bit", line)
         self.assertNotIn("(", line)
+
+
+class TestIdleSpeaksAboutWhatIsBeingWatched(unittest.TestCase):
+    """Under --proxy the idle screen used to report on Ollama, which is not
+    the thing being watched and is often not even running. Someone proxying a
+    loaded llama.cpp server read `no model loaded - the first request pays a
+    load`, which was true of Ollama, irrelevant to them, and looked like a
+    detection failure.
+    """
+
+    def style(self):
+        return Style(color=False, unicode_ok=False, width=100)
+
+    def test_ollama_state_is_not_reported_while_proxying(self):
+        line = render_idle(5.0, self.style(),
+                           {"models_loaded": 0, "server_ok": False,
+                            "proxying": True,
+                            "upstream": "http://127.0.0.1:8080"})
+        self.assertNotIn("Ollama", line)
+        self.assertNotIn("no model loaded", line)
+
+    def test_the_upstream_is_named_so_it_is_obvious_what_is_watched(self):
+        line = render_idle(5.0, self.style(),
+                           {"proxying": True,
+                            "upstream": "http://127.0.0.1:8080"})
+        self.assertIn("127.0.0.1:8080", line)
+
+    def test_the_upstream_models_are_listed(self):
+        """The mismatch this exists for: the client asks for a model id the
+        server does not serve, gets nothing, and nothing says why. Showing what
+        the server does offer makes it a glance rather than an investigation."""
+        line = render_idle(5.0, self.style(),
+                           {"proxying": True,
+                            "upstream": "http://127.0.0.1:8080",
+                            "upstream_models": ["ggml-org/Qwen3.8-27B-GGUF:Q4_K_M"]})
+        self.assertIn("ggml-org/Qwen3.8-27B-GGUF:Q4_K_M", line)
+
+    def test_an_unreachable_upstream_says_so_rather_than_blaming_ollama(self):
+        line = render_idle(5.0, self.style(),
+                           {"proxying": True, "server_ok": False,
+                            "upstream": "http://127.0.0.1:8080",
+                            "upstream_ok": False})
+        self.assertNotIn("Ollama", line)
+        self.assertIn("8080", line)
+
+    def test_the_ollama_wording_is_untouched_when_not_proxying(self):
+        line = render_idle(5.0, self.style(), {"models_loaded": 0})
+        self.assertIn("no model loaded", line)
+        line = render_idle(5.0, self.style(), {"server_ok": False})
+        self.assertIn("Ollama", line)
+
+
+class TestListingUpstreamModels(unittest.TestCase):
+
+    def serve(self, body):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d" % srv.server_address[1]
+
+    def test_ids_come_back_in_order(self):
+        url = self.serve(json.dumps({"object": "list", "data": [
+            {"id": "a"}, {"id": "b"}]}).encode())
+        self.assertEqual(list_upstream_models(url), ["a", "b"])
+
+    def test_an_unreachable_upstream_is_none_not_empty(self):
+        """None means "could not ask"; [] would mean "asked, serves nothing",
+        and the idle screen says different things about each."""
+        self.assertIsNone(list_upstream_models("http://127.0.0.1:1"))
+
+    def test_junk_is_none(self):
+        self.assertIsNone(list_upstream_models(self.serve(b"<html>no</html>")))
