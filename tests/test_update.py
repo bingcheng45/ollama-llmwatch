@@ -11,6 +11,7 @@ about the user in it, silence on every failure, and never a word in --json.
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -19,9 +20,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llmwatch import (  # noqa: E402
     UPDATE_INTERVAL, Style, UIState, check_for_update, compose_frame,
-    fetch_latest_version, handle_key, render_update, start_update_check,
-    update_check_disabled, update_is_newer, upgrade_command, upgrade_plan,
-    version_tuple,
+    fetch_latest_version, handle_key, install_path, render_update,
+    start_update_check, update_check_disabled, update_is_newer, upgrade_command,
+    upgrade_plan, version_tuple,
 )
 
 PLAIN = Style(color=False, unicode_ok=False, width=100)
@@ -298,6 +299,60 @@ class TestUpgradePlan(unittest.TestCase):
             self.assertEqual(argv[argv.index("-o") + 1], path)
         finally:
             os.rmdir(directory)
+
+
+class TestBothBuildsUpgradeCorrectly(unittest.TestCase):
+    """llmwatch ships as a package and as a generated single file, and the
+    upgrade advice is worked out from a path. The package sits one directory
+    deeper, so every check here used to answer as though a contributor's
+    checkout were a stray downloaded script -- and the curl fallback would then
+    have tried to write a file over the package directory itself.
+    """
+
+    HAVE = staticmethod(lambda tool: "/usr/bin/" + tool)
+
+    def test_install_path_points_at_something_that_exists(self):
+        self.assertTrue(os.path.exists(install_path()), install_path())
+
+    def test_a_checkout_is_recognised_from_the_package_directory(self):
+        """The package is repo/llmwatch, so .git is one level above it."""
+        repo = tempfile.mkdtemp()
+        try:
+            os.mkdir(os.path.join(repo, ".git"))
+            package = os.path.join(repo, "llmwatch")
+            os.mkdir(package)
+            self.assertEqual(upgrade_command(package), "git pull")
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_a_checkout_is_still_recognised_from_the_single_file(self):
+        repo = tempfile.mkdtemp()
+        try:
+            os.mkdir(os.path.join(repo, ".git"))
+            self.assertEqual(upgrade_command(os.path.join(repo, "llmwatch.py")),
+                             "git pull")
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_a_package_installed_by_pip_is_still_a_pip_upgrade(self):
+        """site-packages/llmwatch, with no .py on the end."""
+        self.assertEqual(
+            upgrade_command("/x/venv/lib/python3.12/site-packages/llmwatch"),
+            "pip install --upgrade ollama-llmwatch")
+
+    def test_curl_never_writes_over_a_package_directory(self):
+        """The destructive case: a package tree that no package manager owns
+        and git does not track. Refusing is the only safe answer -- curl -o
+        against a directory would take the whole install down with it."""
+        directory = tempfile.mkdtemp()
+        try:
+            package = os.path.join(directory, "llmwatch")
+            os.mkdir(package)
+            argv, blocker = upgrade_plan(package, which=self.HAVE)
+            self.assertIsNone(argv)
+            self.assertIn("source tree", blocker)
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
 
     def test_nothing_in_the_command_comes_from_outside(self):
         """Every argument is a constant or a path this program already knows.

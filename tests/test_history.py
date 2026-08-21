@@ -13,7 +13,6 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

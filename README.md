@@ -13,7 +13,7 @@ And when it finishes: how long that whole thing actually took, at what reasoning
 whether that was normal. See [How long does a turn take?](#how-long-does-a-turn-take)
 
 ```
-  ollama-llmwatch 0.9.1   qwen3.8:27b-mtp-128k   12 req - 18m04s
+  ollama-llmwatch 0.9.2   qwen3.8:27b-mtp-128k   12 req - 18m04s
   PREFILL  peak  114.8   avg   92.3   low   47.2 tok/s   218,442 tok - 39m12s
            ▁▂▃▅▇█▇▆▅▃▂▁▂▃▄▅ last 16
   GENERATE peak   17.8   avg   13.1   low    2.7 tok/s     3,110 tok - 3m58s
@@ -836,6 +836,48 @@ else is, which is why `turns` has no column that could hold text either.
 
 ## How it works
 
+The whole system in one picture:
+
+```
+   1. prompt                2. serves it
+  your agent  ──────────►  Ollama  ──────────►  engine
+  Codex, opencode          ◄───────────────────  llama-server (GGUF)
+       ▲                    3. answer, streamed   MLX runner (-mlx)
+       │                                                │
+       │                                                │  4. writes timings
+       │                                                ▼
+       │                                           ollama.log
+       │                                                │  tail -F, read-only
+       │                                                ▼
+       │    ┌── 5. llmwatch ── passive, adds no overhead ───────────────────────┐
+       │    │                                                                   │
+       │    │   parse   which model, which request, which phase                 │
+       │    │     │                                                             │
+       │    │     ▼                                                             │
+       │    │   track   reading ─► first token ─► writing ─► done               │
+       │    │     │                                                             │
+       │    │     ├── repaint ~10/s ──►  live board: progress, ETA, hints       │
+       │    │     │                                                             │
+       │    │     └── on finish ─────►  SQLite history                          │
+       │    │                                 │                                 │
+       │    └─────────────────────────────────│─────────────────────────────────┘
+       │                                      │  ask later
+       │                                      ▼
+       │                        --history  --compare  --turns  --export
+       │                                      ▲
+       │                                      │  turn boundaries
+       │                          Codex session file (--codex, opt-in)
+       │
+       └── or: point your agent at llmwatch's proxy, and it forwards to any
+           OpenAI-compatible server (mlx-lm, LM Studio, vLLM). The usage and
+           timings ride back in the HTTP response, into the same parse step.
+```
+
+The path through the log is the default and needs nothing. The last branch is `--proxy` mode, for
+servers that never write the numbers anywhere: llmwatch sits between your agent and the server and
+reads them off the wire. Either way it only reads what the engine already produced - it never
+touches the request path.
+
 It never talks to Ollama's API. It tails the log that Ollama's inference engine already writes:
 
 ```
@@ -912,9 +954,14 @@ cd ollama-llmwatch
 python3 -m unittest discover tests -v
 ```
 
-That is the whole setup: one file, standard library only, no build step. The parsing, tracking,
+That is the whole setup: standard library only, nothing to install. The parsing, tracking,
 stats and rendering functions are pure  -  they take data and return data  -  so almost
 everything is testable without a terminal or a running model.
+
+The code lives in the `llmwatch/` package, one module per layer. The single `llmwatch.py` at the
+root is generated from it by `python tools/bundle.py`, which is what the `curl` install above
+downloads: still one script, still no dependencies. Edit the package and re-run the bundler; CI
+checks the two agree and runs the whole suite against both.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) has the rest: how the four layers fit together, what the tests
 are really guarding against, the style rules, and how a release goes out. Security problems go

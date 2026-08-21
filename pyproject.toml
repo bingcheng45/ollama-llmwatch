@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 # [project.scripts]); it is the one name that could collide if someone has both
 # packages installed, which is why it is the alias and not the canonical name.
 name = "ollama-llmwatch"
-version = "0.9.1"
+version = "0.9.2"
 description = "See what your local Ollama model is actually doing: live prefill progress, ETA, tok/s, and how long a whole agent turn takes."
 readme = "README.md"
 license = { text = "MIT" }
@@ -40,4 +40,8 @@ ollama-llmwatch = "llmwatch:main"   # canonical, matches the package name
 llmwatch = "llmwatch:main"          # short alias
 
 [tool.setuptools]
-py-modules = ["llmwatch"]
+# The package, not the generated llmwatch.py at the repository root. That file
+# is built by tools/bundle.py for people who curl a single script instead of
+# installing anything; a wheel that shipped both would carry two copies of the
+# same program and let them disagree.
+packages = ["llmwatch"]
